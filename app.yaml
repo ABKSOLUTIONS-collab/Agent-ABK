@@ -1,0 +1,80 @@
+id: /subscriptions/f5222709-40aa-430e-b009-7c22203fdf8a/resourceGroups/ABKAgent365/providers/Microsoft.App/containerapps/agent365-bridge
+identity:
+  type: None
+location: Sweden Central
+name: agent365-bridge
+properties:
+  configuration:
+    activeRevisionsMode: Single
+    dapr: null
+    identitySettings: []
+    ingress:
+      additionalPortMappings: null
+      allowInsecure: false
+      clientCertificateMode: null
+      corsPolicy: null
+      customDomains: null
+      exposedPort: 0
+      external: true
+      fqdn: agent365-bridge.lemonsea-0ef310bc.swedencentral.azurecontainerapps.io
+      ipSecurityRestrictions: null
+      stickySessions: null
+      targetPort: 3000
+      traffic:
+      - latestRevision: true
+        weight: 100
+      transport: Auto
+    maxInactiveRevisions: 100
+    registries:
+    - identity: ''
+      passwordSecretRef: agent365registryazurecrio-agent365registry
+      server: agent365registry.azurecr.io
+      username: Agent365Registry
+    runtime: null
+    secrets:
+    - name: agent365registryazurecrio-agent365registry
+    service: null
+  environmentId: /subscriptions/f5222709-40aa-430e-b009-7c22203fdf8a/resourceGroups/ABKAgent365/providers/Microsoft.App/managedEnvironments/env-agent365-bridge
+  template:
+    containers:
+    - env:
+      - name: NODE_ENV
+        value: production
+      - name: AUTH_MODE
+        value: device_code
+      - name: AZURE_TENANT_ID
+        value: ddac5428-7db7-4add-beaa-6bdc0b4d1b9c
+      - name: AZURE_CLIENT_ID
+        value: 05ee5674-ffdb-457c-88ec-48313f464bd0
+      - name: MCP_PLATFORM_ENDPOINT
+        value: https://agent365.svc.cloud.microsoft
+      - name: MCP_PLATFORM_AUTHENTICATION_SCOPE
+        value: ea9ffc3e-8a23-4a7d-836d-234d7c7565c1/.default
+      - name: MCP_API_KEY
+        value: ABK-MCP-2026-SecureKey
+      image: agent365registry.azurecr.io/agent365-bridge:latest
+      name: agent365-bridge
+      resources:
+        cpu: 0.25
+        ephemeralStorage: 1Gi
+        memory: 0.5Gi
+      volumeMounts:
+      - mountPath: /root/.agent365-bridge
+        volumeName: token-storage
+    initContainers: null
+    revisionSuffix: ''
+    scale:
+      cooldownPeriod: 300
+      maxReplicas: 1
+      minReplicas: 1
+      pollingInterval: 30
+      rules: null
+    serviceBinds: null
+    terminationGracePeriodSeconds: null
+    volumes:
+    - name: token-storage
+      storageType: AzureFile
+      storageName: token-storage
+  workloadProfileName: Consumption
+resourceGroup: ABKAgent365
+type: Microsoft.App/containerApps
