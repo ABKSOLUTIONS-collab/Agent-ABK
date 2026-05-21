@@ -1,94 +1,107 @@
-import * as fs from "fs";
-import * as path from "path";
-import * as os from "os";
+import { TableClient, AzureNamedKeyCredential, TableEntity } from "@azure/data-tables";
 
 /**
- * Caches the discovered tool list to disk so that subsequent launches
- * can return the full tool list instantly (within Claude Desktop's
- * 5-second tools/list timeout).
- *
- * The cache is populated during `npm run login` (which runs full discovery)
- * and loaded at startup to serve the first tools/list response.
- *
- * Storage location: ~/.agent365-bridge/tools-cache.json
+ * Caches the discovered tool list in Azure Table Storage so that it
+ * survives container restarts, deploys, and volume changes.
  */
 
-const CACHE_DIR = path.join(os.homedir(), ".agent365-bridge");
-const TOOLS_CACHE_FILE = path.join(CACHE_DIR, "tools-cache.json");
+const ACCOUNT     = process.env.AZURE_STORAGE_ACCOUNT ?? "";
+const ACCOUNT_KEY = process.env.AZURE_STORAGE_KEY ?? "";
+const TABLE       = process.env.TOKEN_TABLE_NAME || "agent365tokens";
 
-/** Max age of the cache before it's considered stale (24 hours) */
-const MAX_CACHE_AGE_MS = 24 * 60 * 60 * 1000;
+// Cache row lives in a separate partition so it never conflicts with tokens
+const CACHE_PARTITION = "toolscache";
+const CACHE_ROW       = "latest";
+
+/** Max age of the cache before it's considered stale (30 days) */
+const MAX_CACHE_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 
 export interface CachedTool {
-    name: string;
-    description: string;
-    inputSchema: Record<string, unknown>;
-    serverName: string;
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  serverName: string;
 }
 
-interface ToolsCache {
-    timestamp: number;
-    tools: CachedTool[];
+interface CacheEntity extends TableEntity {
+  timestamp: number;
+  toolsJson: string;
 }
 
 function log(message: string): void {
-    process.stderr.write(`[agent365-bridge] ${message}\n`);
+  process.stderr.write(`[agent365-bridge] ${message}\n`);
+}
+
+function getClient(): TableClient | null {
+  if (!ACCOUNT || !ACCOUNT_KEY) return null;
+  const cred = new AzureNamedKeyCredential(ACCOUNT, ACCOUNT_KEY);
+  return new TableClient(
+    `https://${ACCOUNT}.table.core.windows.net`,
+    TABLE,
+    cred
+  );
 }
 
 /**
- * Saves the discovered tool list to disk.
+ * Saves the discovered tool list to Azure Table Storage.
  */
-export function saveToolsCache(tools: CachedTool[]): void {
-    if (!fs.existsSync(CACHE_DIR)) {
-        fs.mkdirSync(CACHE_DIR, { recursive: true });
-    }
-
-    const cache: ToolsCache = {
-        timestamp: Date.now(),
-        tools,
+export async function saveToolsCache(tools: CachedTool[]): Promise<void> {
+  const client = getClient();
+  if (!client) {
+    log("saveToolsCache: no storage credentials, skipping");
+    return;
+  }
+  try {
+    const entity: CacheEntity = {
+      partitionKey: CACHE_PARTITION,
+      rowKey:       CACHE_ROW,
+      timestamp:    Date.now(),
+      toolsJson:    JSON.stringify(tools),
     };
-
-    fs.writeFileSync(TOOLS_CACHE_FILE, JSON.stringify(cache, null, 2), "utf-8");
-    log(`Cached ${tools.length} tools to ${TOOLS_CACHE_FILE}`);
+    await client.upsertEntity(entity, "Replace");
+    log(`Cached ${tools.length} tools to Table Storage`);
+  } catch (e) {
+    log(`saveToolsCache error: ${e}`);
+  }
 }
 
 /**
- * Loads the cached tool list from disk.
+ * Loads the cached tool list from Azure Table Storage.
  * Returns null if no cache exists or if it's too old.
  */
-export function loadToolsCache(): CachedTool[] | null {
-    try {
-        if (!fs.existsSync(TOOLS_CACHE_FILE)) {
-            return null;
-        }
-
-        const raw = fs.readFileSync(TOOLS_CACHE_FILE, "utf-8");
-        const cache: ToolsCache = JSON.parse(raw);
-
-        // Check if cache is stale
-        const age = Date.now() - cache.timestamp;
-        if (age > MAX_CACHE_AGE_MS) {
-            log(`Tool cache is stale (${Math.round(age / 3600000)}h old), ignoring`);
-            return null;
-        }
-
-        log(`Loaded ${cache.tools.length} cached tools (${Math.round(age / 60000)}m old)`);
-        return cache.tools;
-    } catch (err) {
-        log(`Failed to load tool cache: ${err}`);
-        return null;
+export async function loadToolsCache(): Promise<CachedTool[] | null> {
+  const client = getClient();
+  if (!client) {
+    log("loadToolsCache: no storage credentials, skipping");
+    return null;
+  }
+  try {
+    const entity = await client.getEntity<CacheEntity>(CACHE_PARTITION, CACHE_ROW);
+    const age = Date.now() - entity.timestamp;
+    if (age > MAX_CACHE_AGE_MS) {
+      log(`Tool cache is stale (${Math.round(age / 86400000)}d old), ignoring`);
+      return null;
     }
+    const tools: CachedTool[] = JSON.parse(entity.toolsJson);
+    log(`Loaded ${tools.length} cached tools from Table Storage (${Math.round(age / 60000)}m old)`);
+    return tools;
+  } catch (err: unknown) {
+    const status = (err as { statusCode?: number }).statusCode;
+    if (status !== 404) {
+      log(`loadToolsCache error: ${err}`);
+    }
+    return null;
+  }
 }
 
 /**
- * Clears the cached tool list.
+ * Clears the cached tool list from Azure Table Storage.
  */
-export function clearToolsCache(): void {
-    try {
-        if (fs.existsSync(TOOLS_CACHE_FILE)) {
-            fs.unlinkSync(TOOLS_CACHE_FILE);
-        }
-    } catch {
-        // ignore
-    }
+export async function clearToolsCache(): Promise<void> {
+  const client = getClient();
+  if (!client) return;
+  try {
+    await client.deleteEntity(CACHE_PARTITION, CACHE_ROW);
+    log("Tool cache cleared from Table Storage");
+  } catch { /* already gone */ }
 }

@@ -1,0 +1,55 @@
+# =============================================================================
+# Agent 365 Bridge — Docker Compose (local dev / testing)
+#
+# Usage:
+#   cp .env.example .env       # fill in your Azure credentials
+#   docker compose up --build
+#
+# In production (Azure Container Apps) all env vars below are injected
+# as Secrets from Azure Key Vault — this file is LOCAL ONLY.
+# =============================================================================
+
+version: "3.9"
+
+services:
+  agent365-bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+
+    image: agent365-bridge:local
+
+    # MCP servers run over stdio — no port mapping needed for the MCP protocol.
+    # If you later add an HTTP wrapper (OBO/Copilot Studio mode), expose 3000.
+    # ports:
+    #   - "3000:3000"
+
+    environment:
+      NODE_ENV: production
+
+      # ── Azure Entra ID ────────────────────────────────────────────────────
+      # For containers, use client_credentials (headless — no device code).
+      # Create a Client Secret in your App Registration and add it below.
+      AZURE_TENANT_ID: ${AZURE_TENANT_ID}
+      AZURE_CLIENT_ID: ${AZURE_CLIENT_ID}
+      AZURE_CLIENT_SECRET: ${AZURE_CLIENT_SECRET}
+      AUTH_MODE: client_credentials
+
+      # ── Agent 365 Platform ────────────────────────────────────────────────
+      MCP_PLATFORM_ENDPOINT: ${MCP_PLATFORM_ENDPOINT:-https://agent365.svc.cloud.microsoft}
+      MCP_PLATFORM_AUTHENTICATION_SCOPE: ${MCP_PLATFORM_AUTHENTICATION_SCOPE:-ea9ffc3e-8a23-4a7d-836d-234d7c7565c1/.default}
+
+    # Optional: mount a local volume for tools-cache persistence across restarts
+    volumes:
+      - agent365-cache:/root/.agent365-bridge
+
+    restart: unless-stopped
+
+    # Stdin must stay open — MCP communicates over stdio
+    stdin_open: true
+    tty: false
+
+volumes:
+  agent365-cache:
+    driver: local

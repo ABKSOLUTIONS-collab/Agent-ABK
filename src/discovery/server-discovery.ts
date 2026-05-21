@@ -1,35 +1,40 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { TokenProvider } from "../auth/token-provider";
 import { AppConfig, DiscoveredTool, MCPServerConfig, ResolvedServer } from "../config/types";
+
+function log(message: string): void {
+  process.stderr.write(`[agent365-bridge] ${message}\n`);
+}
 
 /**
  * Discovers Agent 365 MCP servers and enumerates their tools.
  *
- * Two discovery paths:
- * 1. Manifest mode (development): reads from ToolingManifest.json
- * 2. Gateway mode (production): queries the Agent 365 tooling gateway API
+ * IMPORTANT: This class no longer uses TokenProvider or device code flow.
+ * All discovery is done with a per-user bearer token passed directly.
+ * This ensures:
+ *  - No server-level auth that can expire
+ *  - Each user only discovers tools they have access to
+ *  - No manual intervention ever needed
  */
 export class ServerDiscovery {
   private config: AppConfig;
-  private tokenProvider: TokenProvider;
 
-  constructor(config: AppConfig, tokenProvider: TokenProvider) {
+  constructor(config: AppConfig) {
     this.config = config;
-    this.tokenProvider = tokenProvider;
   }
 
   /**
-   * Discovers all configured MCP servers and their tools.
+   * Discovers all configured MCP servers using the provided user token.
+   * Called once per user session, results are cached in McpProxyServer.
    */
-  async discoverAll(): Promise<ResolvedServer[]> {
-    const serverConfigs = await this.getServerConfigs();
+  async discoverAll(userToken: string): Promise<ResolvedServer[]> {
+    const serverConfigs = await this.getServerConfigs(userToken);
     const resolved: ResolvedServer[] = [];
 
     for (const serverConfig of serverConfigs) {
       try {
         const url = this.buildServerUrl(serverConfig);
-        const tools = await this.discoverTools(serverConfig.mcpServerName, url);
+        const tools = await this.discoverTools(serverConfig.mcpServerName, url, userToken);
         resolved.push({ config: serverConfig, url, tools });
         log(`Discovered ${tools.length} tools from ${serverConfig.mcpServerName}`);
       } catch (err) {
@@ -40,20 +45,13 @@ export class ServerDiscovery {
     return resolved;
   }
 
-  /**
-   * Gets MCP server configurations from manifest or gateway.
-   */
-  private async getServerConfigs(): Promise<MCPServerConfig[]> {
-    // Use manifest in development mode or when no agentic app ID is set
-    if (this.config.nodeEnv === "development" || !this.config.agenticAppId) {
-      return this.getFromManifest();
+  private async getServerConfigs(userToken: string): Promise<MCPServerConfig[]> {
+    if (this.config.agenticAppId) {
+      return this.getFromGateway(userToken);
     }
-    return this.getFromGateway();
+    return this.getFromManifest();
   }
 
-  /**
-   * Reads server configs from ToolingManifest.json.
-   */
   private getFromManifest(): MCPServerConfig[] {
     const servers = this.config.manifest.mcpServers;
     if (servers.length === 0) {
@@ -62,55 +60,36 @@ export class ServerDiscovery {
     return servers;
   }
 
-  /**
-   * Queries the Agent 365 tooling gateway to discover available servers.
-   */
-  private async getFromGateway(): Promise<MCPServerConfig[]> {
-    const token = await this.tokenProvider.getToken();
+  private async getFromGateway(userToken: string): Promise<MCPServerConfig[]> {
     const url = `${this.config.mcpPlatformEndpoint}/agents/${this.config.agenticAppId}/mcpServers`;
-
     const response = await fetch(url, {
       headers: {
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        Authorization: `Bearer ${userToken}`,
         "Content-Type": "application/json",
       },
     });
-
     if (!response.ok) {
       throw new Error(`Gateway discovery failed: ${response.status} ${response.statusText}`);
     }
-
     const data = (await response.json()) as { mcpServers?: MCPServerConfig[] };
     return data.mcpServers ?? [];
   }
 
-  /**
-   * Constructs the full URL for an MCP server.
-   * Pattern: {endpoint}/agents/servers/{serverName}/
-   */
   private buildServerUrl(config: MCPServerConfig): string {
-    if (config.url) {
-      return config.url;
-    }
+    if (config.url) return config.url;
     const base = this.config.mcpPlatformEndpoint.replace(/\/+$/, "");
     return `${base}/agents/servers/${config.mcpServerName}/`;
   }
 
-  /**
-   * Connects to a remote MCP server and discovers its available tools.
-   */
   private async discoverTools(
     serverName: string,
-    serverUrl: string
+    serverUrl: string,
+    userToken: string
   ): Promise<DiscoveredTool[]> {
-    const token = await this.tokenProvider.getToken();
-
     const headers: Record<string, string> = {
       "User-Agent": "Agent365SDK/1.0.0 (ClaudeCodeBridge; Node.js)",
+      Authorization: `Bearer ${userToken}`,
     };
-    if (token) {
-      headers["Authorization"] = `Bearer ${token}`;
-    }
     if (this.config.agenticAppId) {
       headers["x-ms-agentid"] = this.config.agenticAppId;
     }
@@ -119,26 +98,16 @@ export class ServerDiscovery {
       requestInit: { headers },
     });
 
-    const client = new Client({
-      name: "agent365-bridge",
-      version: "1.0.0",
-    });
-
+    const client = new Client({ name: "agent365-bridge", version: "1.0.0" });
     await client.connect(transport);
-
     const result = await client.listTools();
-    const tools: DiscoveredTool[] = (result.tools ?? []).map((tool) => ({
+    await client.close();
+
+    return (result.tools ?? []).map((tool) => ({
       name: tool.name,
       description: tool.description,
       inputSchema: tool.inputSchema as Record<string, unknown>,
       serverName,
     }));
-
-    await client.close();
-    return tools;
   }
-}
-
-function log(message: string): void {
-  process.stderr.write(`[agent365-bridge] ${message}\n`);
 }

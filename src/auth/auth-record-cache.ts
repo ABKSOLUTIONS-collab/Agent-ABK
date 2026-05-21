@@ -18,7 +18,8 @@ import {
  * Storage location: ~/.agent365-bridge/auth-record.json
  */
 
-const CACHE_DIR = path.join(os.homedir(), ".agent365-bridge");
+// Allow overriding the cache directory via env var (same as tools-cache.ts).
+const CACHE_DIR = process.env.AGENT365_CACHE_DIR ?? path.join(os.homedir(), ".agent365-bridge");
 const AUTH_RECORD_FILE = path.join(CACHE_DIR, "auth-record.json");
 
 function log(message: string): void {

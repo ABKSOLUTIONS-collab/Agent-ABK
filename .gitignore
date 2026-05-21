@@ -10,6 +10,11 @@ dist/
 .env
 .mcp.json
 
+# Deployment scripts & exported configs with real credentials — keep local only
+deploy.sh
+app.yaml
+output.json
+
 # Logs & Dumps (Tenant Sensitive)
 test_output.log
 test_e2e_output.log

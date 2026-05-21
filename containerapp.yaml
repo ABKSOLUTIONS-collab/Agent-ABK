@@ -1,0 +1,98 @@
+# =============================================================================
+# Agent 365 Bridge — Azure Container Apps Deployment Manifest
+#
+# Deploy with:
+#   az containerapp create \
+#     --resource-group <RG> \
+#     --environment <ACA_ENV_NAME> \
+#     --yaml containerapp.yaml
+#
+# Prerequisites:
+#   1. az login
+#   2. Azure Container Registry (ACR) with the image pushed
+#   3. Azure Key Vault with the secrets listed below
+#   4. Managed Identity assigned to the Container App with Key Vault access
+# =============================================================================
+
+name: agent365-bridge
+type: Microsoft.App/containerApps
+
+properties:
+  # ── Environment ────────────────────────────────────────────────────────────
+  # Point to your existing ACA Environment
+  # managedEnvironmentId: /subscriptions/<SUB_ID>/resourceGroups/<RG>/providers/Microsoft.App/managedEnvironments/<ENV_NAME>
+
+  configuration:
+    # ── Registry ──────────────────────────────────────────────────────────────
+    registries:
+      - server: <YOUR_ACR_NAME>.azurecr.io
+        # Use managed identity for ACR pull (no password stored)
+        identity: system
+
+    # ── Secrets (pulled from Azure Key Vault via managed identity) ────────────
+    # These map Key Vault secret names → container env var names
+    secrets:
+      - name: azure-tenant-id
+        keyVaultUrl: https://<YOUR_KEYVAULT_NAME>.vault.azure.net/secrets/AZURE-TENANT-ID
+        identity: system
+      - name: azure-client-id
+        keyVaultUrl: https://<YOUR_KEYVAULT_NAME>.vault.azure.net/secrets/AZURE-CLIENT-ID
+        identity: system
+      - name: azure-client-secret
+        keyVaultUrl: https://<YOUR_KEYVAULT_NAME>.vault.azure.net/secrets/AZURE-CLIENT-SECRET
+        identity: system
+      - name: azure-storage-account
+        keyVaultUrl: https://<YOUR_KEYVAULT_NAME>.vault.azure.net/secrets/AZURE-STORAGE-ACCOUNT
+        identity: system
+      - name: azure-storage-key
+        keyVaultUrl: https://<YOUR_KEYVAULT_NAME>.vault.azure.net/secrets/AZURE-STORAGE-KEY
+        identity: system
+
+    # ── Ingress ───────────────────────────────────────────────────────────────
+    # MCP over stdio does NOT need HTTP ingress.
+    # Only enable if you wrap the bridge in an HTTP server (OBO mode).
+    # ingress:
+    #   external: false
+    #   targetPort: 3000
+
+  template:
+    containers:
+      - name: agent365-bridge
+        image: <YOUR_ACR_NAME>.azurecr.io/agent365-bridge:latest
+
+        # ── Environment Variables ─────────────────────────────────────────────
+        env:
+          - name: NODE_ENV
+            value: production
+          - name: AUTH_MODE
+            value: client_credentials
+          - name: AZURE_TENANT_ID
+            secretRef: azure-tenant-id
+          - name: AZURE_CLIENT_ID
+            secretRef: azure-client-id
+          - name: AZURE_CLIENT_SECRET
+            secretRef: azure-client-secret
+          - name: AZURE_STORAGE_ACCOUNT
+            secretRef: azure-storage-account
+          - name: AZURE_STORAGE_KEY
+            secretRef: azure-storage-key
+          - name: MCP_PLATFORM_ENDPOINT
+            value: https://agent365.svc.cloud.microsoft
+          - name: MCP_PLATFORM_AUTHENTICATION_SCOPE
+            value: "ea9ffc3e-8a23-4a7d-836d-234d7c7565c1/.default"
+
+        # ── Resources ─────────────────────────────────────────────────────────
+        resources:
+          cpu: 0.25
+          memory: 0.5Gi
+
+    # ── Scaling ───────────────────────────────────────────────────────────────
+    # MCP stdio bridge: 1 replica is enough.
+    # Scale up if you wrap in HTTP and serve multiple clients.
+    scale:
+      minReplicas: 1
+      maxReplicas: 1
+
+  # ── Managed Identity ────────────────────────────────────────────────────────
+  identity:
+    type: SystemAssigned

@@ -3,16 +3,16 @@ import {
   ClientSecretCredential,
   TokenCredential,
   AuthenticationRecord,
-  useIdentityPlugin,
 } from "@azure/identity";
-import { cachePersistencePlugin } from "@azure/identity-cache-persistence";
+// NOTE: @azure/identity-cache-persistence (keytar) is intentionally NOT imported here.
+// It requires a native OS credential store (Windows DPAPI / macOS Keychain) which is
+// unavailable in Linux containers. In production (Azure Container Apps) we use
+// client_credentials auth which doesn't need persistent token caching.
+// For local dev with device_code flow, the auth record is still cached to disk via
+// auth-record-cache.ts — only the MSAL token store persistence is skipped.
 import { TokenCache } from "./token-cache";
 import { loadAuthRecord, saveAuthRecord } from "./auth-record-cache";
 import { AppConfig } from "../config/types";
-
-// Enable the persistent token cache plugin.
-// This stores MSAL tokens in the OS credential store (encrypted on Windows/macOS).
-useIdentityPlugin(cachePersistencePlugin);
 
 function log(message: string): void {
   process.stderr.write(`[agent365-bridge] ${message}\n`);
@@ -90,12 +90,10 @@ export class TokenProvider {
       clientId: config.clientId,
       // If we have a cached record, pass it for silent auth
       ...(cachedRecord ? { authenticationRecord: cachedRecord } : {}),
-      // Enable persistent token cache (uses OS credential store)
-      tokenCachePersistenceOptions: {
-        enabled: true,
-        name: "agent365-bridge",
-      },
-      // Device code callback (only triggered if silent auth fails)
+      // NOTE: tokenCachePersistenceOptions removed — requires keytar (OS credential
+      // store) which is unavailable in Linux containers. MSAL tokens are cached
+      // in-memory via TokenCache. The AuthenticationRecord (non-sensitive) is still
+      // persisted to disk for silent re-auth in local dev scenarios.
       userPromptCallback: (info) => {
         log("========================================");
         log("SIGN IN REQUIRED");
