@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npx tsc *)",
+      "Bash(node -e \"const p=require\\('./node_modules/@azure-rest/ai-document-intelligence/package.json'\\); console.log\\(p.version\\)\")",
+      "Bash(npm run *)",
+      "Bash(Get-ChildItem -Recurse \".claude/\")",
+      "Bash(Select-Object FullName)"
+    ]
+  }
+}
