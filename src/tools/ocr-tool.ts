@@ -7,12 +7,107 @@ import { AzureKeyCredential } from "@azure/core-auth";
 const DI_ENDPOINT = process.env.AZURE_DI_ENDPOINT ?? "";
 const DI_KEY      = process.env.AZURE_DI_KEY ?? "";
 
+// ── OneDrive OCR Cache ────────────────────────────────────────────────────────
+const OCR_CACHE_FOLDER = "OCR Files";
+const DEFAULT_CHUNK_PAGES = 20;
+
+function log(msg: string) {
+  process.stderr.write(`[ocr-tool] ${msg}\n`);
+}
+
+/**
+ * Builds the cache filename from the original filename and itemId.
+ * e.g. "invoice_march.pdf" + itemId → "invoice_march_ocr_a3f8c291.txt"
+ */
+function buildCacheFilename(originalFilename: string, itemId: string): string {
+  const base    = originalFilename.replace(/\.[^.]+$/, "");
+  const shortId = itemId.replace(/[^a-zA-Z0-9]/g, "").substring(0, 8);
+  return `${base}_ocr_${shortId}.txt`;
+}
+
+/**
+ * Tries to read a cached OCR result from the user's OneDrive "OCR Files" folder.
+ * Returns null on cache miss OR if the cached result has 0 page markers (corrupted).
+ */
+async function readOcrCache(accessToken: string, cacheFilename: string): Promise<string | null> {
+  try {
+    const url = `https://graph.microsoft.com/v1.0/me/drive/root:/${OCR_CACHE_FOLDER}/${encodeURIComponent(cacheFilename)}:/content`;
+    const res = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
+    if (!res.ok) return null;
+    const text = await res.text();
+    // Reject cache entries with no page markers — they are corrupted/empty results
+    if (countPages(text) === 0) {
+      log(`Cache invalid (0 pages): ${cacheFilename} — treating as miss`);
+      return null;
+    }
+    return text;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Saves OCR result to the user's OneDrive "OCR Files" folder.
+ * Auto-creates the folder on first use. Fire-and-forget safe.
+ * Throws if text has 0 page markers to prevent caching garbage results.
+ */
+async function saveOcrCache(accessToken: string, cacheFilename: string, text: string): Promise<void> {
+  const pages = countPages(text);
+  if (pages === 0) {
+    throw new Error(`Refusing to cache OCR result with 0 pages for ${cacheFilename}`);
+  }
+  log(`Saving cache: ${cacheFilename} (${pages} pages)`);
+
+  const uploadUrl = `https://graph.microsoft.com/v1.0/me/drive/root:/${OCR_CACHE_FOLDER}/${encodeURIComponent(cacheFilename)}:/content`;
+
+  const doUpload = () =>
+    fetch(uploadUrl, {
+      method: "PUT",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "text/plain; charset=utf-8",
+      },
+      body: text,
+    });
+
+  let res = await doUpload();
+
+  // If folder doesn't exist yet, create it and retry once
+  if (res.status === 404 || res.status === 409) {
+    await fetch("https://graph.microsoft.com/v1.0/me/drive/root/children", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        name: OCR_CACHE_FOLDER,
+        folder: {},
+        "@microsoft.graph.conflictBehavior": "rename",
+      }),
+    });
+    res = await doUpload();
+  }
+
+  if (res.ok) {
+    log(`Cached OCR result: ${cacheFilename}`);
+  } else {
+    log(`Failed to save OCR cache: ${res.status} ${res.statusText}`);
+  }
+}
+
 export const OCR_TOOL = {
   name: "ocr_search_and_read",
   description:
-    "OCR a scanned PDF or image-based document from SharePoint/OneDrive and return its full text. " +
-    "PREFERRED: pass drive_id + item_id directly (obtained from list_sharepoint_folder) to skip search entirely. " +
-    "FALLBACK: pass query to search by filename/keywords when you don't have the IDs yet.",
+    "OCR a scanned PDF or image-based document from SharePoint/OneDrive and return its text. " +
+    "PREFERRED: pass drive_id + item_id directly (from list_sharepoint_folder) to skip search. " +
+    "FALLBACK: pass query to search by filename/keywords. " +
+    `Without page_from/page_to the first ${DEFAULT_CHUNK_PAGES} pages are returned; ` +
+    "the response includes total page count and a hint to continue reading. " +
+    `Use page_from/page_to to read in chunks of up to ${DEFAULT_CHUNK_PAGES} pages (e.g. 1-20, then 21-40). ` +
+    "After the first OCR run the result is cached in OneDrive — subsequent chunk calls are instant. " +
+    "For large documents (60-100+ pages) OCR runs in the background (~5-8 min); use check_only=true to poll " +
+    "for completion without re-triggering OCR. Use force_refresh=true to discard a bad cache and re-run.",
   inputSchema: {
     type: "object",
     properties: {
@@ -38,6 +133,29 @@ export const OCR_TOOL = {
         type: "string",
         description: "Optional filename hint for the result label, e.g. 'smith_contract.pdf'",
       },
+      check_only: {
+        type: "boolean",
+        description:
+          "Set to true to check whether a background OCR job has completed (cache exists) " +
+          "WITHOUT re-triggering OCR if it hasn't. Returns status: ready (with page count) or still-in-progress. " +
+          "Use this to poll after receiving an 'OCR in progress' response for a large document.",
+      },
+      force_refresh: {
+        type: "boolean",
+        description:
+          "Set to true to ignore any cached OCR result and re-run Azure Document Intelligence from scratch. " +
+          "Use this when the cached result is incomplete or incorrect (e.g. shows fewer pages than expected).",
+      },
+      page_from: {
+        type: "number",
+        description:
+          `First page to return (1-based). If omitted, defaults to page 1 and returns the first ${DEFAULT_CHUNK_PAGES} pages.`,
+      },
+      page_to: {
+        type: "number",
+        description:
+          `Last page to return (inclusive). Recommended chunk size: ${DEFAULT_CHUNK_PAGES} pages at a time.`,
+      },
     },
   },
 };
@@ -55,10 +173,14 @@ export class OcrToolHandler {
       return { content: [{ type: "text", text: `Unknown OCR tool: ${name}` }] };
     }
 
-    const query        = args.query       as string | undefined;
-    const hintFilename = args.hint_filename as string | undefined;
-    const directDriveId = args.drive_id   as string | undefined;
-    const directItemId  = args.item_id    as string | undefined;
+    const query         = args.query         as string | undefined;
+    const hintFilename  = args.hint_filename as string | undefined;
+    const directDriveId = args.drive_id      as string | undefined;
+    const directItemId  = args.item_id       as string | undefined;
+    const checkOnly     = args.check_only    as boolean | undefined;
+    const forceRefresh  = args.force_refresh as boolean | undefined;
+    const pageFrom      = args.page_from     as number | undefined;
+    const pageTo        = args.page_to       as number | undefined;
 
     if (!directDriveId && !directItemId && !query) {
       return {
@@ -74,7 +196,7 @@ export class OcrToolHandler {
       if (directDriveId && directItemId) {
         driveId  = directDriveId;
         itemId   = directItemId;
-        filename = hintFilename ?? "document";
+        filename = hintFilename ?? await this.fetchItemFilename(directDriveId, directItemId);
       } else {
         const found = await this.searchFile(query!, hintFilename);
         driveId  = found.driveId;
@@ -82,12 +204,132 @@ export class OcrToolHandler {
         filename = found.filename;
       }
 
-      const text = await ocrPdfFromGraph(driveId, itemId, this.accessToken);
-      return { content: [{ type: "text", text: `📄 **${filename}**\n\n${text}` }] };
+      const cacheFilename = buildCacheFilename(filename, itemId);
+
+      // ── check_only: poll for background completion without starting OCR ──────
+      if (checkOnly) {
+        const cached = await readOcrCache(this.accessToken, cacheFilename);
+        if (cached) {
+          const total = countPages(cached);
+          log(`check_only: cache ready — ${total} pages`);
+          return {
+            content: [{
+              type: "text",
+              text:
+                `✅ **${filename}** — OCR complete (${total} pages cached)\n\n` +
+                `You can now read it with \`page_from\`/\`page_to\`. ` +
+                `Example: \`page_from=1, page_to=${DEFAULT_CHUNK_PAGES}\``,
+            }],
+          };
+        }
+        return {
+          content: [{
+            type: "text",
+            text:
+              `⏳ **${filename}** — OCR still in progress\n\n` +
+              `The cache is not ready yet. Check again in 1–2 minutes.`,
+          }],
+        };
+      }
+
+      // ── 1. Check OneDrive OCR cache ──────────────────────────────────────────
+      if (!forceRefresh) {
+        const cached = await readOcrCache(this.accessToken, cacheFilename);
+        if (cached) {
+          log(`Cache hit: ${cacheFilename}`);
+          return {
+            content: [{
+              type: "text",
+              text: buildPagedResponse(cached, filename, "*(OCR cache)*", pageFrom, pageTo),
+            }],
+          };
+        }
+      } else {
+        log(`force_refresh=true: skipping cache for ${cacheFilename}`);
+      }
+
+      // ── 2. Cache miss → run Azure Document Intelligence ──────────────────────
+      log(`Cache miss: ${cacheFilename} — running OCR...`);
+      const onedrivePath = `OCR Files/${cacheFilename}`;
+
+      // Race OCR against a 170 s timeout (stays safely under ACA's 240 s HTTP
+      // response limit). For large documents (100+ pages) Azure DI takes 5–8
+      // minutes — we fire-and-forget and let the agent check back later via the
+      // OneDrive cache. The background promise continues running in the Node.js
+      // event loop; ACA keeps the container alive (min_replicas = 1).
+      const SYNC_TIMEOUT_MS = 170_000;
+      const ocrPromise = ocrPdfFromGraph(driveId, itemId, this.accessToken);
+
+      let fullText: string;
+      try {
+        fullText = await Promise.race([
+          ocrPromise,
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error("OCR_TIMEOUT")), SYNC_TIMEOUT_MS)
+          ),
+        ]);
+      } catch (raceErr: any) {
+        if (raceErr.message === "OCR_TIMEOUT") {
+          // OCR is still running in the background — attach save handler
+          ocrPromise
+            .then((text) =>
+              saveOcrCache(this.accessToken, cacheFilename, text).catch((e) =>
+                log(`Background cache save error: ${e}`)
+              )
+            )
+            .catch((e) => log(`Background OCR error: ${e}`));
+
+          return {
+            content: [{
+              type: "text",
+              text:
+                `⏳ **${filename}** — OCR in progress (large document)\n\n` +
+                `Azure Document Intelligence is analyzing this document in the background. ` +
+                `Large scanned PDFs typically take **3–8 minutes** to process.\n\n` +
+                `📁 The full text will be saved to OneDrive at:\n` +
+                `**\`${onedrivePath}\`**\n\n` +
+                `👉 Use \`check_only=true\` (with the same drive_id/item_id) to poll for completion ` +
+                `without re-triggering OCR. Check every 1–2 minutes.`,
+            }],
+          };
+        }
+        throw raceErr; // re-throw real errors (Azure DI failure, network, etc.)
+      }
+
+      // ── 3. OCR completed within timeout — save to OneDrive cache ─────────────
+      await saveOcrCache(this.accessToken, cacheFilename, fullText).catch((err) =>
+        log(`Cache save error: ${err}`)
+      );
+
+      // ── 4. Return requested page range (or first chunk) ──────────────────────
+      return {
+        content: [{
+          type: "text",
+          text: buildPagedResponse(fullText, filename, "— OCR complete", pageFrom, pageTo),
+        }],
+      };
+
     } catch (err: any) {
       return {
         content: [{ type: "text", text: `OCR error: ${err.message ?? err}` }],
       };
+    }
+  }
+
+  /**
+   * Fetches the actual filename for a known driveId+itemId.
+   * Used when the caller has direct IDs but no hint_filename,
+   * so the OneDrive OCR cache key is always accurate.
+   */
+  private async fetchItemFilename(driveId: string, itemId: string): Promise<string> {
+    try {
+      const url = `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${itemId}?$select=name`;
+      const res = await fetch(url, { headers: { Authorization: `Bearer ${this.accessToken}` } });
+      if (!res.ok) return "document";
+      const data = await res.json() as any;
+      return data.name ?? "document";
+    } catch {
+      return "document";
     }
   }
 
@@ -151,23 +393,86 @@ export class OcrToolHandler {
   }
 }
 
+/**
+ * Filters the full OCR text to only include the requested page range.
+ * Pages are delimited by "=== Page N ===" markers inserted by ocrPdfFromGraph.
+ * Also prepends a page count summary so the agent knows the total.
+ */
+function countPages(text: string): number {
+  return (text.match(/=== Page \d+ ===/g) ?? []).length;
+}
+
+function buildPagedResponse(
+  text: string,
+  filename: string,
+  label: string,
+  pageFrom?: number,
+  pageTo?: number
+): string {
+  const totalPages = countPages(text);
+  const isDefaultChunk = !pageFrom && !pageTo && totalPages > DEFAULT_CHUNK_PAGES;
+  const effectiveFrom = isDefaultChunk ? 1 : pageFrom;
+  const effectiveTo   = isDefaultChunk ? DEFAULT_CHUNK_PAGES : pageTo;
+  const pageText = applyPageRange(text, effectiveFrom, effectiveTo);
+  const moreHint = isDefaultChunk
+    ? `\n\n💡 Showing pages 1–${DEFAULT_CHUNK_PAGES} of ${totalPages}. ` +
+      `Call again with \`page_from=${DEFAULT_CHUNK_PAGES + 1}, page_to=${DEFAULT_CHUNK_PAGES * 2}\` to continue.`
+    : "";
+  return `📄 **${filename}** ${label}\n\n${pageText}${moreHint}`;
+}
+
+function applyPageRange(fullText: string, pageFrom?: number, pageTo?: number): string {
+  const pageRegex = /=== Page (\d+) ===/g;
+  const pageStarts: { page: number; index: number }[] = [];
+  let match: RegExpExecArray | null;
+
+  while ((match = pageRegex.exec(fullText)) !== null) {
+    pageStarts.push({ page: parseInt(match[1], 10), index: match.index });
+  }
+
+  const totalPages = pageStarts.length;
+  const summary = `[📄 Total pages: ${totalPages}${pageFrom ? ` | Showing pages ${pageFrom}–${pageTo ?? totalPages}` : ""}]\n`;
+
+  if (!pageFrom && !pageTo) return summary + fullText;
+  if (totalPages === 0)    return summary + fullText;
+
+  const from = pageFrom ?? 1;
+  const to   = pageTo   ?? totalPages;
+
+  const startEntry = pageStarts.find((p) => p.page === from);
+  const endEntry   = pageStarts.find((p) => p.page === to + 1);
+
+  if (!startEntry) return summary + fullText;
+  const slice = endEntry
+    ? fullText.slice(startEntry.index, endEntry.index)
+    : fullText.slice(startEntry.index);
+
+  return summary + slice;
+}
+
 export async function ocrPdfFromGraph(
   driveId: string,
   itemId: string,
   accessToken: string
 ): Promise<string> {
-  const downloadUrl = `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${itemId}/content`;
-  const res = await fetch(downloadUrl, {
-    headers: { Authorization: `Bearer ${accessToken}` },
-  });
-
-  if (!res.ok) {
-    throw new Error(`Graph download failed: ${res.status} ${res.statusText}`);
-  }
-
-  const pdfBuffer = Buffer.from(await res.arrayBuffer());
-
   const client = DocumentIntelligence(DI_ENDPOINT, new AzureKeyCredential(DI_KEY));
+
+  // ── Always binary mode ────────────────────────────────────────────────────
+  // URL mode (@microsoft.graph.downloadUrl) was causing Azure DI to receive
+  // only 2 pages for multi-page scanned PDFs — the SharePoint pre-auth URL
+  // can return a partial/preview response. Binary mode downloads the full file
+  // via Graph API (with Bearer token) and uploads it directly to Azure DI,
+  // guaranteeing the complete PDF is processed.
+  log(`OCR: downloading ${itemId} via Graph API (binary mode)...`);
+  const dlRes = await fetch(
+    `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${itemId}/content`,
+    { headers: { Authorization: `Bearer ${accessToken}` } }
+  );
+  if (!dlRes.ok) {
+    throw new Error(`Graph download failed: ${dlRes.status} ${dlRes.statusText}`);
+  }
+  const pdfBuffer = Buffer.from(await dlRes.arrayBuffer());
+  log(`OCR: downloaded ${(pdfBuffer.length / 1024 / 1024).toFixed(1)} MB — submitting to Azure DI...`);
 
   const initialResponse = await client
     .path("/documentModels/{modelId}:analyze", "prebuilt-layout")
@@ -180,23 +485,57 @@ export async function ocrPdfFromGraph(
     throw new Error(`Azure DI error: ${initialResponse.body.error?.message}`);
   }
 
-  const poller = getLongRunningPoller(client, initialResponse, { intervalInMs: 1000 });
+  const poller = getLongRunningPoller(client, initialResponse, { intervalInMs: 2000 });
   const result = await poller.pollUntilDone();
 
   const doc = result.body as any;
+  const analyzeResult = doc.analyzeResult;
+  const pages: any[]  = analyzeResult?.pages ?? [];
+  const fullContent: string = analyzeResult?.content ?? "";
+
+  log(`Azure DI returned ${pages.length} pages, ${fullContent.length} chars`);
+
+  if (pages.length === 0) {
+    throw new Error(
+      "Azure Document Intelligence returned 0 pages. " +
+      "The PDF may be password-protected, corrupted, or in an unsupported format."
+    );
+  }
+
   const lines: string[] = [];
 
-  for (const page of doc.analyzeResult?.pages ?? []) {
+  for (const page of pages) {
     lines.push(`\n=== Page ${page.pageNumber} ===`);
-    for (const line of page.lines ?? []) {
-      lines.push(line.content);
+
+    // PRIMARY: use page.spans to slice the exact text for this page from
+    // analyzeResult.content — spans are always present, lines are optional.
+    // Offsets are utf16CodeUnit — matches JS string indexing natively.
+    if (page.spans?.length > 0 && fullContent) {
+      const parts: string[] = [];
+      for (const span of page.spans as { offset: number; length: number }[]) {
+        parts.push(fullContent.substring(span.offset, span.offset + span.length));
+      }
+      const pageText = parts.join("").trim();
+      if (pageText) { lines.push(pageText); continue; }
+    }
+
+    // FALLBACK: explicit lines (may be absent for digital/signed PDFs)
+    if (page.lines?.length > 0) {
+      for (const line of page.lines) lines.push(line.content);
+      continue;
+    }
+
+    // LAST RESORT: join individual words
+    if (page.words?.length > 0) {
+      lines.push((page.words as { content: string }[]).map(w => w.content).join(" "));
     }
   }
 
-  for (let i = 0; i < (doc.analyzeResult?.tables ?? []).length; i++) {
-    const table = doc.analyzeResult.tables[i];
+  // Append tables (prebuilt-layout only)
+  const tables: any[] = analyzeResult?.tables ?? [];
+  for (let i = 0; i < tables.length; i++) {
     lines.push(`\n=== Table ${i + 1} ===`);
-    for (const cell of table.cells ?? []) {
+    for (const cell of tables[i].cells ?? []) {
       lines.push(`[${cell.rowIndex},${cell.columnIndex}] ${cell.content}`);
     }
   }
