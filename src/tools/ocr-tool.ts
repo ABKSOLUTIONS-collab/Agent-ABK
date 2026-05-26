@@ -9,7 +9,6 @@ const DI_KEY      = process.env.AZURE_DI_KEY ?? "";
 
 // ── OneDrive OCR Cache ────────────────────────────────────────────────────────
 const OCR_CACHE_FOLDER = "OCR Files";
-const DEFAULT_CHUNK_PAGES = 20;
 
 function log(msg: string) {
   process.stderr.write(`[ocr-tool] ${msg}\n`);
@@ -99,14 +98,12 @@ async function saveOcrCache(accessToken: string, cacheFilename: string, text: st
 export const OCR_TOOL = {
   name: "ocr_search_and_read",
   description:
-    "OCR a scanned PDF or image-based document from SharePoint/OneDrive and return its text. " +
+    "OCR a scanned PDF or image-based document from SharePoint/OneDrive and return its full text. " +
     "PREFERRED: pass drive_id + item_id directly (from list_sharepoint_folder) to skip search. " +
     "FALLBACK: pass query to search by filename/keywords. " +
-    `Without page_from/page_to the first ${DEFAULT_CHUNK_PAGES} pages are returned; ` +
-    "the response includes total page count and a hint to continue reading. " +
-    `Use page_from/page_to to read in chunks of up to ${DEFAULT_CHUNK_PAGES} pages (e.g. 1-20, then 21-40). ` +
-    "After the first OCR run the result is cached in OneDrive — subsequent chunk calls are instant. " +
-    "For large documents (60-100+ pages) OCR runs in the background (~5-8 min); use check_only=true to poll " +
+    "Returns ALL pages by default. Use page_from/page_to only if you need a specific range. " +
+    "After the first OCR run the full text is cached in OneDrive — subsequent calls are instant. " +
+    "For large documents (60-100+ pages) OCR runs in the background (~3-8 min); use check_only=true to poll " +
     "for completion without re-triggering OCR. Use force_refresh=true to discard a bad cache and re-run.",
   inputSchema: {
     type: "object",
@@ -148,13 +145,11 @@ export const OCR_TOOL = {
       },
       page_from: {
         type: "number",
-        description:
-          `First page to return (1-based). If omitted, defaults to page 1 and returns the first ${DEFAULT_CHUNK_PAGES} pages.`,
+        description: "First page to return (1-based). If omitted, returns from page 1.",
       },
       page_to: {
         type: "number",
-        description:
-          `Last page to return (inclusive). Recommended chunk size: ${DEFAULT_CHUNK_PAGES} pages at a time.`,
+        description: "Last page to return (inclusive). If omitted, returns all pages to the end.",
       },
     },
   },
@@ -217,8 +212,7 @@ export class OcrToolHandler {
               type: "text",
               text:
                 `✅ **${filename}** — OCR complete (${total} pages cached)\n\n` +
-                `You can now read it with \`page_from\`/\`page_to\`. ` +
-                `Example: \`page_from=1, page_to=${DEFAULT_CHUNK_PAGES}\``,
+                `Call again without \`check_only\` to read the full document.`,
             }],
           };
         }
@@ -409,16 +403,8 @@ function buildPagedResponse(
   pageFrom?: number,
   pageTo?: number
 ): string {
-  const totalPages = countPages(text);
-  const isDefaultChunk = !pageFrom && !pageTo && totalPages > DEFAULT_CHUNK_PAGES;
-  const effectiveFrom = isDefaultChunk ? 1 : pageFrom;
-  const effectiveTo   = isDefaultChunk ? DEFAULT_CHUNK_PAGES : pageTo;
-  const pageText = applyPageRange(text, effectiveFrom, effectiveTo);
-  const moreHint = isDefaultChunk
-    ? `\n\n💡 Showing pages 1–${DEFAULT_CHUNK_PAGES} of ${totalPages}. ` +
-      `Call again with \`page_from=${DEFAULT_CHUNK_PAGES + 1}, page_to=${DEFAULT_CHUNK_PAGES * 2}\` to continue.`
-    : "";
-  return `📄 **${filename}** ${label}\n\n${pageText}${moreHint}`;
+  const pageText = applyPageRange(text, pageFrom, pageTo);
+  return `📄 **${filename}** ${label}\n\n${pageText}`;
 }
 
 function applyPageRange(fullText: string, pageFrom?: number, pageTo?: number): string {

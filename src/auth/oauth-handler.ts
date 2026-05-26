@@ -19,6 +19,7 @@ interface PendingAuth {
   codeVerifier: string;
   sessionToken: string;
   createdAt: number;
+  redirectUri?: string;
 }
 
 const pendingAuths = new Map<string, PendingAuth>();
@@ -130,6 +131,7 @@ export function registerOAuthEndpoints(app: Express, config: OAuthConfig): void 
       codeVerifier: code_challenge ?? "",
       sessionToken,
       createdAt: Date.now(),
+      redirectUri: redirect_uri,
     });
     const cutoff = Date.now() - 10 * 60 * 1000;
     for (const [key, val] of pendingAuths.entries()) {
@@ -310,7 +312,7 @@ export function registerOAuthEndpoints(app: Express, config: OAuthConfig): void 
         return;
       }
 
-      // ── Redirect back to claude.ai ────────────────────────────────────────
+      // ── Redirect back to the OAuth client (Claude, ChatGPT, Cursor, etc.) ──
       const authCode = `${finalSessionToken}:${generateToken(8)}`;
       pendingAuths.set(authCode, {
         state: pending.state,
@@ -318,10 +320,11 @@ export function registerOAuthEndpoints(app: Express, config: OAuthConfig): void 
         sessionToken: finalSessionToken,
         createdAt: Date.now(),
       });
-      const claudeCallback = `https://claude.ai/api/mcp/auth_callback`;
-      const redirectUrl = new URL(claudeCallback);
+      const clientCallback = pending.redirectUri ?? `https://claude.ai/api/mcp/auth_callback`;
+      const redirectUrl = new URL(clientCallback);
       redirectUrl.searchParams.set("code", authCode);
       redirectUrl.searchParams.set("state", pending.state);
+      log(`OAuth: redirecting back to client: ${clientCallback}`);
       res.redirect(redirectUrl.toString());
 
     } catch (e) {

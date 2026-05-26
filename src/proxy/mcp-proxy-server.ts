@@ -161,6 +161,7 @@ export class McpProxyServer {
   async start(): Promise<void> {
     const app = express();
     app.use(express.json());
+    app.use(express.urlencoded({ extended: false }));
 
     app.use((_req, res, next) => {
       res.header("Access-Control-Allow-Origin", "*");
