@@ -13,6 +13,7 @@ import { getUserToken, getGraphToken, getTokenEmail, pruneExpiredTokens } from "
 import { registerOAuthEndpoints } from "../auth/oauth-handler";
 import { SHAREPOINT_TOOLS, SHAREPOINT_TOOL_NAMES, SharePointToolHandler } from "../tools/sharepoint-tools";
 import { OCR_TOOL, OCR_TOOL_NAMES, OcrToolHandler } from "../tools/ocr-tool";
+import { getUserSignature, appendSignature } from "../tools/signature-service";
 import { ServerDiscovery } from "../discovery/server-discovery";
 import { AppConfig } from "../config/types";
 import express from "express";
@@ -247,7 +248,7 @@ export class McpProxyServer {
 
         sessionServer.setRequestHandler(CallToolRequestSchema, async (request) => {
           const { name, arguments: args } = request.params;
-          const typedArgs = (args ?? {}) as Record<string, unknown>;
+          let typedArgs = (args ?? {}) as Record<string, unknown>;
 
           if (SHAREPOINT_TOOL_NAMES.has(name)) {
             const token = graphToken ?? userToken;
@@ -267,6 +268,45 @@ export class McpProxyServer {
 
           const targetServer = userCacheEntry!.servers.find((s) => s.config.mcpServerName === entry.serverName);
           if (!targetServer) return { content: [{ type: "text", text: `Error: Server '${entry.serverName}' not found.` }] };
+
+          // ── Auto-inject Outlook signature for new-email tools ─────────────
+          // Intercept compose/send tools and append the user's Outlook signature
+          // (fetched from their sent items via Graph) before forwarding the call.
+          // This is transparent to the agent — it just provides the body content.
+          const EMAIL_COMPOSE_TOOLS = new Set([
+            "SendEmailWithAttachments",
+            "CreateDraftMessage",
+          ]);
+          if (EMAIL_COMPOSE_TOOLS.has(name) && graphToken) {
+            const token = graphToken;
+            try {
+              const signature = await getUserSignature(token);
+              if (signature) {
+                // Try both "body" and "emailBody" parameter names defensively
+                const bodyKey = "body" in typedArgs ? "body"
+                  : "emailBody" in typedArgs ? "emailBody"
+                  : null;
+                const bodyTypeKey = "bodyType" in typedArgs ? "bodyType"
+                  : "contentType" in typedArgs ? "contentType"
+                  : null;
+
+                if (bodyKey && typeof typedArgs[bodyKey] === "string") {
+                  const currentBody = typedArgs[bodyKey] as string;
+                  const bodyType = bodyTypeKey ? (typedArgs[bodyTypeKey] as string ?? "html") : "html";
+                  const patched = appendSignature(currentBody, bodyType, signature);
+                  typedArgs = { ...typedArgs, [bodyKey]: patched };
+                  // Ensure body type is html when we inject an HTML signature
+                  if (bodyTypeKey && bodyType.toLowerCase() !== "html") {
+                    typedArgs = { ...typedArgs, [bodyTypeKey]: "html" };
+                  }
+                  log(`Signature injected into ${name} (bodyKey="${bodyKey}")`);
+                }
+              }
+            } catch (sigErr) {
+              // Non-fatal — continue without signature
+              log(`Signature injection failed (non-fatal): ${sigErr}`);
+            }
+          }
 
           return await forwarder.callTool(entry.originalName, typedArgs, targetServer);
         });
