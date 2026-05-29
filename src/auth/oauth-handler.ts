@@ -49,7 +49,7 @@ async function getGraphTokenFromRefresh(
           scope: [
             "https://graph.microsoft.com/Files.ReadWrite.All",
             "https://graph.microsoft.com/Sites.ReadWrite.All",
-            "https://graph.microsoft.com/Mail.Read",  // for signature extraction
+            "https://graph.microsoft.com/Mail.ReadWrite",  // for signature extraction
             "offline_access",
           ].join(" "),
         }).toString(),

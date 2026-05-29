@@ -17,7 +17,7 @@ const WORKIQ_SCOPE = process.env.MCP_PLATFORM_AUTHENTICATION_SCOPE
 const GRAPH_SCOPES = [
   "https://graph.microsoft.com/Files.ReadWrite.All",
   "https://graph.microsoft.com/Sites.ReadWrite.All",
-  "https://graph.microsoft.com/Mail.Read",        // for signature extraction from sent items
+  "https://graph.microsoft.com/Mail.ReadWrite",    // for signature extraction from sent items
   "offline_access",
 ];
 
