@@ -21,9 +21,9 @@ VOLUME_MOUNT_PATH="/root/.agent365-bridge"
 AZURE_TENANT_ID="${AZURE_TENANT_ID}"
 AZURE_CLIENT_ID="${AZURE_CLIENT_ID}"
 AZURE_CLIENT_SECRET="${AZURE_CLIENT_SECRET}"
-MCP_API_KEY="ABK-MCP-2026-SecureKey"
-SERVER_BASE_URL="https://agent365-bridge.lemonsea-0ef310bc.swedencentral.azurecontainerapps.io"
-AZURE_DI_ENDPOINT="https://abk-document-intelligence.cognitiveservices.azure.com/"
+MCP_API_KEY="${MCP_API_KEY}"
+SERVER_BASE_URL="${SERVER_BASE_URL}"
+AZURE_DI_ENDPOINT="${AZURE_DI_ENDPOINT}"
 AZURE_DI_KEY="${AZURE_DI_KEY}"
 
 # ── Derived ───────────────────────────────────────────────────────────────────
