@@ -13,7 +13,15 @@ import { getUserToken, getGraphToken, getTokenEmail, pruneExpiredTokens } from "
 import { registerOAuthEndpoints } from "../auth/oauth-handler";
 import { SHAREPOINT_TOOLS, SHAREPOINT_TOOL_NAMES, SharePointToolHandler } from "../tools/sharepoint-tools";
 import { OCR_TOOL, OCR_TOOL_NAMES, OcrToolHandler } from "../tools/ocr-tool";
-import { getUserSignature, appendSignature } from "../tools/signature-service";
+import {
+  SIGNATURE_STYLE_TOOL,
+  SIGNATURE_STYLE_TOOL_NAME,
+  SET_SIGNATURE_TOOL,
+  SET_SIGNATURE_TOOL_NAME,
+  EMAIL_TOOLS_REQUIRING_SIGNATURE,
+  handleGetSignatureStyle,
+  handleSetSignature,
+} from "../tools/signature-style-tool";
 import { ServerDiscovery } from "../discovery/server-discovery";
 import { AppConfig } from "../config/types";
 import express from "express";
@@ -178,7 +186,7 @@ export class McpProxyServer {
       res.json({
         status: "ok",
         server: "agent365-bridge",
-        cachedTools: this.sharedToolRegistry.size + SHAREPOINT_TOOLS.length + 1,
+        cachedTools: this.sharedToolRegistry.size + SHAREPOINT_TOOLS.length + 2,
         activeUsers: this.userCache.size,
       });
     });
@@ -240,9 +248,25 @@ export class McpProxyServer {
 
         sessionServer.setRequestHandler(ListToolsRequestSchema, async () => ({
           tools: [
-            ...Array.from(toolRegistry.values()).map((e) => e.toolDef),
+            ...Array.from(toolRegistry.values()).map((e) => {
+              // Patch descriptions of email composition tools to instruct the LLM
+              // that it must call GetUserEmailSignatureStyle before composing emails.
+              if (
+                EMAIL_TOOLS_REQUIRING_SIGNATURE.has(e.uniqueName) ||
+                EMAIL_TOOLS_REQUIRING_SIGNATURE.has(e.originalName)
+              ) {
+                return {
+                  ...e.toolDef,
+                  description:
+                    (e.toolDef.description ?? "") +
+                    "\n\nIMPORTANT: You MUST call GetUserEmailSignatureStyle BEFORE using this tool. Use the signature found there and append it verbatim to the bottom of the email body.",
+                };
+              }
+              return e.toolDef;
+            }),
             ...SHAREPOINT_TOOLS,
             OCR_TOOL,
+            SIGNATURE_STYLE_TOOL,
           ],
         }));
 
@@ -262,51 +286,21 @@ export class McpProxyServer {
             return handler.handleToolCall(name, typedArgs);
           }
 
+          // ── Signature tool (dual-purpose: save if name given, read otherwise) ──
+          if (name === SIGNATURE_STYLE_TOOL_NAME || name === SET_SIGNATURE_TOOL_NAME) {
+            if (!graphToken) {
+              return { content: [{ type: "text", text: "Graph token not available. Please re-authenticate." }] };
+            }
+            const result = await handleGetSignatureStyle(graphToken, typedArgs);
+            return { content: [{ type: "text", text: result }] };
+          }
+
           const entry = toolRegistry.get(name);
           if (!entry) return { content: [{ type: "text", text: `Error: Tool '${name}' not found.` }] };
           if (!forwarder) return { content: [{ type: "text", text: "Tools still loading. Please try again in a moment." }] };
 
           const targetServer = userCacheEntry!.servers.find((s) => s.config.mcpServerName === entry.serverName);
           if (!targetServer) return { content: [{ type: "text", text: `Error: Server '${entry.serverName}' not found.` }] };
-
-          // ── Auto-inject Outlook signature for new-email tools ─────────────
-          // Intercept compose/send tools and append the user's Outlook signature
-          // (fetched from their sent items via Graph) before forwarding the call.
-          // This is transparent to the agent — it just provides the body content.
-          const EMAIL_COMPOSE_TOOLS = new Set([
-            "SendEmailWithAttachments",
-            "CreateDraftMessage",
-          ]);
-          if (EMAIL_COMPOSE_TOOLS.has(name) && graphToken) {
-            const token = graphToken;
-            try {
-              const signature = await getUserSignature(token);
-              if (signature) {
-                // Try both "body" and "emailBody" parameter names defensively
-                const bodyKey = "body" in typedArgs ? "body"
-                  : "emailBody" in typedArgs ? "emailBody"
-                  : null;
-                const bodyTypeKey = "bodyType" in typedArgs ? "bodyType"
-                  : "contentType" in typedArgs ? "contentType"
-                  : null;
-
-                if (bodyKey && typeof typedArgs[bodyKey] === "string") {
-                  const currentBody = typedArgs[bodyKey] as string;
-                  const bodyType = bodyTypeKey ? (typedArgs[bodyTypeKey] as string ?? "html") : "html";
-                  const patched = appendSignature(currentBody, bodyType, signature);
-                  typedArgs = { ...typedArgs, [bodyKey]: patched };
-                  // Ensure body type is html when we inject an HTML signature
-                  if (bodyTypeKey && bodyType.toLowerCase() !== "html") {
-                    typedArgs = { ...typedArgs, [bodyTypeKey]: "html" };
-                  }
-                  log(`Signature injected into ${name} (bodyKey="${bodyKey}")`);
-                }
-              }
-            } catch (sigErr) {
-              // Non-fatal — continue without signature
-              log(`Signature injection failed (non-fatal): ${sigErr}`);
-            }
-          }
 
           return await forwarder.callTool(entry.originalName, typedArgs, targetServer);
         });
@@ -346,6 +340,8 @@ export class McpProxyServer {
           ...Array.from(this.sharedToolRegistry.values()).map((e) => e.toolDef),
           ...SHAREPOINT_TOOLS,
           OCR_TOOL,
+          SIGNATURE_STYLE_TOOL,
+          SET_SIGNATURE_TOOL,
         ],
       }));
       await sseServer.connect(transport);
@@ -381,6 +377,7 @@ export class McpProxyServer {
           ...Array.from(this.sharedToolRegistry.values()).map((e) => e.toolDef),
           ...SHAREPOINT_TOOLS,
           OCR_TOOL,
+          SIGNATURE_STYLE_TOOL,
         ],
       }));
       server.setRequestHandler(CallToolRequestSchema, async () => ({
