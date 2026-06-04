@@ -20,6 +20,7 @@
     "@azure/core-auth": "^1.10.1",
     "@azure/data-tables": "^13.3.2",
     "@azure/identity": "^4.12.1",
+    "@azure/storage-blob": "^12.31.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "dotenv": "^16.4.5",
     "express": "^5.2.1",
