@@ -106,10 +106,10 @@ export function invalidateSignatureCache(graphToken: string): void {
 
 async function fetchSignatureFromSentItems(graphToken: string): Promise<string | null> {
   try {
-    // Fetch the 5 most recent HTML sent emails
+    // Fetch the 20 most recent HTML sent emails (with attachments for cid: resolution)
     const url =
       "https://graph.microsoft.com/v1.0/me/mailFolders/sentItems/messages" +
-      "?$top=5&$select=body&$orderby=sentDateTime+desc";
+      "?$top=20&$select=id,body&$expand=attachments&$orderby=sentDateTime+desc";
 
     const resp = await fetch(url, {
       headers: {
@@ -130,13 +130,33 @@ async function fetchSignatureFromSentItems(graphToken: string): Promise<string |
     }
 
     const data = await resp.json() as {
-      value?: Array<{ body?: { contentType?: string; content?: string } }>;
+      value?: Array<{
+        id?: string;
+        body?: { contentType?: string; content?: string };
+        attachments?: Array<{ contentId?: string; contentType?: string; contentBytes?: string; name?: string }>;
+      }>;
     };
 
     for (const msg of data.value ?? []) {
       const contentType = msg.body?.contentType ?? "";
-      const content = msg.body?.content ?? "";
+      let content = msg.body?.content ?? "";
       if (contentType.toLowerCase() !== "html" || !content) continue;
+
+      // Replace cid: references with inline base64 data URIs using attachments
+      const attachments = msg.attachments ?? [];
+      for (const att of attachments) {
+        if (att.contentId && att.contentBytes && att.contentType) {
+          const cidClean = att.contentId.replace(/[<>]/g, "");
+          const dataUri = `data:${att.contentType};base64,${att.contentBytes}`;
+          content = content.replace(new RegExp(`cid:${cidClean}`, "g"), dataUri);
+        }
+      }
+
+      // Skip emails that still have unresolved cid: references (logo not embedded)
+      if (/cid:[a-zA-Z0-9]/i.test(content)) {
+        log("Skipping email with unresolved cid: references");
+        continue;
+      }
 
       const sig = extractSignature(content);
       if (sig) return sig;

@@ -17,14 +17,14 @@ STORAGE_SHARE_NAME="agent365-tokens"
 VOLUME_NAME="token-storage"
 VOLUME_MOUNT_PATH="/root/.agent365-bridge"
 
-# ── Secrets ───────────────────────────────────────────────────────────────────
-AZURE_TENANT_ID="${AZURE_TENANT_ID}"
-AZURE_CLIENT_ID="${AZURE_CLIENT_ID}"
-AZURE_CLIENT_SECRET="${AZURE_CLIENT_SECRET}"
-MCP_API_KEY="${MCP_API_KEY}"
-SERVER_BASE_URL="${SERVER_BASE_URL}"
-AZURE_DI_ENDPOINT="${AZURE_DI_ENDPOINT}"
-AZURE_DI_KEY="${AZURE_DI_KEY}"
+# ── Secrets (must be exported in the calling shell before running) ────────────
+: "${AZURE_TENANT_ID:?Need AZURE_TENANT_ID}"
+: "${AZURE_CLIENT_ID:?Need AZURE_CLIENT_ID}"
+: "${AZURE_CLIENT_SECRET:?Need AZURE_CLIENT_SECRET}"
+: "${MCP_API_KEY:?Need MCP_API_KEY}"
+: "${SERVER_BASE_URL:?Need SERVER_BASE_URL}"
+: "${AZURE_DI_ENDPOINT:?Need AZURE_DI_ENDPOINT}"
+: "${AZURE_DI_KEY:?Need AZURE_DI_KEY}"
 
 # ── Derived ───────────────────────────────────────────────────────────────────
 ACR_SERVER="${ACR_NAME,,}.azurecr.io"

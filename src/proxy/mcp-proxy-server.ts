@@ -22,6 +22,7 @@ import {
   handleGetSignatureStyle,
   handleSetSignature,
 } from "../tools/signature-style-tool";
+import { getUserSignature, appendSignature } from "../tools/signature-service";
 import { ServerDiscovery } from "../discovery/server-discovery";
 import { AppConfig } from "../config/types";
 import express from "express";
@@ -301,6 +302,31 @@ export class McpProxyServer {
 
           const targetServer = userCacheEntry!.servers.find((s) => s.config.mcpServerName === entry.serverName);
           if (!targetServer) return { content: [{ type: "text", text: `Error: Server '${entry.serverName}' not found.` }] };
+
+          // ── Auto-inject signature for outgoing email tools ──────────────────
+          if (EMAIL_TOOLS_REQUIRING_SIGNATURE.has(name) && graphToken) {
+            try {
+              const signature = await getUserSignature(graphToken);
+              if (signature) {
+                const bodyKey = "body" in typedArgs ? "body"
+                  : "emailBody" in typedArgs ? "emailBody"
+                  : null;
+                const bodyTypeKey = "bodyType" in typedArgs ? "bodyType"
+                  : "contentType" in typedArgs ? "contentType"
+                  : null;
+                if (bodyKey && typeof typedArgs[bodyKey] === "string") {
+                  const bodyType = bodyTypeKey ? (typedArgs[bodyTypeKey] as string ?? "html") : "html";
+                  typedArgs = { ...typedArgs, [bodyKey]: appendSignature(typedArgs[bodyKey] as string, bodyType, signature) };
+                  if (bodyTypeKey && bodyType.toLowerCase() !== "html") {
+                    typedArgs = { ...typedArgs, [bodyTypeKey]: "html" };
+                  }
+                  log(`Signature auto-injected into ${name}`);
+                }
+              }
+            } catch (sigErr) {
+              log(`Signature auto-inject failed (non-fatal): ${sigErr}`);
+            }
+          }
 
           return await forwarder.callTool(entry.originalName, typedArgs, targetServer);
         });
