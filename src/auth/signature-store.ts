@@ -1,49 +1,54 @@
 /**
  * signature-store.ts
  *
- * Reads the ABK Solutions company logo from Azure Table Storage (table: agent365config).
- * The logo was uploaded once by the admin as a base64-encoded PNG string.
+ * Reads the ABK Solutions company logo from OneDrive:
+ *   Agent365-Bridge/abk-logo-sig.b64  (base64-encoded PNG)
  *
- * User signature TEXT is stored separately in OneDrive (signature-style-tool.ts).
+ * Cached in memory for the lifetime of the process.
+ * No Azure Table Storage dependency needed.
  */
-
-import { TableClient, AzureNamedKeyCredential } from "@azure/data-tables";
-
-const ACCOUNT      = process.env.AZURE_STORAGE_ACCOUNT ?? "";
-const ACCOUNT_KEY  = process.env.AZURE_STORAGE_KEY ?? "";
-const CONFIG_TABLE = "agent365config";
 
 function log(msg: string) {
   process.stderr.write(`[agent365-bridge] [sig-store] ${msg}\n`);
 }
 
-function getConfigClient(): TableClient {
-  if (!ACCOUNT || !ACCOUNT_KEY) throw new Error("Storage credentials missing");
-  return new TableClient(
-    `https://${ACCOUNT}.table.core.windows.net`,
-    CONFIG_TABLE,
-    new AzureNamedKeyCredential(ACCOUNT, ACCOUNT_KEY)
-  );
-}
+const ONEDRIVE_LOGO_PATH = "Agent365-Bridge/abk-logo-sig.b64";
 
 // ── In-memory cache ───────────────────────────────────────────────────────────
 let cachedLogoBase64: string | null = null;
 
 /**
  * Returns the ABK Solutions logo as a base64-encoded PNG string.
+ * Reads from OneDrive (Agent365-Bridge/abk-logo-sig.b64).
  * Cached in memory for the lifetime of the process.
  */
-export async function getCompanyLogoBase64(): Promise<string | null> {
+export async function getCompanyLogoBase64(graphToken?: string): Promise<string | null> {
   if (cachedLogoBase64) return cachedLogoBase64;
+  if (!graphToken) return null;
+
   try {
-    const client = getConfigClient();
-    const entity = await client.getEntity<{ value: string }>("config", "abk-logo-png");
-    cachedLogoBase64 = entity.value ?? null;
-    if (cachedLogoBase64) log("Company logo loaded from Table Storage");
+    const url = `https://graph.microsoft.com/v1.0/me/drive/root:/${ONEDRIVE_LOGO_PATH}:/content`;
+    const resp = await fetch(url, {
+      headers: { Authorization: `Bearer ${graphToken}` },
+    });
+
+    if (resp.status === 404) {
+      log("abk-logo-sig.b64 not found in OneDrive");
+      return null;
+    }
+    if (!resp.ok) {
+      log(`OneDrive logo fetch failed: ${resp.status}`);
+      return null;
+    }
+
+    const b64 = (await resp.text()).trim();
+    if (!b64) return null;
+
+    cachedLogoBase64 = b64;
+    log(`Company logo loaded from OneDrive (${b64.length} chars)`);
     return cachedLogoBase64;
-  } catch (err: unknown) {
-    const status = (err as { statusCode?: number }).statusCode;
-    if (status !== 404) log(`Error fetching company logo: ${err}`);
+  } catch (err) {
+    log(`Error fetching company logo: ${err}`);
     return null;
   }
 }

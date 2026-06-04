@@ -127,7 +127,7 @@ async function fetchSignatureFromOneDrive(graphToken: string): Promise<string | 
     const text = (await resp.text()).trim();
     if (!text) return null;
 
-    const logoBase64 = await getCompanyLogoBase64();
+    const logoBase64 = await getCompanyLogoBase64(graphToken);
     return buildSignatureHtml(text, logoBase64);
   } catch (err) {
     log(`OneDrive signature fetch error: ${err}`);
