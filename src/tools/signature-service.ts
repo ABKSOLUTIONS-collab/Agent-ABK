@@ -1,35 +1,33 @@
 /**
  * signature-service.ts
  *
- * Fetches the user's Outlook email signature by reading their most recent
- * sent HTML email via Microsoft Graph (requires Mail.Read scope on the
- * Graph token). The extracted signature is cached in memory per user for
- * 1 hour so we don't hit Graph on every send.
+ * Provides the user's HTML email signature for auto-injection into outgoing emails.
  *
- * Injection: appended to the email body before the agent's email is forwarded
- * to the upstream Agent365 MCP server.
+ * Priority:
+ *   1. OneDrive: Agent365-Bridge/signature.txt  (structured, per-user, always up-to-date)
+ *   2. Fallback: most recent HTML sent email via Graph (extracts Outlook signature)
+ *
+ * appendSignature() always produces an HTML body — plain text bodies are
+ * converted to HTML so the signature is never rendered as a squished string.
  */
+
+import { getCompanyLogoBase64 } from "../auth/signature-store";
 
 function log(msg: string) {
   process.stderr.write(`[agent365-bridge] [signature] ${msg}\n`);
 }
 
-// ── In-memory cache ───────────────────────────────────────────────────────────
-// Key: first 16 chars of graphToken (enough for isolation, not sensitive)
-// Value: { html, fetchedAt }
+// ── Cache ─────────────────────────────────────────────────────────────────────
 const CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
 
-interface CacheEntry {
-  html: string;
-  fetchedAt: number;
-}
+interface CacheEntry { html: string; fetchedAt: number; }
 const signatureCache = new Map<string, CacheEntry>();
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /**
- * Returns the user's HTML email signature, or null if it cannot be determined.
- * Results are cached for 1 hour.
+ * Returns the user's HTML email signature.
+ * Tries OneDrive signature.txt first, then sent items. Cached 1 hour.
  */
 export async function getUserSignature(graphToken: string): Promise<string | null> {
   const cacheKey = graphToken.substring(0, 16);
@@ -39,20 +37,30 @@ export async function getUserSignature(graphToken: string): Promise<string | nul
     return cached.html;
   }
 
-  const sig = await fetchSignatureFromSentItems(graphToken);
-  if (sig) {
-    signatureCache.set(cacheKey, { html: sig, fetchedAt: Date.now() });
-    log(`Signature cached (${sig.length} chars)`);
-  } else {
-    log("No signature found in sent items");
+  // 1️⃣ Try OneDrive signature.txt
+  const oneDriveSig = await fetchSignatureFromOneDrive(graphToken);
+  if (oneDriveSig) {
+    signatureCache.set(cacheKey, { html: oneDriveSig, fetchedAt: Date.now() });
+    log(`OneDrive signature loaded (${oneDriveSig.length} chars)`);
+    return oneDriveSig;
   }
-  return sig;
+
+  // 2️⃣ Fallback: extract from sent items
+  const sentSig = await fetchSignatureFromSentItems(graphToken);
+  if (sentSig) {
+    signatureCache.set(cacheKey, { html: sentSig, fetchedAt: Date.now() });
+    log(`Sent-items signature loaded (${sentSig.length} chars)`);
+    return sentSig;
+  }
+
+  log("No signature found");
+  return null;
 }
 
 /**
  * Appends the HTML signature to an email body.
- * Handles both HTML and plain-text bodies.
- * If the body already contains the signature (idempotency guard), returns unchanged.
+ * ALWAYS produces an HTML body — plain text is converted to HTML first.
+ * Idempotency: if the signature is already present, body is returned unchanged.
  */
 export function appendSignature(
   body: string,
@@ -61,71 +69,145 @@ export function appendSignature(
 ): string {
   if (!signature || !body) return body;
 
-  // Idempotency: don't double-append
-  // We detect our own injection by looking for a known stable part of the sig
-  const sigAnchor = extractIdempotencyAnchor(signature);
-  if (sigAnchor && body.includes(sigAnchor)) {
+  // Idempotency guard
+  const anchor = extractIdempotencyAnchor(signature);
+  if (anchor && body.includes(anchor)) {
     log("Signature already present — skipping injection");
     return body;
   }
 
   const isHtml = bodyType?.toLowerCase() === "html";
 
-  if (!isHtml) {
-    // Plain-text fallback: strip HTML tags from signature
-    const textSig = signature
-      .replace(/<br\s*\/?>/gi, "\n")
-      .replace(/<[^>]+>/g, "")
-      .replace(/&nbsp;/gi, " ")
-      .replace(/&amp;/gi, "&")
-      .replace(/&lt;/gi, "<")
-      .replace(/&gt;/gi, ">")
-      .replace(/\n{3,}/g, "\n\n")
-      .trim();
-    return `${body}\n\n--\n${textSig}`;
-  }
+  // Convert plain text to HTML so the signature renders correctly
+  let htmlBody = isHtml
+    ? body
+    : `<html><body><p style="font-family:Calibri,Arial,sans-serif;font-size:11pt;white-space:pre-wrap;">${escHtml(body)}</p></body></html>`;
 
-  // HTML: wrap signature in a standard separator div
-  const sigBlock = `<div style="margin-top:16px;padding-top:16px;border-top:1px solid #e0e0e0;">${signature}</div>`;
+  const sigBlock = `<div style="margin-top:20px;padding-top:16px;border-top:1px solid #d0d0d0;">${signature}</div>`;
 
-  // Insert before </body> if present; otherwise append
-  if (/<\/body>/i.test(body)) {
-    return body.replace(/<\/body>/i, `${sigBlock}</body>`);
+  if (/<\/body>/i.test(htmlBody)) {
+    return htmlBody.replace(/<\/body>/i, `${sigBlock}</body>`);
   }
-  return `${body}${sigBlock}`;
+  return `${htmlBody}${sigBlock}`;
 }
 
-/**
- * Invalidates the cached signature for a given graph token (e.g., after re-login).
- */
 export function invalidateSignatureCache(graphToken: string): void {
   signatureCache.delete(graphToken.substring(0, 16));
 }
 
-// ── Graph API fetch ───────────────────────────────────────────────────────────
+// ── OneDrive signature.txt ────────────────────────────────────────────────────
+
+const ONEDRIVE_SIG_PATH = "Agent365-Bridge/signature.txt";
+
+/**
+ * Reads Agent365-Bridge/signature.txt from the user's OneDrive and
+ * builds a structured HTML signature block with the ABK Solutions logo.
+ *
+ * File format (plain text, one item per line):
+ *   Line 1: Full name
+ *   Line 2: Job title
+ *   Line 3+: m: / t: / a: / w: / e: prefixed fields, or free text
+ */
+async function fetchSignatureFromOneDrive(graphToken: string): Promise<string | null> {
+  try {
+    const url = `https://graph.microsoft.com/v1.0/me/drive/root:/${ONEDRIVE_SIG_PATH}:/content`;
+    const resp = await fetch(url, {
+      headers: { Authorization: `Bearer ${graphToken}` },
+    });
+
+    if (resp.status === 404) {
+      log("No OneDrive signature.txt found — will try sent items");
+      return null;
+    }
+    if (!resp.ok) {
+      log(`OneDrive read failed: ${resp.status}`);
+      return null;
+    }
+
+    const text = (await resp.text()).trim();
+    if (!text) return null;
+
+    const logoBase64 = await getCompanyLogoBase64();
+    return buildSignatureHtml(text, logoBase64);
+  } catch (err) {
+    log(`OneDrive signature fetch error: ${err}`);
+    return null;
+  }
+}
+
+// ── HTML builder ──────────────────────────────────────────────────────────────
+
+function buildSignatureHtml(sigText: string, logoBase64: string | null): string {
+  const logoImg = logoBase64
+    ? `<img src="data:image/png;base64,${logoBase64}" alt="ABK Solutions" style="height:45px;width:auto;display:block;margin-bottom:10px;"/>`
+    : `<strong style="color:#0066CC;font-size:13pt;">ABK Solutions</strong><br/>`;
+
+  const lines = sigText.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+
+  const lineHtml = lines.map((line, i) => {
+    if (i === 0) {
+      // Full name — bold
+      return `<div style="font-size:11pt;font-weight:bold;color:#1a1a1a;">${escHtml(line)}</div>`;
+    }
+    if (i === 1) {
+      // Job title — grey
+      return `<div style="font-size:9.5pt;color:#666666;margin-bottom:6px;">${escHtml(line)}</div>`;
+    }
+
+    // Labelled fields: m: / t: / a: / w: / e:
+    const labelMatch = line.match(/^([mtawe]):\s*(.+)$/i);
+    if (labelMatch) {
+      const label = labelMatch[1].toLowerCase();
+      const value = labelMatch[2].trim();
+      const labelNames: Record<string, string> = { m: "m", t: "t", a: "a", w: "w", e: "e" };
+      const labelStr = `<span style="color:#0066CC;font-weight:600;">${labelNames[label]}:</span>`;
+
+      if (label === "e") {
+        return `<div style="font-size:9pt;">${labelStr} <a href="mailto:${escHtml(value)}" style="color:#0066CC;text-decoration:none;">${escHtml(value)}</a></div>`;
+      }
+      if (label === "w") {
+        const href = value.startsWith("http") ? value : `https://${value}`;
+        return `<div style="font-size:9pt;">${labelStr} <a href="${escHtml(href)}" style="color:#0066CC;text-decoration:none;">${escHtml(value)}</a></div>`;
+      }
+      return `<div style="font-size:9pt;">${labelStr} ${escHtml(value)}</div>`;
+    }
+
+    // Disclaimer or free text — small italic grey
+    if (line.length > 80) {
+      return `<div style="font-size:8pt;color:#888888;font-style:italic;margin-top:8px;max-width:520px;">${escHtml(line)}</div>`;
+    }
+
+    return `<div style="font-size:9pt;color:#444444;">${escHtml(line)}</div>`;
+  }).join("\n");
+
+  return `<div style="font-family:Calibri,Arial,sans-serif;line-height:1.6;color:#1a1a1a;">
+  ${logoImg}
+  ${lineHtml}
+</div>`;
+}
+
+function escHtml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+// ── Sent-items fallback ───────────────────────────────────────────────────────
 
 async function fetchSignatureFromSentItems(graphToken: string): Promise<string | null> {
   try {
-    // Fetch the 20 most recent HTML sent emails (with attachments for cid: resolution)
     const url =
       "https://graph.microsoft.com/v1.0/me/mailFolders/sentItems/messages" +
       "?$top=20&$select=id,body&$expand=attachments&$orderby=sentDateTime+desc";
 
     const resp = await fetch(url, {
-      headers: {
-        Authorization: `Bearer ${graphToken}`,
-        Accept: "application/json",
-        "Content-Type": "application/json",
-      },
+      headers: { Authorization: `Bearer ${graphToken}`, Accept: "application/json" },
     });
 
     if (resp.status === 403 || resp.status === 401) {
-      log(`Graph Mail.Read not authorized (${resp.status}) — skipping signature injection`);
+      log(`Mail.Read not authorized (${resp.status})`);
       return null;
     }
-
     if (!resp.ok) {
-      log(`Graph sentItems fetch failed: ${resp.status} ${resp.statusText}`);
+      log(`sentItems fetch failed: ${resp.status}`);
       return null;
     }
 
@@ -133,7 +215,7 @@ async function fetchSignatureFromSentItems(graphToken: string): Promise<string |
       value?: Array<{
         id?: string;
         body?: { contentType?: string; content?: string };
-        attachments?: Array<{ contentId?: string; contentType?: string; contentBytes?: string; name?: string }>;
+        attachments?: Array<{ contentId?: string; contentType?: string; contentBytes?: string }>;
       }>;
     };
 
@@ -142,17 +224,18 @@ async function fetchSignatureFromSentItems(graphToken: string): Promise<string |
       let content = msg.body?.content ?? "";
       if (contentType.toLowerCase() !== "html" || !content) continue;
 
-      // Replace cid: references with inline base64 data URIs using attachments
-      const attachments = msg.attachments ?? [];
-      for (const att of attachments) {
+      // Replace cid: references with inline base64 data URIs
+      for (const att of msg.attachments ?? []) {
         if (att.contentId && att.contentBytes && att.contentType) {
-          const cidClean = att.contentId.replace(/[<>]/g, "");
-          const dataUri = `data:${att.contentType};base64,${att.contentBytes}`;
-          content = content.replace(new RegExp(`cid:${cidClean}`, "g"), dataUri);
+          const cid = att.contentId.replace(/[<>]/g, "");
+          content = content.replace(
+            new RegExp(`cid:${cid}`, "g"),
+            `data:${att.contentType};base64,${att.contentBytes}`
+          );
         }
       }
 
-      // Skip emails that still have unresolved cid: references (logo not embedded)
+      // Skip if cid: references are still unresolved
       if (/cid:[a-zA-Z0-9]/i.test(content)) {
         log("Skipping email with unresolved cid: references");
         continue;
@@ -169,136 +252,80 @@ async function fetchSignatureFromSentItems(graphToken: string): Promise<string |
   }
 }
 
-// ── Signature extraction ──────────────────────────────────────────────────────
+// ── Signature extraction from HTML email ──────────────────────────────────────
 
-/**
- * Attempts to extract the signature block from a full HTML email body.
- * Tries multiple strategies in order of reliability.
- */
 function extractSignature(html: string): string | null {
-  // Strategy 1: OWA inserts signatures in a <div id="Signature"> element
   const sigById = extractByDivId(html, "Signature");
   if (sigById) { log("Extracted via div#Signature"); return sigById; }
 
-  // Strategy 2: Older Outlook uses <div id="appendonsend">
   const appendOnSend = extractByDivId(html, "appendonsend");
   if (appendOnSend) { log("Extracted via div#appendonsend"); return appendOnSend; }
 
-  // Strategy 3: Look for the divider between main body and signature.
-  // OWA's compose wrapper is typically <div id="divtagdefaultwrapper"> (user content)
-  // followed immediately by the signature div.
   const afterWrapper = extractAfterMainWrapper(html);
   if (afterWrapper) { log("Extracted after divtagdefaultwrapper"); return afterWrapper; }
 
-  // Strategy 4: Company-specific — find the first div that contains
-  // an image whose src/alt contains "abk" (the ABK Solutions logo).
   const byLogo = extractByCompanyLogo(html);
   if (byLogo) { log("Extracted via ABK logo anchor"); return byLogo; }
 
-  // Strategy 5: Last resort — extract content after the last <hr> tag
   const afterHr = extractAfterLastHr(html);
   if (afterHr) { log("Extracted after <hr>"); return afterHr; }
 
   return null;
 }
 
-/** Extracts a <div id="..."> and its content (handles nested divs). */
 function extractByDivId(html: string, id: string): string | null {
   const re = new RegExp(`<div[^>]+id=["']${id}["'][^>]*>`, "i");
   const match = re.exec(html);
   if (!match) return null;
-
   const start = match.index;
-  const innerStart = start + match[0].length;
-
-  // Walk forward counting open/close divs to find the matching </div>
   let depth = 1;
-  let i = innerStart;
+  let i = start + match[0].length;
   while (i < html.length && depth > 0) {
     const openIdx = html.indexOf("<div", i);
     const closeIdx = html.indexOf("</div>", i);
     if (closeIdx < 0) break;
-    if (openIdx >= 0 && openIdx < closeIdx) {
-      depth++;
-      i = openIdx + 4;
-    } else {
-      depth--;
-      if (depth === 0) {
-        return html.substring(start, closeIdx + 6).trim() || null;
-      }
-      i = closeIdx + 6;
-    }
+    if (openIdx >= 0 && openIdx < closeIdx) { depth++; i = openIdx + 4; }
+    else { depth--; if (depth === 0) return html.substring(start, closeIdx + 6).trim() || null; i = closeIdx + 6; }
   }
   return null;
 }
 
-/** Extracts content that follows OWA's main content wrapper div. */
 function extractAfterMainWrapper(html: string): string | null {
   const wrapperRe = /<div[^>]+id=["']divtagdefaultwrapper["'][^>]*>/i;
   const wrapperMatch = wrapperRe.exec(html);
   if (!wrapperMatch) return null;
-
-  // Find the end of this div
   let depth = 1;
   let i = wrapperMatch.index + wrapperMatch[0].length;
   while (i < html.length && depth > 0) {
     const openIdx = html.indexOf("<div", i);
     const closeIdx = html.indexOf("</div>", i);
     if (closeIdx < 0) break;
-    if (openIdx >= 0 && openIdx < closeIdx) {
-      depth++;
-      i = openIdx + 4;
-    } else {
-      depth--;
-      i = closeIdx + 6;
-    }
+    if (openIdx >= 0 && openIdx < closeIdx) { depth++; i = openIdx + 4; }
+    else { depth--; i = closeIdx + 6; }
   }
-
-  // Everything after the wrapper div, up to </body>
   const after = html.substring(i).replace(/<\/body>[\s\S]*$/i, "").trim();
-
-  // Only return if there's substantial content (not just whitespace/empty divs)
-  const textContent = after.replace(/<[^>]+>/g, "").trim();
-  if (textContent.length > 20) return after;
-  return null;
+  return after.replace(/<[^>]+>/g, "").trim().length > 20 ? after : null;
 }
 
-/** Finds the first top-level div containing an image with "abk" in its src/alt. */
 function extractByCompanyLogo(html: string): string | null {
   const imgRe = /<img[^>]+(src|alt)=["'][^"']*abk[^"']*["'][^>]*>/i;
   const imgMatch = imgRe.exec(html);
   if (!imgMatch) return null;
-
-  // Walk backward to find the containing top-level div
-  const beforeImg = html.substring(0, imgMatch.index);
-  const lastDivStart = beforeImg.lastIndexOf("<div");
+  const lastDivStart = html.substring(0, imgMatch.index).lastIndexOf("<div");
   if (lastDivStart < 0) return null;
-
-  // Extract from that div to </body> (or end of content)
   const fromDiv = html.substring(lastDivStart);
   const bodyClose = fromDiv.search(/<\/body>/i);
-  const snippet = bodyClose >= 0 ? fromDiv.substring(0, bodyClose) : fromDiv;
-  return snippet.trim() || null;
+  return (bodyClose >= 0 ? fromDiv.substring(0, bodyClose) : fromDiv).trim() || null;
 }
 
-/** Extracts HTML after the last <hr> tag in the email. */
 function extractAfterLastHr(html: string): string | null {
   const hrIdx = html.lastIndexOf("<hr");
   if (hrIdx < 0) return null;
-
   const after = html.substring(hrIdx).replace(/<\/body>[\s\S]*$/i, "").trim();
-  const textContent = after.replace(/<[^>]+>/g, "").trim();
-  if (textContent.length > 20) return after;
-  return null;
+  return after.replace(/<[^>]+>/g, "").trim().length > 20 ? after : null;
 }
 
-/**
- * Picks a short, stable string from the signature to use as an idempotency
- * anchor — prevents double-injection if the agent somehow calls send twice.
- */
 function extractIdempotencyAnchor(signature: string): string | null {
-  // Use the first 40 chars of text content as the anchor
   const text = signature.replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
-  if (text.length >= 20) return text.substring(0, 40);
-  return null;
+  return text.length >= 20 ? text.substring(0, 40) : null;
 }
