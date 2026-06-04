@@ -249,22 +249,7 @@ export class McpProxyServer {
 
         sessionServer.setRequestHandler(ListToolsRequestSchema, async () => ({
           tools: [
-            ...Array.from(toolRegistry.values()).map((e) => {
-              // Patch descriptions of email composition tools to instruct the LLM
-              // that it must call GetUserEmailSignatureStyle before composing emails.
-              if (
-                EMAIL_TOOLS_REQUIRING_SIGNATURE.has(e.uniqueName) ||
-                EMAIL_TOOLS_REQUIRING_SIGNATURE.has(e.originalName)
-              ) {
-                return {
-                  ...e.toolDef,
-                  description:
-                    (e.toolDef.description ?? "") +
-                    "\n\nIMPORTANT: You MUST call GetUserEmailSignatureStyle BEFORE using this tool. Use the signature found there and append it verbatim to the bottom of the email body.",
-                };
-              }
-              return e.toolDef;
-            }),
+            ...Array.from(toolRegistry.values()).map((e) => e.toolDef),
             ...SHAREPOINT_TOOLS,
             OCR_TOOL,
             SIGNATURE_STYLE_TOOL,

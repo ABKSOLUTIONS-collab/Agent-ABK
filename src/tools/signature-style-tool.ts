@@ -24,9 +24,9 @@ export const SIGNATURE_STYLE_TOOL_NAME = "GetUserEmailSignatureStyle";
 
 export const SIGNATURE_STYLE_TOOL: Tool = {
   name: SIGNATURE_STYLE_TOOL_NAME,
-  description: `Returns the user's Outlook email signature as an HTML block, extracted from their sent items.
-Call this tool before composing emails if you need to preview or reference the signature.
-The signature is also injected automatically into every outgoing email.`,
+  description: `Returns the user's email signature as an HTML preview.
+NOTE: The signature is already injected automatically into every outgoing email — do NOT call this tool before sending emails, and do NOT add the signature manually to the email body.
+Use this tool ONLY if the user explicitly asks to see or preview their signature.`,
   inputSchema: {
     type: "object" as const,
     properties: {},
