@@ -152,7 +152,7 @@ async function fetchSignatureFromOneDrive(graphToken: string): Promise<string | 
 
 function buildSignatureHtml(sigText: string): string {
   const logoImg = LOGO_BASE64
-    ? `<img src="data:image/png;base64,${LOGO_BASE64}" alt="ABK Solutions" style="height:40px;width:auto;display:block;margin-bottom:10px;" />`
+    ? `<img src="data:image/png;base64,${LOGO_BASE64}" alt="ABK Solutions" height="40" width="124" style="height:40px;width:124px;display:block;margin-bottom:10px;border:0;" />`
     : `<strong style="color:#0066CC;font-size:12pt;">ABK Solutions</strong><br/>`;
 
   const lines = sigText.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
