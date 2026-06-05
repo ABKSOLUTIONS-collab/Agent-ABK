@@ -360,6 +360,27 @@ export class McpProxyServer {
             }
           }
 
+          // ── SendDraftMessage: add CID attachment before sending ────────────
+          if (name === "SendDraftMessage" && graphToken && LOGO_BASE64) {
+            try {
+              const msgId = String(typedArgs.messageId ?? typedArgs.draftId ?? typedArgs.id ?? "");
+              if (msgId) {
+                await fetch(`https://graph.microsoft.com/v1.0/me/messages/${msgId}/attachments`, {
+                  method: "POST",
+                  headers: { Authorization: `Bearer ${graphToken}`, "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    "@odata.type": "#microsoft.graph.fileAttachment",
+                    name: "abk-logo.png", contentType: "image/png",
+                    contentBytes: LOGO_BASE64, contentId: "abk-logo@abk", isInline: true,
+                  }),
+                });
+                log(`CID attachment added to draft ${msgId} before send`);
+              }
+            } catch (e) {
+              log(`CID attachment pre-send failed (non-fatal): ${e}`);
+            }
+          }
+
           // ── Other email tools: inject signature into body ───────────────────
           if (EMAIL_TOOLS_REQUIRING_SIGNATURE.has(name) && graphToken && name !== "SendEmailWithAttachments") {
             try {
