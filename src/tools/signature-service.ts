@@ -18,7 +18,8 @@ import * as path from "path";
 // No HTTP calls, no external URLs, no blocking by email clients
 function loadLogoBase64(): string | null {
   try {
-    const logoPath = path.join(__dirname, "../../assets/abk-logo-sig.png");
+    // Use the pre-resized 248x80 version (displays at 124x40) — avoids Outlook scaling/clipping
+    const logoPath = path.join(__dirname, "../../assets/abk-logo-email.png");
     const data = fs.readFileSync(logoPath);
     return data.toString("base64");
   } catch {
@@ -152,7 +153,7 @@ async function fetchSignatureFromOneDrive(graphToken: string): Promise<string | 
 
 function buildSignatureHtml(sigText: string): string {
   const logoImg = LOGO_BASE64
-    ? `<img src="data:image/png;base64,${LOGO_BASE64}" alt="ABK Solutions" height="40" width="124" style="height:40px;width:124px;display:block;margin-bottom:10px;border:0;" />`
+    ? `<img src="data:image/png;base64,${LOGO_BASE64}" alt="ABK Solutions" height="40" width="124" style="height:40px!important;width:124px!important;max-width:124px;display:block;margin-bottom:10px;border:0;outline:none;" />`
     : `<strong style="color:#0066CC;font-size:12pt;">ABK Solutions</strong><br/>`;
 
   const lines = sigText.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
