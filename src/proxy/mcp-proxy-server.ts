@@ -173,6 +173,12 @@ export class McpProxyServer {
     app.use(express.json());
     app.use(express.urlencoded({ extended: false }));
 
+    // ── Serve static assets (logo etc.) ──────────────────────────────────────
+    app.use("/assets", express.static(
+      require("path").join(__dirname, "../../assets"),
+      { maxAge: "7d", immutable: true }
+    ));
+
     app.use((_req, res, next) => {
       res.header("Access-Control-Allow-Origin", "*");
       res.header("Access-Control-Allow-Methods", "GET, POST, DELETE, HEAD, OPTIONS");

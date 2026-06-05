@@ -41,6 +41,9 @@ COPY --from=builder /app/dist ./dist
 # Copy manifest (read at runtime by configuration.ts)
 COPY ToolingManifest.json ./
 
+# Copy static assets (logo etc.)
+COPY assets/ ./assets/
+
 # ── Auth cache directory ──────────────────────────────────────────────────────
 # In Azure Container Apps we use client_credentials (no interactive login).
 # The ~/.agent365-bridge dir is kept for optional volume-mount scenarios.

@@ -11,7 +11,7 @@
  * converted to HTML so the signature is never rendered as a squished string.
  */
 
-import { getCompanyLogoBase64 } from "../auth/signature-store";
+const LOGO_URL = `${process.env.SERVER_BASE_URL ?? ""}/assets/abk-logo-sig.png`;
 
 function log(msg: string) {
   process.stderr.write(`[agent365-bridge] [signature] ${msg}\n`);
@@ -127,8 +127,7 @@ async function fetchSignatureFromOneDrive(graphToken: string): Promise<string | 
     const text = (await resp.text()).trim();
     if (!text) return null;
 
-    const logoBase64 = await getCompanyLogoBase64(graphToken);
-    return buildSignatureHtml(text, logoBase64);
+    return buildSignatureHtml(text);
   } catch (err) {
     log(`OneDrive signature fetch error: ${err}`);
     return null;
@@ -137,10 +136,8 @@ async function fetchSignatureFromOneDrive(graphToken: string): Promise<string | 
 
 // ── HTML builder ──────────────────────────────────────────────────────────────
 
-function buildSignatureHtml(sigText: string, logoBase64: string | null): string {
-  const logoImg = logoBase64
-    ? `<img src="data:image/png;base64,${logoBase64}" alt="ABK Solutions" style="height:45px;max-width:220px;width:auto;display:block;margin-bottom:10px;"/>`
-    : `<strong style="color:#0066CC;font-size:13pt;">ABK Solutions</strong><br/>`;
+function buildSignatureHtml(sigText: string): string {
+  const logoImg = `<img src="${LOGO_URL}" alt="ABK Solutions" style="height:45px;width:auto;display:block;margin-bottom:10px;" />`;
 
   const lines = sigText.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
 
