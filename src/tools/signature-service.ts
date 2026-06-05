@@ -152,52 +152,45 @@ async function fetchSignatureFromOneDrive(graphToken: string): Promise<string | 
 // ── HTML builder ──────────────────────────────────────────────────────────────
 
 function buildSignatureHtml(sigText: string): string {
-  const logoImg = LOGO_BASE64
-    ? `<img src="data:image/png;base64,${LOGO_BASE64}" alt="ABK Solutions" style="display:block;margin-bottom:10px;border:0;" />`
-    : `<strong style="color:#0066CC;font-size:12pt;">ABK Solutions</strong><br/>`;
-
   const lines = sigText.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
 
   const lineHtml = lines.map((line, i) => {
-    if (i === 0) {
-      // Full name — bold
-      return `<div style="font-size:11pt;font-weight:bold;color:#1a1a1a;">${escHtml(line)}</div>`;
-    }
-    if (i === 1) {
-      // Job title — grey
-      return `<div style="font-size:9.5pt;color:#666666;margin-bottom:6px;">${escHtml(line)}</div>`;
-    }
+    if (i === 0) return `<tr><td style="font-family:Calibri,Arial,sans-serif;font-size:11pt;font-weight:bold;color:#1a1a1a;padding:0 0 2px 0;">${escHtml(line)}</td></tr>`;
+    if (i === 1) return `<tr><td style="font-family:Calibri,Arial,sans-serif;font-size:9.5pt;color:#666666;padding:0 0 6px 0;">${escHtml(line)}</td></tr>`;
 
-    // Labelled fields: m: / t: / a: / w: / e:
     const labelMatch = line.match(/^([mtawe]):\s*(.+)$/i);
     if (labelMatch) {
       const label = labelMatch[1].toLowerCase();
       const value = labelMatch[2].trim();
-      const labelNames: Record<string, string> = { m: "m", t: "t", a: "a", w: "w", e: "e" };
-      const labelStr = `<span style="color:#0066CC;font-weight:600;">${labelNames[label]}:</span>`;
-
+      const labelStr = `<span style="color:#0066CC;font-weight:600;">${label}:</span>`;
       if (label === "e") {
-        return `<div style="font-size:9pt;">${labelStr} <a href="mailto:${escHtml(value)}" style="color:#0066CC;text-decoration:none;">${escHtml(value)}</a></div>`;
+        return `<tr><td style="font-family:Calibri,Arial,sans-serif;font-size:9pt;padding:0 0 1px 0;">${labelStr} <a href="mailto:${escHtml(value)}" style="color:#0066CC;text-decoration:none;">${escHtml(value)}</a></td></tr>`;
       }
       if (label === "w") {
         const href = value.startsWith("http") ? value : `https://${value}`;
-        return `<div style="font-size:9pt;">${labelStr} <a href="${escHtml(href)}" style="color:#0066CC;text-decoration:none;">${escHtml(value)}</a></div>`;
+        return `<tr><td style="font-family:Calibri,Arial,sans-serif;font-size:9pt;padding:0 0 1px 0;">${labelStr} <a href="${escHtml(href)}" style="color:#0066CC;text-decoration:none;">${escHtml(value)}</a></td></tr>`;
       }
-      return `<div style="font-size:9pt;">${labelStr} ${escHtml(value)}</div>`;
+      return `<tr><td style="font-family:Calibri,Arial,sans-serif;font-size:9pt;padding:0 0 1px 0;">${labelStr} ${escHtml(value)}</td></tr>`;
     }
 
     // Disclaimer or free text — small italic grey
     if (line.length > 80) {
-      return `<div style="font-size:8pt;color:#888888;font-style:italic;margin-top:8px;max-width:520px;">${escHtml(line)}</div>`;
+      return `<tr><td style="font-family:Calibri,Arial,sans-serif;font-size:8pt;color:#888888;font-style:italic;padding-top:8px;">${escHtml(line)}</td></tr>`;
     }
 
-    return `<div style="font-size:9pt;color:#444444;">${escHtml(line)}</div>`;
+    return `<tr><td style="font-family:Calibri,Arial,sans-serif;font-size:9pt;color:#444444;padding:0 0 1px 0;">${escHtml(line)}</td></tr>`;
   }).join("\n");
 
-  return `<div style="font-family:Calibri,Arial,sans-serif;line-height:1.6;color:#1a1a1a;">
-  ${logoImg}
+  const logoRow = LOGO_BASE64
+    ? `<tr><td style="padding:0 0 10px 0;"><img src="data:image/png;base64,${LOGO_BASE64}" alt="ABK Solutions" width="180" height="58" style="display:block;" /></td></tr>`
+    : `<tr><td style="padding:0 0 10px 0;font-family:Calibri,Arial,sans-serif;font-size:13pt;font-weight:bold;color:#0066CC;">ABK Solutions</td></tr>`;
+
+  return `<table border="0" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
+  <tbody>
+  ${logoRow}
   ${lineHtml}
-</div>`;
+  </tbody>
+</table>`;
 }
 
 function escHtml(s: string): string {
