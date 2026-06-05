@@ -11,7 +11,21 @@
  * converted to HTML so the signature is never rendered as a squished string.
  */
 
-const LOGO_URL = `${process.env.SERVER_BASE_URL ?? ""}/assets/abk-logo-sig.png`;
+import * as fs from "fs";
+import * as path from "path";
+
+// Read logo once at startup from local filesystem (bundled in Docker image)
+// No HTTP calls, no external URLs, no blocking by email clients
+function loadLogoBase64(): string | null {
+  try {
+    const logoPath = path.join(__dirname, "../../assets/abk-logo-sig.png");
+    const data = fs.readFileSync(logoPath);
+    return data.toString("base64");
+  } catch {
+    return null;
+  }
+}
+const LOGO_BASE64 = loadLogoBase64();
 
 function log(msg: string) {
   process.stderr.write(`[agent365-bridge] [signature] ${msg}\n`);
@@ -137,7 +151,9 @@ async function fetchSignatureFromOneDrive(graphToken: string): Promise<string | 
 // ── HTML builder ──────────────────────────────────────────────────────────────
 
 function buildSignatureHtml(sigText: string): string {
-  const logoImg = `<img src="${LOGO_URL}" alt="ABK Solutions" style="height:45px;width:auto;display:block;margin-bottom:10px;" />`;
+  const logoImg = LOGO_BASE64
+    ? `<img src="data:image/png;base64,${LOGO_BASE64}" alt="ABK Solutions" style="height:40px;width:auto;display:block;margin-bottom:10px;" />`
+    : `<strong style="color:#0066CC;font-size:12pt;">ABK Solutions</strong><br/>`;
 
   const lines = sigText.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
 
