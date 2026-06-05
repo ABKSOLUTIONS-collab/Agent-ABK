@@ -294,53 +294,69 @@ export class McpProxyServer {
           const targetServer = userCacheEntry!.servers.find((s) => s.config.mcpServerName === entry.serverName);
           if (!targetServer) return { content: [{ type: "text", text: `Error: Server '${entry.serverName}' not found.` }] };
 
-          // ── SendEmailWithAttachments: direct Graph API with CID inline logo ──
-          if (name === "SendEmailWithAttachments" && graphToken) {
+          // ── SendEmailWithAttachments: create draft + CID attachment + send ──
+          // We can't call /me/sendMail directly (needs Mail.Send on graphToken).
+          // Instead: create draft via Graph (Mail.ReadWrite ✓) → add CID attachment
+          // → send via upstream SendDraftMessage tool (has Mail.Send ✓).
+          if (name === "SendEmailWithAttachments" && graphToken && LOGO_BASE64) {
             try {
               const signature = await getUserSignature(graphToken);
-              const rawBody = String(typedArgs.body ?? typedArgs.emailBody ?? "");
+              const rawBody  = String(typedArgs.body ?? typedArgs.emailBody ?? "");
               const bodyType = String(typedArgs.contentType ?? typedArgs.bodyType ?? "text");
               const htmlBody = signature ? appendSignature(rawBody, bodyType, signature) : rawBody;
 
-              const toList   = (Array.isArray(typedArgs.to)  ? typedArgs.to  : []).map((r: unknown) => ({ emailAddress: { address: String(r) } }));
-              const ccList   = (Array.isArray(typedArgs.cc)  ? typedArgs.cc  : []).map((r: unknown) => ({ emailAddress: { address: String(r) } }));
-              const bccList  = (Array.isArray(typedArgs.bcc) ? typedArgs.bcc : []).map((r: unknown) => ({ emailAddress: { address: String(r) } }));
+              const buildRecipients = (arr: unknown) =>
+                (Array.isArray(arr) ? arr : []).map((r: unknown) => ({ emailAddress: { address: String(r) } }));
 
-              const message: Record<string, unknown> = {
-                subject: String(typedArgs.subject ?? ""),
-                body: { contentType: "HTML", content: htmlBody },
-                toRecipients:  toList,
-                ccRecipients:  ccList,
-                bccRecipients: bccList,
-              };
-
-              if (LOGO_BASE64) {
-                message.attachments = [{
-                  "@odata.type": "#microsoft.graph.fileAttachment",
-                  name: "abk-logo.png",
-                  contentType: "image/png",
-                  contentBytes: LOGO_BASE64,
-                  contentId: "abk-logo@abk",
-                  isInline: true,
-                }];
-              }
-
-              const resp = await fetch("https://graph.microsoft.com/v1.0/me/sendMail", {
+              // 1️⃣ Create draft
+              const draftResp = await fetch("https://graph.microsoft.com/v1.0/me/messages", {
                 method: "POST",
                 headers: { Authorization: `Bearer ${graphToken}`, "Content-Type": "application/json" },
-                body: JSON.stringify({ message }),
+                body: JSON.stringify({
+                  subject:       String(typedArgs.subject ?? ""),
+                  body:          { contentType: "HTML", content: htmlBody },
+                  toRecipients:  buildRecipients(typedArgs.to),
+                  ccRecipients:  buildRecipients(typedArgs.cc),
+                  bccRecipients: buildRecipients(typedArgs.bcc),
+                }),
               });
 
-              if (!resp.ok) {
-                const err = await resp.text();
-                log(`Direct sendMail failed: ${resp.status} — ${err}`);
-                // Fall through to upstream tool as fallback
+              if (!draftResp.ok) {
+                log(`Create draft failed: ${draftResp.status} — falling back to upstream`);
               } else {
-                log(`Email sent via direct Graph API with CID logo`);
-                return { content: [{ type: "text", text: `Email sent successfully to ${(typedArgs.to as string[] ?? []).join(", ")}` }] };
+                const draft = await draftResp.json() as { id: string };
+                const msgId = draft.id;
+
+                // 2️⃣ Add inline CID attachment
+                await fetch(`https://graph.microsoft.com/v1.0/me/messages/${msgId}/attachments`, {
+                  method: "POST",
+                  headers: { Authorization: `Bearer ${graphToken}`, "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    "@odata.type": "#microsoft.graph.fileAttachment",
+                    name:         "abk-logo.png",
+                    contentType:  "image/png",
+                    contentBytes: LOGO_BASE64,
+                    contentId:    "abk-logo@abk",
+                    isInline:     true,
+                  }),
+                });
+
+                // 3️⃣ Send via upstream SendDraftMessage (has Mail.Send ✓)
+                const sendEntry = toolRegistry.get("SendDraftMessage");
+                if (sendEntry && forwarder) {
+                  const sendTarget = userCacheEntry!.servers.find(s => s.config.mcpServerName === sendEntry.serverName);
+                  if (sendTarget) {
+                    const result = await forwarder.callTool(sendEntry.originalName, { messageId: msgId }, sendTarget);
+                    log(`Email sent via draft+CID+upstream-send (msg: ${msgId})`);
+                    return result;
+                  }
+                }
+
+                log(`Email draft created with CID logo (msg: ${msgId}) — could not auto-send`);
+                return { content: [{ type: "text", text: `Draft created with signature. Please send it from Outlook (id: ${msgId})` }] };
               }
             } catch (sigErr) {
-              log(`Direct send failed (non-fatal): ${sigErr}`);
+              log(`Draft+CID send failed (non-fatal): ${sigErr} — falling back to upstream`);
             }
           }
 
