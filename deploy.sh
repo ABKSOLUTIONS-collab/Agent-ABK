@@ -76,12 +76,17 @@ az storage share create \
   --output none 2>/dev/null || echo "   File share already exists, skipping."
 
 # ── 5. ACA Environment ────────────────────────────────────────────────────────
-echo "▶ Creating ACA Environment (if not exists)..."
-az containerapp env create \
-  --name "$ACA_ENV_NAME" \
-  --resource-group "$RESOURCE_GROUP" \
-  --location "$LOCATION" \
-  --output none 2>/dev/null || echo "   ACA env already exists, skipping."
+echo "▶ Checking ACA Environment..."
+if az containerapp env show --name "$ACA_ENV_NAME" --resource-group "$RESOURCE_GROUP" --output none 2>/dev/null; then
+  echo "   ACA environment already exists, skipping."
+else
+  echo "   Creating ACA environment..."
+  az containerapp env create \
+    --name "$ACA_ENV_NAME" \
+    --resource-group "$RESOURCE_GROUP" \
+    --location "$LOCATION" \
+    --output none
+fi
 
 # ── 6. Link Storage to ACA Environment ───────────────────────────────────────
 echo "▶ Linking storage to ACA environment..."
