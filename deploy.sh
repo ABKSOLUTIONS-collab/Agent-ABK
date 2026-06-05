@@ -18,7 +18,7 @@ VOLUME_NAME="token-storage"
 VOLUME_MOUNT_PATH="/root/.agent365-bridge"
 
 # ── Server URL (hardcoded — update here if Azure reassigns the domain) ────────
-SERVER_BASE_URL="https://agent365-bridge.gentlecoast-placeholder.swedencentral.azurecontainerapps.io"
+SERVER_BASE_URL="https://agent365-bridge.lemonsea-0ef310bc.swedencentral.azurecontainerapps.io"
 
 # ── Secrets (must be exported in the calling shell before running) ────────────
 : "${AZURE_TENANT_ID:?Need AZURE_TENANT_ID}"
