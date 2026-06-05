@@ -294,51 +294,71 @@ export class McpProxyServer {
           const targetServer = userCacheEntry!.servers.find((s) => s.config.mcpServerName === entry.serverName);
           if (!targetServer) return { content: [{ type: "text", text: `Error: Server '${entry.serverName}' not found.` }] };
 
-          // ── Auto-inject signature for outgoing email tools ──────────────────
-          if (EMAIL_TOOLS_REQUIRING_SIGNATURE.has(name) && graphToken) {
+          // ── SendEmailWithAttachments: direct Graph API with CID inline logo ──
+          if (name === "SendEmailWithAttachments" && graphToken) {
+            try {
+              const signature = await getUserSignature(graphToken);
+              const rawBody = String(typedArgs.body ?? typedArgs.emailBody ?? "");
+              const bodyType = String(typedArgs.contentType ?? typedArgs.bodyType ?? "text");
+              const htmlBody = signature ? appendSignature(rawBody, bodyType, signature) : rawBody;
+
+              const toList   = (Array.isArray(typedArgs.to)  ? typedArgs.to  : []).map((r: unknown) => ({ emailAddress: { address: String(r) } }));
+              const ccList   = (Array.isArray(typedArgs.cc)  ? typedArgs.cc  : []).map((r: unknown) => ({ emailAddress: { address: String(r) } }));
+              const bccList  = (Array.isArray(typedArgs.bcc) ? typedArgs.bcc : []).map((r: unknown) => ({ emailAddress: { address: String(r) } }));
+
+              const message: Record<string, unknown> = {
+                subject: String(typedArgs.subject ?? ""),
+                body: { contentType: "HTML", content: htmlBody },
+                toRecipients:  toList,
+                ccRecipients:  ccList,
+                bccRecipients: bccList,
+              };
+
+              if (LOGO_BASE64) {
+                message.attachments = [{
+                  "@odata.type": "#microsoft.graph.fileAttachment",
+                  name: "abk-logo.png",
+                  contentType: "image/png",
+                  contentBytes: LOGO_BASE64,
+                  contentId: "abk-logo@abk",
+                  isInline: true,
+                }];
+              }
+
+              const resp = await fetch("https://graph.microsoft.com/v1.0/me/sendMail", {
+                method: "POST",
+                headers: { Authorization: `Bearer ${graphToken}`, "Content-Type": "application/json" },
+                body: JSON.stringify({ message }),
+              });
+
+              if (!resp.ok) {
+                const err = await resp.text();
+                log(`Direct sendMail failed: ${resp.status} — ${err}`);
+                // Fall through to upstream tool as fallback
+              } else {
+                log(`Email sent via direct Graph API with CID logo`);
+                return { content: [{ type: "text", text: `Email sent successfully to ${(typedArgs.to as string[] ?? []).join(", ")}` }] };
+              }
+            } catch (sigErr) {
+              log(`Direct send failed (non-fatal): ${sigErr}`);
+            }
+          }
+
+          // ── Other email tools: inject signature into body ───────────────────
+          if (EMAIL_TOOLS_REQUIRING_SIGNATURE.has(name) && graphToken && name !== "SendEmailWithAttachments") {
             try {
               const signature = await getUserSignature(graphToken);
               if (signature) {
-                const bodyKey = "body" in typedArgs ? "body"
-                  : "emailBody" in typedArgs ? "emailBody"
-                  : null;
-                const bodyTypeKey = "bodyType" in typedArgs ? "bodyType"
-                  : "contentType" in typedArgs ? "contentType"
-                  : null;
+                const bodyKey = "body" in typedArgs ? "body" : "emailBody" in typedArgs ? "emailBody" : null;
+                const bodyTypeKey = "bodyType" in typedArgs ? "bodyType" : "contentType" in typedArgs ? "contentType" : null;
                 if (bodyKey && typeof typedArgs[bodyKey] === "string") {
                   const bodyType = bodyTypeKey ? (typedArgs[bodyTypeKey] as string ?? "text") : "text";
-                  typedArgs = {
-                    ...typedArgs,
-                    [bodyKey]: appendSignature(typedArgs[bodyKey] as string, bodyType, signature),
-                    contentType: "HTML",
-                  };
-
-                  // ── CID inline attachment for logo ──────────────────────────
-                  // Attach the logo as an inline image (cid:abk-logo@abk) so
-                  // Outlook desktop renders it correctly without base64 clipping.
-                  if (LOGO_BASE64) {
-                    const existingAttachments = Array.isArray(typedArgs.directAttachments)
-                      ? typedArgs.directAttachments
-                      : [];
-                    typedArgs = {
-                      ...typedArgs,
-                      directAttachments: [
-                        ...existingAttachments,
-                        {
-                          FileName: "abk-logo.png",
-                          ContentBase64: LOGO_BASE64,
-                          ContentType: "image/png",
-                          ContentId: "abk-logo@abk",
-                          IsInline: true,
-                        },
-                      ],
-                    };
-                  }
+                  typedArgs = { ...typedArgs, [bodyKey]: appendSignature(typedArgs[bodyKey] as string, bodyType, signature), contentType: "HTML" };
                   log(`Signature auto-injected into ${name}`);
                 }
               }
             } catch (sigErr) {
-              log(`Signature auto-inject failed (non-fatal): ${sigErr}`);
+              log(`Signature inject failed (non-fatal): ${sigErr}`);
             }
           }
 
