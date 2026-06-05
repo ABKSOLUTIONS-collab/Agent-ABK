@@ -307,11 +307,15 @@ export class McpProxyServer {
                   : null;
                 if (bodyKey && typeof typedArgs[bodyKey] === "string") {
                   const bodyType = bodyTypeKey ? (typedArgs[bodyTypeKey] as string ?? "text") : "text";
-                  // appendSignature always returns HTML — update bodyType accordingly
-                  typedArgs = { ...typedArgs, [bodyKey]: appendSignature(typedArgs[bodyKey] as string, bodyType, signature) };
-                  if (bodyTypeKey) {
-                    typedArgs = { ...typedArgs, [bodyTypeKey]: "html" };
-                  }
+                  // appendSignature always returns HTML — force contentType/bodyType to html
+                  typedArgs = {
+                    ...typedArgs,
+                    [bodyKey]: appendSignature(typedArgs[bodyKey] as string, bodyType, signature),
+                    // Always set BOTH possible content-type keys to "html"
+                    contentType: "HTML",
+                    bodyType: "HTML",
+                    ...(bodyTypeKey ? { [bodyTypeKey]: "HTML" } : {}),
+                  };
                   log(`Signature auto-injected into ${name}`);
                 }
               }
