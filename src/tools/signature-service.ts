@@ -14,11 +14,11 @@
 import * as fs from "fs";
 import * as path from "path";
 
+const LOGO_CID = "abk-logo@abk";
+
 // Read logo once at startup from local filesystem (bundled in Docker image)
-// No HTTP calls, no external URLs, no blocking by email clients
 function loadLogoBase64(): string | null {
   try {
-    // Use the pre-resized 248x80 version (displays at 124x40) — avoids Outlook scaling/clipping
     const logoPath = path.join(__dirname, "../../assets/abk-logo-email.png");
     const data = fs.readFileSync(logoPath);
     return data.toString("base64");
@@ -26,7 +26,9 @@ function loadLogoBase64(): string | null {
     return null;
   }
 }
-const LOGO_BASE64 = loadLogoBase64();
+
+/** Base64 PNG of the ABK Solutions logo — exported for CID attachment injection */
+export const LOGO_BASE64: string | null = loadLogoBase64();
 
 function log(msg: string) {
   process.stderr.write(`[agent365-bridge] [signature] ${msg}\n`);
@@ -182,7 +184,7 @@ function buildSignatureHtml(sigText: string): string {
   }).join("\n");
 
   const logoRow = LOGO_BASE64
-    ? `<tr><td style="padding:0 0 10px 0;"><img src="data:image/png;base64,${LOGO_BASE64}" alt="ABK Solutions" width="180" height="58" style="display:block;" /></td></tr>`
+    ? `<tr><td style="padding:0 0 10px 0;"><img src="cid:${LOGO_CID}" alt="ABK Solutions" width="180" height="58" style="display:block;border:0;" /></td></tr>`
     : `<tr><td style="padding:0 0 10px 0;font-family:Calibri,Arial,sans-serif;font-size:13pt;font-weight:bold;color:#0066CC;">ABK Solutions</td></tr>`;
 
   return `<table border="0" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">

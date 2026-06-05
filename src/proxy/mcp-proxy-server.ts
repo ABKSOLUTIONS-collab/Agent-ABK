@@ -22,7 +22,7 @@ import {
   handleGetSignatureStyle,
   handleSetSignature,
 } from "../tools/signature-style-tool";
-import { getUserSignature, appendSignature } from "../tools/signature-service";
+import { getUserSignature, appendSignature, LOGO_BASE64 } from "../tools/signature-service";
 import { ServerDiscovery } from "../discovery/server-discovery";
 import { AppConfig } from "../config/types";
 import express from "express";
@@ -307,12 +307,33 @@ export class McpProxyServer {
                   : null;
                 if (bodyKey && typeof typedArgs[bodyKey] === "string") {
                   const bodyType = bodyTypeKey ? (typedArgs[bodyTypeKey] as string ?? "text") : "text";
-                  // appendSignature always returns HTML — force contentType/bodyType to html
                   typedArgs = {
                     ...typedArgs,
                     [bodyKey]: appendSignature(typedArgs[bodyKey] as string, bodyType, signature),
                     contentType: "HTML",
                   };
+
+                  // ── CID inline attachment for logo ──────────────────────────
+                  // Attach the logo as an inline image (cid:abk-logo@abk) so
+                  // Outlook desktop renders it correctly without base64 clipping.
+                  if (LOGO_BASE64) {
+                    const existingAttachments = Array.isArray(typedArgs.directAttachments)
+                      ? typedArgs.directAttachments
+                      : [];
+                    typedArgs = {
+                      ...typedArgs,
+                      directAttachments: [
+                        ...existingAttachments,
+                        {
+                          FileName: "abk-logo.png",
+                          ContentBase64: LOGO_BASE64,
+                          ContentType: "image/png",
+                          ContentId: "abk-logo@abk",
+                          IsInline: true,
+                        },
+                      ],
+                    };
+                  }
                   log(`Signature auto-injected into ${name}`);
                 }
               }
