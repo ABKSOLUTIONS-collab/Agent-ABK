@@ -311,10 +311,7 @@ export class McpProxyServer {
                   typedArgs = {
                     ...typedArgs,
                     [bodyKey]: appendSignature(typedArgs[bodyKey] as string, bodyType, signature),
-                    // Always set BOTH possible content-type keys to "html"
                     contentType: "HTML",
-                    bodyType: "HTML",
-                    ...(bodyTypeKey ? { [bodyTypeKey]: "HTML" } : {}),
                   };
                   log(`Signature auto-injected into ${name}`);
                 }
