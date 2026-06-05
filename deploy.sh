@@ -17,12 +17,14 @@ STORAGE_SHARE_NAME="agent365-tokens"
 VOLUME_NAME="token-storage"
 VOLUME_MOUNT_PATH="/root/.agent365-bridge"
 
+# ── Server URL (hardcoded — update here if Azure reassigns the domain) ────────
+SERVER_BASE_URL="https://agent365-bridge.gentlecoast-placeholder.swedencentral.azurecontainerapps.io"
+
 # ── Secrets (must be exported in the calling shell before running) ────────────
 : "${AZURE_TENANT_ID:?Need AZURE_TENANT_ID}"
 : "${AZURE_CLIENT_ID:?Need AZURE_CLIENT_ID}"
 : "${AZURE_CLIENT_SECRET:?Need AZURE_CLIENT_SECRET}"
 : "${MCP_API_KEY:?Need MCP_API_KEY}"
-: "${SERVER_BASE_URL:?Need SERVER_BASE_URL}"
 : "${AZURE_DI_ENDPOINT:?Need AZURE_DI_ENDPOINT}"
 : "${AZURE_DI_KEY:?Need AZURE_DI_KEY}"
 
