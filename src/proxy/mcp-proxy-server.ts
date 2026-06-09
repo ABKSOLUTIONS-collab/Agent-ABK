@@ -9,10 +9,16 @@ import {
 import { ResolvedServer } from "../config/types";
 import { ToolForwarder } from "./tool-forwarder";
 import { CachedTool, loadToolsCache, saveToolsCache } from "../auth/tools-cache";
-import { getUserToken, getGraphToken, getTokenEmail, pruneExpiredTokens } from "../auth/user-token-store";
+import { getUserToken, getGraphToken, getTokenEmail, getStoredEmail, pruneExpiredTokens } from "../auth/user-token-store";
 import { registerOAuthEndpoints } from "../auth/oauth-handler";
-import { SHAREPOINT_TOOLS, SHAREPOINT_TOOL_NAMES, SharePointToolHandler } from "../tools/sharepoint-tools";
+import { SHAREPOINT_TOOLS, SHAREPOINT_LIST_TOOLS, SHAREPOINT_TOOL_NAMES, SharePointToolHandler } from "../tools/sharepoint-tools";
 import { OCR_TOOL, OCR_TOOL_NAMES, OcrToolHandler } from "../tools/ocr-tool";
+import { EMAIL_GRAPH_TOOLS, EMAIL_GRAPH_TOOL_NAMES, EmailGraphToolHandler } from "../tools/email-graph-tools";
+import { CALENDAR_GRAPH_TOOLS, CALENDAR_GRAPH_TOOL_NAMES, CalendarGraphToolHandler } from "../tools/calendar-graph-tools";
+import { WORD_GRAPH_TOOLS, WORD_GRAPH_TOOL_NAMES, WordGraphToolHandler } from "../tools/word-graph-tools";
+import { EXCEL_GRAPH_TOOLS, EXCEL_GRAPH_TOOL_NAMES, ExcelGraphToolHandler } from "../tools/excel-graph-tools";
+import { TEAMS_GRAPH_TOOLS, TEAMS_GRAPH_TOOL_NAMES, TeamsGraphToolHandler } from "../tools/teams-graph-tools";
+import { KNOWLEDGE_GRAPH_TOOLS, KNOWLEDGE_GRAPH_TOOL_NAMES, KnowledgeGraphToolHandler } from "../tools/knowledge-graph-tools";
 import {
   SIGNATURE_STYLE_TOOL,
   SIGNATURE_STYLE_TOOL_NAME,
@@ -224,9 +230,11 @@ export class McpProxyServer {
       const sessionToken = this.extractToken(req);
       if (!sessionToken) { await this.serveAnonymous(req, res); return; }
 
-      const userToken = await getUserToken(sessionToken);
-      const graphToken = await getGraphToken(sessionToken);
-      const email = getTokenEmail(sessionToken);
+      const [userToken, graphToken, email] = await Promise.all([
+        getUserToken(sessionToken),
+        getGraphToken(sessionToken),
+        getStoredEmail(sessionToken),
+      ]);
 
       if (!userToken) {
         log("Session token expired or not found — sending WWW-Authenticate to trigger re-auth");
@@ -257,6 +265,13 @@ export class McpProxyServer {
           tools: [
             ...Array.from(toolRegistry.values()).map((e) => e.toolDef),
             ...SHAREPOINT_TOOLS,
+            ...SHAREPOINT_LIST_TOOLS,
+            ...EMAIL_GRAPH_TOOLS,
+            ...CALENDAR_GRAPH_TOOLS,
+            ...WORD_GRAPH_TOOLS,
+            ...EXCEL_GRAPH_TOOLS,
+            ...TEAMS_GRAPH_TOOLS,
+            ...KNOWLEDGE_GRAPH_TOOLS,
             OCR_TOOL,
             SIGNATURE_STYLE_TOOL,
           ],
@@ -267,14 +282,109 @@ export class McpProxyServer {
           let typedArgs = (args ?? {}) as Record<string, unknown>;
 
           if (SHAREPOINT_TOOL_NAMES.has(name)) {
-            const token = graphToken ?? userToken;
-            const handler = new SharePointToolHandler(token);
+            if (!graphToken) {
+              return { content: [{ type: "text", text: "Graph token not available. Please re-authenticate at /login." }] };
+            }
+            const handler = new SharePointToolHandler(graphToken);
             return handler.handleToolCall(name, typedArgs);
           }
 
           if (OCR_TOOL_NAMES.has(name)) {
-            const token = graphToken ?? userToken;
-            const handler = new OcrToolHandler(token);
+            if (!graphToken) {
+              return { content: [{ type: "text", text: "Graph token not available. Please re-authenticate at /login." }] };
+            }
+            const handler = new OcrToolHandler(graphToken);
+            return handler.handleToolCall(name, typedArgs);
+          }
+
+          // ── CreateDraftMessage: inject signature + CID logo before creating ──
+          if (name === "CreateDraftMessage" && graphToken) {
+            try {
+              const signature = await getUserSignature(graphToken);
+              if (signature) {
+                const rawBody  = String(typedArgs.body ?? typedArgs.emailBody ?? "");
+                const bodyType = String(typedArgs.contentType ?? typedArgs.bodyType ?? "text");
+                typedArgs = { ...typedArgs, body: appendSignature(rawBody, bodyType, signature), contentType: "HTML" };
+                log("Signature injected into CreateDraftMessage");
+              }
+            } catch (e) { log(`Signature inject failed: ${e}`); }
+
+            const handler = new EmailGraphToolHandler(graphToken);
+            const result   = await handler.handleToolCall(name, typedArgs);
+
+            // Add CID logo attachment to the newly created draft
+            if (LOGO_BASE64) {
+              try {
+                const text  = (result.content?.[0] as { text?: string })?.text ?? "";
+                const match = text.match(/ID:\s*([A-Za-z0-9_\-=]+)/);
+                if (match?.[1]) {
+                  await fetch(`https://graph.microsoft.com/v1.0/me/messages/${match[1]}/attachments`, {
+                    method: "POST",
+                    headers: { Authorization: `Bearer ${graphToken}`, "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                      "@odata.type": "#microsoft.graph.fileAttachment",
+                      name: "abk-logo.png", contentType: "image/png",
+                      contentBytes: LOGO_BASE64, contentId: "abk-logo@abk", isInline: true,
+                    }),
+                  });
+                  log(`CID logo attachment added to draft ${match[1]}`);
+                }
+              } catch (e) { log(`CID attachment failed (non-fatal): ${e}`); }
+            }
+            return result;
+          }
+
+          // ── Email tools: Graph API directly (no Copilot license required) ──
+          if (EMAIL_GRAPH_TOOL_NAMES.has(name)) {
+            if (!graphToken) {
+              return { content: [{ type: "text", text: "Graph token not available. Please re-authenticate at /login." }] };
+            }
+            const handler = new EmailGraphToolHandler(graphToken);
+            return handler.handleToolCall(name, typedArgs);
+          }
+
+          // ── Calendar tools: Graph API directly (no Copilot license required) ──
+          if (CALENDAR_GRAPH_TOOL_NAMES.has(name)) {
+            if (!graphToken) {
+              return { content: [{ type: "text", text: "Graph token not available. Please re-authenticate at /login." }] };
+            }
+            const handler = new CalendarGraphToolHandler(graphToken);
+            return handler.handleToolCall(name, typedArgs);
+          }
+
+          // ── Word document tools: Graph API + DOCX (no Copilot license required) ──
+          if (WORD_GRAPH_TOOL_NAMES.has(name)) {
+            if (!graphToken) {
+              return { content: [{ type: "text", text: "Graph token not available. Please re-authenticate at /login." }] };
+            }
+            const handler = new WordGraphToolHandler(graphToken);
+            return handler.handleToolCall(name, typedArgs);
+          }
+
+          // ── Excel workbook tools: Graph Excel API (no Copilot license required) ──
+          if (EXCEL_GRAPH_TOOL_NAMES.has(name)) {
+            if (!graphToken) {
+              return { content: [{ type: "text", text: "Graph token not available. Please re-authenticate at /login." }] };
+            }
+            const handler = new ExcelGraphToolHandler(graphToken);
+            return handler.handleToolCall(name, typedArgs);
+          }
+
+          // ── Teams meeting tools: Graph API (no Copilot license required) ──
+          if (TEAMS_GRAPH_TOOL_NAMES.has(name)) {
+            if (!graphToken) {
+              return { content: [{ type: "text", text: "Graph token not available. Please re-authenticate at /login." }] };
+            }
+            const handler = new TeamsGraphToolHandler(graphToken);
+            return handler.handleToolCall(name, typedArgs);
+          }
+
+          // ── Knowledge / Search tools: Graph Search API ──────────────────
+          if (KNOWLEDGE_GRAPH_TOOL_NAMES.has(name)) {
+            if (!graphToken) {
+              return { content: [{ type: "text", text: "Graph token not available. Please re-authenticate at /login." }] };
+            }
+            const handler = new KnowledgeGraphToolHandler(graphToken);
             return handler.handleToolCall(name, typedArgs);
           }
 
@@ -341,7 +451,19 @@ export class McpProxyServer {
                   }),
                 });
 
-                // 3️⃣ Send via upstream SendDraftMessage (has Mail.Send ✓)
+                // 3️⃣ Send directly via Graph API (no Copilot license needed)
+                const sendRes = await fetch(`https://graph.microsoft.com/v1.0/me/messages/${msgId}/send`, {
+                  method: "POST",
+                  headers: { Authorization: `Bearer ${graphToken}` },
+                });
+                if (sendRes.ok || sendRes.status === 202) {
+                  log(`Email sent via Graph API direct send (msg: ${msgId})`);
+                  return { content: [{ type: "text", text: "Email sent successfully." }] };
+                }
+                const sendErr = await sendRes.text().catch(() => "");
+                log(`Graph direct send failed (${sendRes.status}): ${sendErr} — trying upstream`);
+
+                // Fallback: upstream SendDraftMessage
                 const sendEntry = toolRegistry.get("SendDraftMessage");
                 if (sendEntry && forwarder) {
                   const sendTarget = userCacheEntry!.servers.find(s => s.config.mcpServerName === sendEntry.serverName);
@@ -360,24 +482,36 @@ export class McpProxyServer {
             }
           }
 
-          // ── SendDraftMessage: add CID attachment before sending ────────────
-          if (name === "SendDraftMessage" && graphToken && LOGO_BASE64) {
+          // ── SendDraftMessage: add CID attachment then send directly via Graph ──
+          if (name === "SendDraftMessage" && graphToken) {
             try {
               const msgId = String(typedArgs.messageId ?? typedArgs.draftId ?? typedArgs.id ?? "");
               if (msgId) {
-                await fetch(`https://graph.microsoft.com/v1.0/me/messages/${msgId}/attachments`, {
+                if (LOGO_BASE64) {
+                  await fetch(`https://graph.microsoft.com/v1.0/me/messages/${msgId}/attachments`, {
+                    method: "POST",
+                    headers: { Authorization: `Bearer ${graphToken}`, "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                      "@odata.type": "#microsoft.graph.fileAttachment",
+                      name: "abk-logo.png", contentType: "image/png",
+                      contentBytes: LOGO_BASE64, contentId: "abk-logo@abk", isInline: true,
+                    }),
+                  });
+                  log(`CID attachment added to draft ${msgId} before send`);
+                }
+                const sendRes = await fetch(`https://graph.microsoft.com/v1.0/me/messages/${msgId}/send`, {
                   method: "POST",
-                  headers: { Authorization: `Bearer ${graphToken}`, "Content-Type": "application/json" },
-                  body: JSON.stringify({
-                    "@odata.type": "#microsoft.graph.fileAttachment",
-                    name: "abk-logo.png", contentType: "image/png",
-                    contentBytes: LOGO_BASE64, contentId: "abk-logo@abk", isInline: true,
-                  }),
+                  headers: { Authorization: `Bearer ${graphToken}` },
                 });
-                log(`CID attachment added to draft ${msgId} before send`);
+                if (sendRes.ok || sendRes.status === 202) {
+                  log(`Draft sent directly via Graph API (msg: ${msgId})`);
+                  return { content: [{ type: "text", text: "Email sent successfully." }] };
+                }
+                const sendErr = await sendRes.text().catch(() => "");
+                log(`Graph direct send failed (${sendRes.status}): ${sendErr} — falling back to upstream`);
               }
             } catch (e) {
-              log(`CID attachment pre-send failed (non-fatal): ${e}`);
+              log(`Graph send attempt failed (non-fatal): ${e} — falling back to upstream`);
             }
           }
 
@@ -436,6 +570,8 @@ export class McpProxyServer {
         tools: [
           ...Array.from(this.sharedToolRegistry.values()).map((e) => e.toolDef),
           ...SHAREPOINT_TOOLS,
+          ...EMAIL_GRAPH_TOOLS,
+          ...CALENDAR_GRAPH_TOOLS,
           OCR_TOOL,
           SIGNATURE_STYLE_TOOL,
           SET_SIGNATURE_TOOL,
@@ -460,8 +596,9 @@ export class McpProxyServer {
     const PORT = process.env.PORT || 3000;
     app.listen(PORT, () => {
       log(`MCP server listening on port ${PORT}`);
-      log(`Login:  http://localhost:${PORT}/login`);
-      log(`Health: http://localhost:${PORT}/health`);
+      log(`Login:          http://localhost:${PORT}/login`);
+      log(`Admin consent:  http://localhost:${PORT}/admin-consent  (run ONCE by an Azure AD admin)`);
+      log(`Health:         http://localhost:${PORT}/health`);
     });
   }
 
@@ -473,6 +610,8 @@ export class McpProxyServer {
         tools: [
           ...Array.from(this.sharedToolRegistry.values()).map((e) => e.toolDef),
           ...SHAREPOINT_TOOLS,
+          ...EMAIL_GRAPH_TOOLS,
+          ...CALENDAR_GRAPH_TOOLS,
           OCR_TOOL,
           SIGNATURE_STYLE_TOOL,
         ],
