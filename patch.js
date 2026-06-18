@@ -173,8 +173,33 @@ const inject = `<!-- ABK_START -->
            (obj.data && obj.data.email) || (obj.result && obj.result.email) || '';
   }
 
+  // Scrape the logged-in user's email from the LibreChat DOM.
+  // LibreChat shows the email as a visible text node in the bottom-left user menu.
+  function getEmailFromDom() {
+    try {
+      var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
+      var node;
+      while ((node = walker.nextNode())) {
+        var text = (node.textContent || '').trim();
+        if (text && text.length < 100 && /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(text)) {
+          return text;
+        }
+      }
+    } catch(e) {}
+    return '';
+  }
+
   function openOrgAdmin() {
-    // 0. Use previously saved email (set after first successful login via the form)
+    // 0a. Read email from visible DOM (LibreChat shows it in the user menu bottom-left)
+    var domEmail = getEmailFromDom();
+    if (domEmail) {
+      console.log('[ABK] email from DOM:', domEmail);
+      localStorage.setItem('abk_admin_email', domEmail);
+      showOrgAdminModal('lc_email=' + encodeURIComponent(domEmail));
+      return;
+    }
+
+    // 0b. Use previously saved email (cached from last session)
     var savedEmail = localStorage.getItem('abk_admin_email');
     if (savedEmail && savedEmail.indexOf('@') !== -1) {
       console.log('[ABK] using saved email:', savedEmail);
