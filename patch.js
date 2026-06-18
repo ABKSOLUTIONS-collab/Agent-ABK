@@ -128,9 +128,31 @@ const inject = `<!-- ABK_START -->
     }
   }
 
+  // 4. Intercept "Admin Settings" sidebar link → open org-admin dashboard
+  function patchAdminLink() {
+    var all = document.querySelectorAll('a, button, [role="menuitem"]');
+    for (var i = 0; i < all.length; i++) {
+      var el = all[i];
+      if (!el.dataset.abkAdminPatched && (el.innerText || '').trim() === 'Admin Settings') {
+        el.dataset.abkAdminPatched = '1';
+        el.addEventListener('click', function(e) {
+          e.preventDefault();
+          e.stopPropagation();
+          var lct = localStorage.getItem('token') || '';
+          window.open(
+            'https://agent365-bridge.lemonsea-0ef310bc.swedencentral.azurecontainerapps.io/org-admin' +
+            (lct ? '?lc_token=' + encodeURIComponent(lct) : ''),
+            '_blank'
+          );
+        }, true);
+      }
+    }
+  }
+
   function tryPatch() {
     patchLoginText();
     patchLogo();
+    patchAdminLink();
   }
 
   // Start observing immediately on <html> — do NOT wait for DOMContentLoaded
