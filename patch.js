@@ -129,13 +129,12 @@ const inject = `<!-- ABK_START -->
   }
 
   // 4. Intercept "Admin Settings" sidebar link → open org-admin as modal overlay
-  function openOrgAdmin() {
+  function showOrgAdminModal(authParam) {
     var existing = document.getElementById('abk-org-overlay');
     if (existing) { existing.remove(); return; }
 
-    var lct = localStorage.getItem('token') || '';
     var url = 'https://agent365-bridge.lemonsea-0ef310bc.swedencentral.azurecontainerapps.io/org-admin?embed=1' +
-              (lct ? '&lc_token=' + encodeURIComponent(lct) : '');
+              (authParam ? '&' + authParam : '');
 
     var overlay = document.createElement('div');
     overlay.id = 'abk-org-overlay';
@@ -165,6 +164,25 @@ const inject = `<!-- ABK_START -->
     overlay.appendChild(modal);
     overlay.addEventListener('click', function(e) { if (e.target === overlay) overlay.remove(); });
     document.body.appendChild(overlay);
+  }
+
+  function openOrgAdmin() {
+    // Try localStorage first (some LibreChat versions store JWT there)
+    var lct = localStorage.getItem('token') ||
+              localStorage.getItem('accessToken') ||
+              localStorage.getItem('librechat-token') || '';
+    if (lct) {
+      showOrgAdminModal('lc_token=' + encodeURIComponent(lct));
+      return;
+    }
+    // Fallback: call LibreChat's /api/user (uses httpOnly cookie — same-origin only)
+    fetch('/api/user', { credentials: 'include' })
+      .then(function(r) { return r.ok ? r.json() : null; })
+      .then(function(user) {
+        var email = user && (user.email || (user.data && user.data.email)) || '';
+        showOrgAdminModal(email ? 'lc_email=' + encodeURIComponent(email) : '');
+      })
+      .catch(function() { showOrgAdminModal(''); });
   }
 
   // Install ONE document-level capture listener — fires before React's root handler.
