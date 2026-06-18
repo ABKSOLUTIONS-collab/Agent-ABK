@@ -174,30 +174,81 @@ const inject = `<!-- ABK_START -->
   }
 
   function openOrgAdmin() {
-    // 1. Scan ALL localStorage keys for a JWT with email/id
+    // 0. Use previously saved email (set after first successful login via the form)
+    var savedEmail = localStorage.getItem('abk_admin_email');
+    if (savedEmail && savedEmail.indexOf('@') !== -1) {
+      console.log('[ABK] using saved email:', savedEmail);
+      showOrgAdminModal('lc_email=' + encodeURIComponent(savedEmail));
+      return;
+    }
+
+    // 1. Scan ALL localStorage keys for JWT or JSON containing email
     var lct = '';
+    var emailFromStorage = '';
     for (var i = 0; i < localStorage.length; i++) {
-      var v = localStorage.getItem(localStorage.key(i)) || '';
-      if (v && v.split('.').length === 3) {
+      var k = localStorage.key(i);
+      var v = localStorage.getItem(k) || '';
+
+      // Check for JWT (3 dot-separated parts with valid base64 payload)
+      if (!lct && v && v.split('.').length === 3) {
         try {
           var b64 = v.split('.')[1].replace(/-/g,'+').replace(/_/g,'/');
+          while (b64.length % 4) b64 += '=';
           var p = JSON.parse(atob(b64));
-          if (p && (p.id || p.email)) { lct = v; break; }
+          if (p && (p.id || p.email || p.sub)) {
+            lct = v;
+            if (p.email) emailFromStorage = p.email;
+            console.log('[ABK] JWT found in localStorage key:', k, '| has email:', !!p.email);
+          }
+        } catch(e) {}
+      }
+
+      // Check for JSON object that may contain email
+      if (!emailFromStorage && v && v[0] === '{') {
+        try {
+          var parsed = JSON.parse(v);
+          var fe = extractEmail(parsed);
+          if (fe && fe.indexOf('@') !== -1) {
+            emailFromStorage = fe;
+            console.log('[ABK] email in localStorage key:', k, '→', fe);
+          } else {
+            // Handle persist:root style double-encoded JSON
+            for (var field in parsed) {
+              if (typeof parsed[field] === 'string' && parsed[field][0] === '{') {
+                try {
+                  var inner = JSON.parse(parsed[field]);
+                  var ie = extractEmail(inner);
+                  if (ie && ie.indexOf('@') !== -1) {
+                    emailFromStorage = ie;
+                    console.log('[ABK] email in nested localStorage key:', k + '.' + field, '→', ie);
+                    break;
+                  }
+                } catch(e2) {}
+              }
+            }
+          }
         } catch(e) {}
       }
     }
+
+    if (emailFromStorage) {
+      console.log('[ABK] using email from localStorage:', emailFromStorage);
+      localStorage.setItem('abk_admin_email', emailFromStorage);
+      showOrgAdminModal(lct ? 'lc_token=' + encodeURIComponent(lct) : 'lc_email=' + encodeURIComponent(emailFromStorage));
+      return;
+    }
     if (lct) {
-      console.log('[ABK] found JWT in localStorage');
+      console.log('[ABK] using JWT (no email in payload)');
       showOrgAdminModal('lc_token=' + encodeURIComponent(lct));
       return;
     }
 
-    // 2. Try LibreChat API endpoints for user info (httpOnly cookie auth)
-    var endpoints = ['/api/user', '/api/auth/user', '/api/v1/user'];
+    // 2. Try LibreChat API endpoints (browser sends httpOnly cookie automatically)
+    var endpoints = ['/api/user', '/api/auth/user', '/api/v1/user', '/api/auth/me', '/api/me'];
     var idx = 0;
     function tryNext() {
       if (idx >= endpoints.length) {
-        console.warn('[ABK] all /api/user endpoints failed — opening modal without auth');
+        console.warn('[ABK] all API endpoints failed — opening modal (email form will appear)');
         showOrgAdminModal('');
         return;
       }
@@ -205,19 +256,21 @@ const inject = `<!-- ABK_START -->
       fetch(ep, { credentials: 'include' })
         .then(function(r) {
           console.log('[ABK] ' + ep + ' → ' + r.status);
-          return r.ok ? r.json() : null;
+          return r.ok ? r.json() : Promise.reject(r.status);
         })
         .then(function(data) {
+          console.log('[ABK] ' + ep + ' data:', JSON.stringify(data).slice(0, 200));
           var email = extractEmail(data);
-          console.log('[ABK] email extracted:', email);
-          if (email) {
+          if (email && email.indexOf('@') !== -1) {
+            console.log('[ABK] email from API:', email);
+            localStorage.setItem('abk_admin_email', email);
             showOrgAdminModal('lc_email=' + encodeURIComponent(email));
           } else {
             tryNext();
           }
         })
         .catch(function(e) {
-          console.warn('[ABK] ' + ep + ' error:', e);
+          console.warn('[ABK] ' + ep + ' failed:', e);
           tryNext();
         });
     }
