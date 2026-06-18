@@ -166,23 +166,62 @@ const inject = `<!-- ABK_START -->
     document.body.appendChild(overlay);
   }
 
+  function extractEmail(obj) {
+    if (!obj || typeof obj !== 'object') return '';
+    // Try every common nested path LibreChat might use
+    return obj.email || (obj.user && obj.user.email) ||
+           (obj.data && obj.data.email) || (obj.result && obj.result.email) || '';
+  }
+
   function openOrgAdmin() {
-    // Try localStorage first (some LibreChat versions store JWT there)
-    var lct = localStorage.getItem('token') ||
-              localStorage.getItem('accessToken') ||
-              localStorage.getItem('librechat-token') || '';
+    // 1. Scan ALL localStorage keys for a JWT with email/id
+    var lct = '';
+    for (var i = 0; i < localStorage.length; i++) {
+      var v = localStorage.getItem(localStorage.key(i)) || '';
+      if (v && v.split('.').length === 3) {
+        try {
+          var b64 = v.split('.')[1].replace(/-/g,'+').replace(/_/g,'/');
+          var p = JSON.parse(atob(b64));
+          if (p && (p.id || p.email)) { lct = v; break; }
+        } catch(e) {}
+      }
+    }
     if (lct) {
+      console.log('[ABK] found JWT in localStorage');
       showOrgAdminModal('lc_token=' + encodeURIComponent(lct));
       return;
     }
-    // Fallback: call LibreChat's /api/user (uses httpOnly cookie — same-origin only)
-    fetch('/api/user', { credentials: 'include' })
-      .then(function(r) { return r.ok ? r.json() : null; })
-      .then(function(user) {
-        var email = user && (user.email || (user.data && user.data.email)) || '';
-        showOrgAdminModal(email ? 'lc_email=' + encodeURIComponent(email) : '');
-      })
-      .catch(function() { showOrgAdminModal(''); });
+
+    // 2. Try LibreChat API endpoints for user info (httpOnly cookie auth)
+    var endpoints = ['/api/user', '/api/auth/user', '/api/v1/user'];
+    var idx = 0;
+    function tryNext() {
+      if (idx >= endpoints.length) {
+        console.warn('[ABK] all /api/user endpoints failed — opening modal without auth');
+        showOrgAdminModal('');
+        return;
+      }
+      var ep = endpoints[idx++];
+      fetch(ep, { credentials: 'include' })
+        .then(function(r) {
+          console.log('[ABK] ' + ep + ' → ' + r.status);
+          return r.ok ? r.json() : null;
+        })
+        .then(function(data) {
+          var email = extractEmail(data);
+          console.log('[ABK] email extracted:', email);
+          if (email) {
+            showOrgAdminModal('lc_email=' + encodeURIComponent(email));
+          } else {
+            tryNext();
+          }
+        })
+        .catch(function(e) {
+          console.warn('[ABK] ' + ep + ' error:', e);
+          tryNext();
+        });
+    }
+    tryNext();
   }
 
   // Install ONE document-level capture listener — fires before React's root handler.
