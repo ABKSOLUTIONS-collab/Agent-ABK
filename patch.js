@@ -128,7 +128,45 @@ const inject = `<!-- ABK_START -->
     }
   }
 
-  // 4. Intercept "Admin Settings" sidebar link → open org-admin dashboard
+  // 4. Intercept "Admin Settings" sidebar link → open org-admin as modal overlay
+  function openOrgAdmin() {
+    var existing = document.getElementById('abk-org-overlay');
+    if (existing) { existing.remove(); return; }
+
+    var lct = localStorage.getItem('token') || '';
+    var url = 'https://agent365-bridge.lemonsea-0ef310bc.swedencentral.azurecontainerapps.io/org-admin?embed=1' +
+              (lct ? '&lc_token=' + encodeURIComponent(lct) : '');
+
+    var overlay = document.createElement('div');
+    overlay.id = 'abk-org-overlay';
+    overlay.style.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center;';
+
+    var modal = document.createElement('div');
+    modal.style.cssText = 'position:relative;width:92%;max-width:1060px;height:88vh;background:#f9f9f9;border-radius:14px;overflow:hidden;box-shadow:0 24px 80px rgba(0,0,0,.35);display:flex;flex-direction:column;';
+
+    var header = document.createElement('div');
+    header.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:14px 20px;background:#fff;border-bottom:1px solid #e8e8e8;flex-shrink:0;';
+    var title = document.createElement('span');
+    title.style.cssText = 'font-weight:600;font-size:14px;color:#0066cc;';
+    title.textContent = 'Organization Settings';
+    var closeBtn = document.createElement('button');
+    closeBtn.innerHTML = '&#215;';
+    closeBtn.style.cssText = 'background:none;border:none;font-size:22px;cursor:pointer;color:#888;padding:0 4px;line-height:1;';
+    closeBtn.onclick = function() { overlay.remove(); };
+    header.appendChild(title);
+    header.appendChild(closeBtn);
+
+    var iframe = document.createElement('iframe');
+    iframe.src = url;
+    iframe.style.cssText = 'flex:1;width:100%;border:none;';
+
+    modal.appendChild(header);
+    modal.appendChild(iframe);
+    overlay.appendChild(modal);
+    overlay.addEventListener('click', function(e) { if (e.target === overlay) overlay.remove(); });
+    document.body.appendChild(overlay);
+  }
+
   function patchAdminLink() {
     var all = document.querySelectorAll('a, button, [role="menuitem"]');
     for (var i = 0; i < all.length; i++) {
@@ -138,12 +176,7 @@ const inject = `<!-- ABK_START -->
         el.addEventListener('click', function(e) {
           e.preventDefault();
           e.stopPropagation();
-          var lct = localStorage.getItem('token') || '';
-          window.open(
-            'https://agent365-bridge.lemonsea-0ef310bc.swedencentral.azurecontainerapps.io/org-admin' +
-            (lct ? '?lc_token=' + encodeURIComponent(lct) : ''),
-            '_blank'
-          );
+          openOrgAdmin();
         }, true);
       }
     }
