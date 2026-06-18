@@ -173,14 +173,71 @@ const inject = `<!-- ABK_START -->
            (obj.data && obj.data.email) || (obj.result && obj.result.email) || '';
   }
 
-  // Receive email back from the org-admin iframe (posted when user submits the form).
-  // Saves it to LibreChat's localStorage so next open is automatic.
+  // Receive messages back from the org-admin iframe.
   window.addEventListener('message', function(evt) {
-    if (evt && evt.data && evt.data.type === 'abk_admin_email' && evt.data.email) {
+    if (!evt || !evt.data) return;
+    // Cache email so next Admin Settings open is automatic
+    if (evt.data.type === 'abk_admin_email' && evt.data.email) {
       localStorage.setItem('abk_admin_email', evt.data.email);
-      console.log('[ABK] email received via postMessage:', evt.data.email);
+    }
+    // Cache org role so it can be shown in Account settings
+    if (evt.data.type === 'abk_org_role' && evt.data.role) {
+      localStorage.setItem('abk_org_role', evt.data.role);
     }
   }, false);
+
+  // 5. Rename "Admin Settings" → "Organization Settings" in the sidebar
+  function renameAdminLink() {
+    var els = document.querySelectorAll('a, button, li, [role="menuitem"]');
+    for (var i = 0; i < els.length; i++) {
+      var el = els[i];
+      if ((el.innerText || '').trim() === 'Admin Settings' && !el.dataset.abkRenamed) {
+        el.dataset.abkRenamed = '1';
+        var walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null, false);
+        var node;
+        while ((node = walker.nextNode())) {
+          if (node.textContent.trim() === 'Admin Settings') {
+            node.textContent = node.textContent.replace('Admin Settings', 'Organization Settings');
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  // 6. Inject org role into LibreChat Account settings panel
+  var abkRoleInjected = false;
+  function injectAccountRole() {
+    if (abkRoleInjected) return;
+    var role = localStorage.getItem('abk_org_role');
+    if (!role) return;
+    // Find the Account settings panel by looking for "Log out of all devices" text
+    var found = false;
+    var els = document.querySelectorAll('div, section, p, span');
+    for (var i = 0; i < els.length; i++) {
+      if ((els[i].textContent || '').trim() === 'Log out of all devices') { found = true; break; }
+    }
+    if (!found) return;
+    // Find the container that holds Account settings rows
+    var rows = document.querySelectorAll('div[class*="flex"][class*="justify"]');
+    var targetRow = null;
+    for (var j = 0; j < rows.length; j++) {
+      if ((rows[j].textContent || '').includes('Log out of all devices')) {
+        targetRow = rows[j].parentElement;
+        break;
+      }
+    }
+    if (!targetRow || targetRow.dataset.abkRole) return;
+    targetRow.dataset.abkRole = '1';
+    abkRoleInjected = true;
+    var roleLabels = { OWNER: 'Primary owner', ADMIN: 'Admin', USER: 'User' };
+    var roleLabel = roleLabels[role] || role;
+    var inject = document.createElement('div');
+    inject.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:12px 0;border-top:1px solid #e5e7eb;margin-top:8px';
+    inject.innerHTML = '<span style="font-size:14px;color:#374151">Your organization role</span>' +
+      '<span style="font-size:13px;background:#f3f4f6;color:#374151;padding:3px 10px;border-radius:6px;font-weight:500">' + roleLabel + '</span>';
+    targetRow.appendChild(inject);
+  }
 
   function openOrgAdmin() {
     // Use previously saved email (set via postMessage after first form submit)
@@ -301,10 +358,10 @@ const inject = `<!-- ABK_START -->
 
     abkAdminInterceptorInstalled = true;
     document.addEventListener('click', function(e) {
-      // Walk up max 5 levels from click target to find the "Admin Settings" element
       var el = e.target;
       for (var i = 0; i < 5 && el && el !== document.body; i++, el = el.parentElement) {
-        if ((el.innerText || '').trim() === 'Admin Settings') {
+        var txt = (el.innerText || '').trim();
+        if (txt === 'Admin Settings' || txt === 'Organization Settings') {
           e.preventDefault();
           e.stopPropagation();
           e.stopImmediatePropagation();
@@ -312,13 +369,15 @@ const inject = `<!-- ABK_START -->
           return;
         }
       }
-    }, true); // capture phase — runs before React's synthetic event system
+    }, true);
   }
 
   function tryPatch() {
     patchLoginText();
     patchLogo();
     patchAdminLink();
+    renameAdminLink();
+    injectAccountRole();
   }
 
   // Start observing immediately on <html> — do NOT wait for DOMContentLoaded
