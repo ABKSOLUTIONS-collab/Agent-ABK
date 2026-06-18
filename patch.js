@@ -167,19 +167,33 @@ const inject = `<!-- ABK_START -->
     document.body.appendChild(overlay);
   }
 
+  // Install ONE document-level capture listener — fires before React's root handler.
+  // React (v17+) delegates events to div#root, so document capture = before React.
+  var abkAdminInterceptorInstalled = false;
   function patchAdminLink() {
-    var all = document.querySelectorAll('a, button, [role="menuitem"]');
-    for (var i = 0; i < all.length; i++) {
-      var el = all[i];
-      if (!el.dataset.abkAdminPatched && (el.innerText || '').trim() === 'Admin Settings') {
-        el.dataset.abkAdminPatched = '1';
-        el.addEventListener('click', function(e) {
+    if (abkAdminInterceptorInstalled) return;
+    // Only install once the element actually exists in the DOM
+    var found = false;
+    var els = document.querySelectorAll('a, button, [role="menuitem"]');
+    for (var i = 0; i < els.length; i++) {
+      if ((els[i].innerText || '').trim() === 'Admin Settings') { found = true; break; }
+    }
+    if (!found) return;
+
+    abkAdminInterceptorInstalled = true;
+    document.addEventListener('click', function(e) {
+      // Walk up max 5 levels from click target to find the "Admin Settings" element
+      var el = e.target;
+      for (var i = 0; i < 5 && el && el !== document.body; i++, el = el.parentElement) {
+        if ((el.innerText || '').trim() === 'Admin Settings') {
           e.preventDefault();
           e.stopPropagation();
+          e.stopImmediatePropagation();
           openOrgAdmin();
-        }, true);
+          return;
+        }
       }
-    }
+    }, true); // capture phase — runs before React's synthetic event system
   }
 
   function tryPatch() {
