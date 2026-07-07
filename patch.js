@@ -16,6 +16,12 @@ const inject = `<!-- ABK_START -->
   footer { display: none !important; }
   a[href*="librechat.ai"] { display: none !important; }
 
+  /* ── Hide Sign Up / registration links via CSS (reliable, no JS race) ── */
+  a[href*="register"] { display: none !important; }
+  p:has(a[href*="register"]),
+  div:has(> a[href*="register"]),
+  span:has(a[href*="register"]) { display: none !important; }
+
   /* ── ABK Solutions color overrides ── */
 
   /* Submit button: green → ABK blue */
@@ -46,9 +52,69 @@ const inject = `<!-- ABK_START -->
   svg[data-abk-hidden="1"] {
     display: none !important;
   }
+
+  /* ── ABK blue: ONLY for main app (not login/register) ── */
+  /* body.abk-app is added by JS only on non-auth pages */
+  body.abk-app { color: #0066CC !important; }
+  body.abk-app h1, body.abk-app h2,
+  body.abk-app h3, body.abk-app h4 { color: #0066CC !important; }
+  /* Keep muted / secondary text gray */
+  body.abk-app [class*="text-gray-4"],
+  body.abk-app [class*="text-gray-5"],
+  body.abk-app [class*="text-gray-6"],
+  body.abk-app [class*="text-muted"],
+  body.abk-app footer, body.abk-app footer * { color: #9ca3af !important; }
+  /* Keep white text on dark backgrounds */
+  body.abk-app [class*="bg-gray-9"] *,
+  body.abk-app [class*="bg-black"] *,
+  body.abk-app [style*="background-color: #0066"] *,
+  body.abk-app [style*="background:#0066"] * { color: #fff !important; }
+  /* Input typing text: keep dark */
+  body.abk-app input, body.abk-app textarea { color: #111827 !important; }
+  body.abk-app input::placeholder,
+  body.abk-app textarea::placeholder { color: #9ca3af !important; }
+  /* Green accents → ABK blue */
+  body.abk-app [class*="text-green-"] { color: #0066CC !important; }
+  body.abk-app [class*="bg-green-"] { background-color: rgba(0,102,204,0.12) !important; }
+  body.abk-app [class*="border-green-"] { border-color: #0066CC !important; }
+  /* Send button */
+  body.abk-app button[class*="bg-black"],
+  body.abk-app button[class*="bg-gray-900"] { background-color: #0066CC !important; }
+  /* Greeting icon hidden by JS */
+  [data-abk-greet-icon-hidden="1"] { display: none !important; }
 </style>
 <script>
+// Unregister LibreChat's service worker so the latest index.html is always served.
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.getRegistrations().then(function(regs) {
+    regs.forEach(function(r) { r.unregister(); });
+    if (regs.length > 0) { console.log('[ABK] SW unregistered, reloading...'); window.location.reload(); }
+  });
+}
+</script>
+<script>
 (function() {
+  'use strict';
+  // 0. Add/remove body.abk-app class — main app only, NOT on auth pages
+  function updateAppClass() {
+    if (!document.body) return;
+    var path = window.location.pathname;
+    var isAuth = (path === '/' || path.indexOf('/login') !== -1 || path.indexOf('/register') !== -1);
+    if (isAuth) {
+      document.body.classList.remove('abk-app');
+    } else {
+      document.body.classList.add('abk-app');
+    }
+  }
+  window.addEventListener('popstate', updateAppClass);
+  // Intercept pushState/replaceState for SPA navigation
+  try {
+    var _origPush = history.pushState.bind(history);
+    var _origReplace = history.replaceState.bind(history);
+    history.pushState = function() { _origPush.apply(history, arguments); updateAppClass(); };
+    history.replaceState = function() { _origReplace.apply(history, arguments); updateAppClass(); };
+  } catch(e) {}
+
   // 1. Fix title
   var t = function() {
     if (document.title !== 'ABK Assistant') {
@@ -173,20 +239,170 @@ const inject = `<!-- ABK_START -->
            (obj.data && obj.data.email) || (obj.result && obj.result.email) || '';
   }
 
+  // In-memory role — reset on every page load so no cross-user contamination.
+  // Never read from localStorage for role display.
+  var BRIDGE_URL = 'https://agent365-bridge.lemonsea-0ef310bc.swedencentral.azurecontainerapps.io';
+  var abkCurrentRole = null;
+  localStorage.removeItem('abk_org_role');
+
+  function applyRole(tier, email) {
+    abkCurrentRole = tier;
+    if (email) localStorage.setItem('abk_admin_email', email);
+    // Remove any stale injection (from previous user's session) and re-inject fresh
+    var old = document.querySelector('[data-abk-role-row]');
+    if (old) old.remove();
+    injectAccountRole();
+  }
+
   // Receive messages back from the org-admin iframe.
   window.addEventListener('message', function(evt) {
     if (!evt || !evt.data) return;
-    // Cache email so next Admin Settings open is automatic
     if (evt.data.type === 'abk_admin_email' && evt.data.email) {
       localStorage.setItem('abk_admin_email', evt.data.email);
     }
-    // Cache org role so it can be shown in Account settings
     if (evt.data.type === 'abk_org_role' && evt.data.role) {
-      localStorage.setItem('abk_org_role', evt.data.role);
+      applyRole(evt.data.role, null);
     }
   }, false);
 
-  // 5. Rename "Admin Settings" → "Organization Settings" in the sidebar
+  // Intercept LibreChat's own fetch calls to grab the authenticated user's email.
+  // This piggybacks on LibreChat's auth/refresh call it makes on every page load,
+  // so we never need to guess the endpoint name, method, or token format.
+  (function autoFetchOrgRole() {
+    var resolved = false;
+
+    function fetchRoleByEmail(email) {
+      if (resolved) return;
+      resolved = true;
+      fetch(BRIDGE_URL + '/org-admin/api/my-tier?lc_email=' + encodeURIComponent(email))
+        .then(function(r) { return r.ok ? r.json() : null; })
+        .then(function(data) {
+          if (data && data.tier) applyRole(data.tier, email);
+        }).catch(function() {});
+    }
+
+    function checkData(data) {
+      if (!data || typeof data !== 'object') return;
+      var email = (data.user && data.user.email) || data.email ||
+                  (data.data && data.data.email);
+      if (email && email.indexOf('@') !== -1) fetchRoleByEmail(email);
+    }
+
+    // Wrap window.fetch to intercept LibreChat's own API responses
+    var _origFetch = window.fetch;
+    window.fetch = function(resource, init) {
+      var url = typeof resource === 'string' ? resource
+              : (resource && typeof resource.url === 'string' ? resource.url : '');
+      var p = _origFetch.apply(this, arguments);
+      if (!resolved && url && (url.indexOf('/api/auth') !== -1 || url.indexOf('/api/user') !== -1)) {
+        p.then(function(resp) {
+          if (resp && resp.ok) {
+            resp.clone().json().then(checkData).catch(function() {});
+          }
+        }).catch(function() {});
+      }
+      return p;
+    };
+
+    // Also attempt directly — LibreChat may have already called refresh before our script ran
+    _origFetch('/api/auth/refresh', { method: 'POST', credentials: 'include' })
+      .then(function(r) { return r.ok ? r.json() : null; })
+      .then(function(d) { if (d) checkData(d); }).catch(function() {});
+    _origFetch('/api/auth/refresh', { credentials: 'include' })
+      .then(function(r) { return r.ok ? r.json() : null; })
+      .then(function(d) { if (d) checkData(d); }).catch(function() {});
+  })();
+
+  // 5. "Forgot password?" link → custom reset modal (no email required)
+  function showResetPasswordModal() {
+    if (document.getElementById('abk-reset-overlay')) return;
+    var overlay = document.createElement('div');
+    overlay.id = 'abk-reset-overlay';
+    overlay.style.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center;';
+
+    var card = document.createElement('div');
+    card.style.cssText = 'background:#fff;border-radius:14px;padding:32px 36px;width:340px;box-shadow:0 24px 80px rgba(0,0,0,.35);';
+    card.innerHTML =
+      '<h2 style="font-size:16px;font-weight:600;margin:0 0 6px;color:#111">Forgot Password</h2>' +
+      '<p style="font-size:13px;color:#6b7280;margin:0 0 18px">Enter your email and we\\'ll send you a reset link.</p>' +
+      '<div id="abk-reset-msg" style="display:none;margin-bottom:12px;font-size:13px;padding:10px 12px;border-radius:8px;"></div>' +
+      '<input id="abk-reset-email" type="email" placeholder="Email address" style="width:100%;padding:10px 14px;border:1px solid #e3e3e3;border-radius:8px;font-size:14px;margin-bottom:16px;box-sizing:border-box;outline:none">' +
+      '<button id="abk-reset-submit" style="width:100%;padding:11px;background:#0066cc;color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:500;cursor:pointer;margin-bottom:8px">Send Reset Link</button>' +
+      '<button id="abk-reset-cancel" style="width:100%;padding:8px;background:none;border:none;font-size:13px;color:#6b7280;cursor:pointer">Cancel</button>';
+
+    overlay.appendChild(card);
+    document.body.appendChild(overlay);
+
+    function showMsg(txt, isErr) {
+      var el = document.getElementById('abk-reset-msg');
+      el.style.display = 'block';
+      el.style.background = isErr ? '#fef2f2' : '#f0fdf4';
+      el.style.color = isErr ? '#dc2626' : '#16a34a';
+      el.textContent = txt;
+    }
+
+    document.getElementById('abk-reset-cancel').onclick = function() { overlay.remove(); };
+    overlay.addEventListener('click', function(e) { if (e.target === overlay) overlay.remove(); });
+
+    document.getElementById('abk-reset-submit').onclick = function() {
+      var email = document.getElementById('abk-reset-email').value.trim();
+      if (!email || email.indexOf('@') === -1) { showMsg('Enter a valid email address.', true); return; }
+      var btn = document.getElementById('abk-reset-submit');
+      btn.disabled = true; btn.textContent = 'Sending...';
+      fetch(BRIDGE_URL + '/org-admin/api/forgot-password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: email })
+      })
+      .then(function(r) { return r.json(); })
+      .then(function() {
+        showMsg('If this email exists, a reset link has been sent. Check your inbox.', false);
+        btn.style.display = 'none';
+        document.getElementById('abk-reset-cancel').textContent = 'Back to Login';
+      })
+      .catch(function() {
+        showMsg('Connection error. Please try again.', true);
+        btn.disabled = false; btn.textContent = 'Send Reset Link';
+      });
+    };
+
+    document.getElementById('abk-reset-email').addEventListener('keydown', function(e) {
+      if (e.key === 'Enter') document.getElementById('abk-reset-submit').click();
+    });
+  }
+
+  function patchForgotPassword() {
+    var path = window.location.pathname;
+    var onLoginPage = path === '/' || path.indexOf('login') !== -1;
+    if (!onLoginPage) return;
+    var existing = document.querySelector('[data-abk-forgot]');
+    if (existing && existing.isConnected) return;
+    if (existing) existing.remove();
+    var submitBtn = null;
+    document.querySelectorAll('button[type="submit"]').forEach(function(btn) {
+      var txt = (btn.textContent || '').toLowerCase().trim();
+      if (!submitBtn && (txt.indexOf('sign in') !== -1 || txt.indexOf('log in') !== -1 ||
+          txt.indexOf('login') !== -1 || txt.indexOf('continue') !== -1)) {
+        submitBtn = btn;
+      }
+    });
+    if (!submitBtn) return;
+    var rect = submitBtn.getBoundingClientRect();
+    if (!rect.width) return;
+    var wrap = document.createElement('div');
+    wrap.setAttribute('data-abk-forgot', '1');
+    wrap.style.cssText = 'position:fixed;z-index:9999;text-align:center;pointer-events:auto;' +
+      'left:' + rect.left + 'px;top:' + (rect.bottom + 8) + 'px;width:' + rect.width + 'px;';
+    var a = document.createElement('a');
+    a.href = '#';
+    a.style.cssText = 'font-size:13px;color:#0066cc;text-decoration:none;';
+    a.textContent = 'Forgot password?';
+    a.addEventListener('click', function(e) { e.preventDefault(); showResetPasswordModal(); });
+    wrap.appendChild(a);
+    document.body.appendChild(wrap);
+  }
+
+  // 6. Rename "Admin Settings" → "Organization Settings" in the sidebar
   function renameAdminLink() {
     var els = document.querySelectorAll('a, button, li, [role="menuitem"]');
     for (var i = 0; i < els.length; i++) {
@@ -205,38 +421,46 @@ const inject = `<!-- ABK_START -->
     }
   }
 
-  // 6. Inject org role into LibreChat Account settings panel
-  var abkRoleInjected = false;
+  // 6. Inject org role into LibreChat Account settings panel.
+  // Anchors on the "Delete account" row which is always present in Account tab.
   function injectAccountRole() {
-    if (abkRoleInjected) return;
-    var role = localStorage.getItem('abk_org_role');
+    if (document.querySelector('[data-abk-role-row]')) return;
+    var role = abkCurrentRole;
     if (!role) return;
-    // Find the Account settings panel by looking for "Log out of all devices" text
-    var found = false;
-    var els = document.querySelectorAll('div, section, p, span');
-    for (var i = 0; i < els.length; i++) {
-      if ((els[i].textContent || '').trim() === 'Log out of all devices') { found = true; break; }
-    }
-    if (!found) return;
-    // Find the container that holds Account settings rows
-    var rows = document.querySelectorAll('div[class*="flex"][class*="justify"]');
-    var targetRow = null;
-    for (var j = 0; j < rows.length; j++) {
-      if ((rows[j].textContent || '').includes('Log out of all devices')) {
-        targetRow = rows[j].parentElement;
+    // Find the "Delete account" label (anchor element)
+    var anchor = null;
+    var candidates = document.querySelectorAll('span, p, label, div');
+    for (var ci = 0; ci < candidates.length; ci++) {
+      var ct = (candidates[ci].textContent || '').trim();
+      if (ct === 'Delete account' && candidates[ci].children.length === 0) {
+        anchor = candidates[ci];
         break;
       }
     }
-    if (!targetRow || targetRow.dataset.abkRole) return;
-    targetRow.dataset.abkRole = '1';
-    abkRoleInjected = true;
+    if (!anchor) return;
+    // Walk up to find the flex row that contains the "Delete account" label + button
+    var row = anchor;
+    for (var k = 0; k < 8; k++) {
+      var par = row.parentElement;
+      if (!par) break;
+      if (par.children.length >= 2) {
+        var cs = window.getComputedStyle(par);
+        if (cs.display === 'flex') { row = par; break; }
+      }
+      row = par;
+    }
+    if (!row.parentNode) return;
     var roleLabels = { OWNER: 'Primary owner', ADMIN: 'Admin', USER: 'User' };
     var roleLabel = roleLabels[role] || role;
     var inject = document.createElement('div');
-    inject.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:12px 0;border-top:1px solid #e5e7eb;margin-top:8px';
-    inject.innerHTML = '<span style="font-size:14px;color:#374151">Your organization role</span>' +
-      '<span style="font-size:13px;background:#f3f4f6;color:#374151;padding:3px 10px;border-radius:6px;font-weight:500">' + roleLabel + '</span>';
-    targetRow.appendChild(inject);
+    inject.setAttribute('data-abk-role-row', '1');
+    inject.className = row.className || '';
+    inject.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:12px 0;';
+    inject.innerHTML =
+      '<span style="font-size:14px">Organization role</span>' +
+      '<span style="font-size:13px;padding:3px 10px;border-radius:6px;font-weight:500;' +
+      'background:rgba(0,102,204,0.12);color:#0066cc">' + roleLabel + '</span>';
+    row.parentNode.insertBefore(inject, row);
   }
 
   function openOrgAdmin() {
@@ -372,18 +596,141 @@ const inject = `<!-- ABK_START -->
     }, true);
   }
 
-  function tryPatch() {
-    patchLoginText();
-    patchLogo();
-    patchAdminLink();
-    renameAdminLink();
-    injectAccountRole();
+  // 7. Block registration for non-@abk.gr emails.
+  // Disables the submit button in real-time as the user types.
+  function patchRegistration() {
+    var path = window.location.pathname;
+    if (path.indexOf('register') === -1) return;
+    var emailInput = document.querySelector(
+      'input[type="email"], input[name="email"], input[autocomplete="email"], input[id*="email"]'
+    );
+    if (!emailInput || emailInput.getAttribute('data-abk-reg')) return;
+    emailInput.setAttribute('data-abk-reg', '1');
+
+    // Add a helper note below the field
+    if (!document.getElementById('abk-reg-note')) {
+      var note = document.createElement('p');
+      note.id = 'abk-reg-note';
+      note.style.cssText = 'font-size:12px;color:#9ca3af;margin:3px 0 0;';
+      note.textContent = 'Only @abk.gr email addresses are accepted.';
+      if (emailInput.parentNode) emailInput.parentNode.insertBefore(note, emailInput.nextSibling);
+    }
+
+    function validate() {
+      var val = (emailInput.value || '').trim().toLowerCase();
+      var submitBtn = document.querySelector('button[type="submit"]');
+      var errEl = document.getElementById('abk-reg-err');
+      var hasDomain = val.indexOf('@') !== -1;
+      var allowed = !hasDomain || val.endsWith('@abk.gr');
+      if (!allowed) {
+        if (!errEl) {
+          var err = document.createElement('p');
+          err.id = 'abk-reg-err';
+          err.style.cssText = 'font-size:12px;color:#dc2626;margin:4px 0 0;';
+          err.textContent = 'Only @abk.gr addresses are allowed.';
+          if (emailInput.parentNode) emailInput.parentNode.insertBefore(err, emailInput.nextSibling);
+        }
+        if (submitBtn) { submitBtn.disabled = true; submitBtn.style.opacity = '0.5'; }
+      } else {
+        if (errEl) errEl.remove();
+        if (submitBtn) { submitBtn.disabled = false; submitBtn.style.opacity = ''; }
+      }
+    }
+
+    emailInput.addEventListener('input', validate);
+    emailInput.addEventListener('blur', validate);
   }
 
-  // Start observing immediately on <html> — do NOT wait for DOMContentLoaded
-  // This ensures we catch React's first render
-  new MutationObserver(tryPatch).observe(document.documentElement, { childList: true, subtree: true });
-  tryPatch();
+  // 8. Replace greeting icon (pencil/feather) with ABK logo
+  function patchGreeting() {
+    if (!document.body) return;
+    try {
+    // Use TreeWalker to find the exact text node with the greeting
+    var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
+    var node;
+    while ((node = walker.nextNode())) {
+      if (!/Good (morning|afternoon|evening)/i.test(node.textContent || '')) continue;
+      var el = node.parentElement;
+      if (!el || el.dataset.abkGreetDone) continue;
+      el.dataset.abkGreetDone = '1';
+
+      // Walk up until we find a container that also has an SVG sibling
+      var container = el;
+      for (var k = 0; k < 6; k++) {
+        if (!container.parentElement) break;
+        container = container.parentElement;
+        if (container.querySelector('svg')) break;
+      }
+
+      // Hide ALL SVGs in the container (the feather/pencil icon)
+      container.querySelectorAll('svg').forEach(function(s) {
+        s.style.display = 'none';
+        s.setAttribute('data-abk-greet-icon-hidden', '1');
+      });
+
+      // Insert ABK logo inline BEFORE the heading element (as a sibling)
+      if (!document.querySelector('[data-abk-greet-logo]')) {
+        var img = document.createElement('img');
+        img.src = '/assets/abk-logo.png?abk=1';
+        img.setAttribute('data-abk-greet-logo', '1');
+        img.style.cssText = 'height:28px;width:auto;object-fit:contain;vertical-align:middle;margin-right:10px;display:inline-block;';
+        // Insert at start of the parent container (same row as the text)
+        var insertParent = el.parentElement || container;
+        insertParent.insertBefore(img, insertParent.firstChild);
+      }
+      break;
+    }
+    } catch(e) {}
+  }
+
+  // 9. Hide Sign Up link and redirect /register → / (registration is admin-only via org settings)
+  function hideSignUp() {
+    // Redirect anyone who navigates directly to /register
+    if (window.location.pathname.indexOf('register') !== -1) {
+      window.location.replace('/');
+      return;
+    }
+    // Hide "Don't have an account?" / "Sign up" links on login page
+    var all = document.querySelectorAll('a, p, span, div');
+    for (var i = 0; i < all.length; i++) {
+      var el = all[i];
+      var txt = (el.textContent || '').trim();
+      if ((txt.indexOf('Sign up') !== -1 || txt.indexOf("Don't have an account") !== -1 ||
+           txt.indexOf('Create an account') !== -1 || txt.indexOf('Register') !== -1) &&
+          el.children.length <= 2) {
+        el.style.display = 'none';
+      }
+    }
+    // Also hide any <a> pointing to /register
+    document.querySelectorAll('a[href*="register"]').forEach(function(a) {
+      var p = a.parentElement;
+      if (p && p !== document.body) p.style.display = 'none';
+      else a.style.display = 'none';
+    });
+  }
+
+  function tryPatch() {
+    try { updateAppClass(); } catch(e) {}
+    try { patchLoginText(); } catch(e) {}
+    try { patchLogo(); } catch(e) {}
+    try { patchForgotPassword(); } catch(e) {}
+    try { hideSignUp(); } catch(e) {}
+    try { patchAdminLink(); } catch(e) {}
+    try { renameAdminLink(); } catch(e) {}
+    try { injectAccountRole(); } catch(e) {}
+    try { patchGreeting(); } catch(e) {}
+  }
+
+  function setup() {
+    new MutationObserver(tryPatch).observe(document.documentElement, { childList: true, subtree: true });
+    tryPatch();
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', setup);
+  } else {
+    setup();
+  }
 })();
 </script>
 <!-- ABK_END -->`;
