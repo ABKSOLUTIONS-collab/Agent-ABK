@@ -144,6 +144,10 @@ const inject = `<!-- ABK_START -->
 
   /* Home greeting subtitle, adapts to light/dark brand blue */
   [data-abk-greet-sub] { color: var(--ring-primary) !important; }
+
+  .abk-scroll::-webkit-scrollbar { width: 10px; height: 10px; }
+  .abk-scroll::-webkit-scrollbar-thumb { background: var(--border-medium); border-radius: 8px; border: 3px solid transparent; background-clip: padding-box; }
+  .abk-scroll::-webkit-scrollbar-track { background: transparent; }
 </style>
 <script>
 // Unregister LibreChat's service worker so the latest index.html is always served.
@@ -767,6 +771,291 @@ if ('serviceWorker' in navigator) {
     } catch(e) {}
   }
 
+  // 8b. Lightweight toast for not-yet-implemented actions (UI only — no fake state/data)
+  function showAbkToast(msg) {
+    var old = document.getElementById('abk-toast');
+    if (old) old.remove();
+    var t = document.createElement('div');
+    t.id = 'abk-toast';
+    t.textContent = msg;
+    t.style.cssText = 'position:fixed;bottom:24px;left:50%;transform:translateX(-50%);' +
+      'background:var(--text-primary,#14171c);color:#fff;padding:10px 18px;border-radius:8px;' +
+      'font-size:13px;font-weight:500;z-index:100000;box-shadow:0 12px 44px rgba(16,24,40,.25);opacity:0;' +
+      'transition:opacity .15s ease;';
+    document.body.appendChild(t);
+    requestAnimationFrame(function() { t.style.opacity = '1'; });
+    setTimeout(function() {
+      t.style.opacity = '0';
+      setTimeout(function() { t.remove(); }, 200);
+    }, 2200);
+  }
+
+  // 8c. Generic full-screen panel modal (same chrome as Organization Settings) for Projects / MCP
+  function showAbkPanelModal(title, bodyHtml) {
+    var existing = document.getElementById('abk-panel-overlay');
+    if (existing) existing.remove();
+
+    var overlay = document.createElement('div');
+    overlay.id = 'abk-panel-overlay';
+    overlay.style.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(16,20,26,.5);display:flex;align-items:center;justify-content:center;';
+
+    var modal = document.createElement('div');
+    modal.style.cssText = 'position:relative;width:92%;max-width:960px;height:85vh;background:var(--surface-dialog,#fff);border-radius:14px;overflow:hidden;box-shadow:0 24px 80px rgba(0,0,0,.35);display:flex;flex-direction:column;';
+
+    var header = document.createElement('div');
+    header.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:14px 20px;background:var(--surface-dialog,#fff);border-bottom:1px solid var(--border-light,#e6e9ee);flex-shrink:0;';
+    var titleEl = document.createElement('span');
+    titleEl.style.cssText = 'font-weight:600;font-size:14px;color:var(--ring-primary,#0071BC);';
+    titleEl.textContent = title;
+    var closeBtn = document.createElement('button');
+    closeBtn.innerHTML = '&#215;';
+    closeBtn.style.cssText = 'background:none;border:none;font-size:22px;cursor:pointer;color:var(--text-tertiary,#8b94a1);padding:0 4px;line-height:1;';
+    closeBtn.onclick = function() { overlay.remove(); };
+    header.appendChild(titleEl);
+    header.appendChild(closeBtn);
+
+    var body = document.createElement('div');
+    body.className = 'abk-scroll';
+    body.style.cssText = 'flex:1;overflow-y:auto;padding:24px 28px;color:var(--text-primary,#14171c);';
+    body.innerHTML = bodyHtml;
+
+    modal.appendChild(header);
+    modal.appendChild(body);
+    overlay.appendChild(modal);
+    overlay.addEventListener('click', function(e) { if (e.target === overlay) overlay.remove(); });
+    document.body.appendChild(overlay);
+    return body;
+  }
+
+  // 8d. Projects panel — UI shell only, genuinely empty (no seeded fake projects)
+  function buildProjectsHtml() {
+    return (
+      '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:18px;">' +
+        '<h1 style="font-size:26px;font-weight:700;letter-spacing:-.02em;margin:0;">Projects</h1>' +
+        '<button id="abk-projects-new" style="height:38px;padding:0 16px;border:none;border-radius:8px;background:var(--ring-primary,#0071BC);color:#fff;font-size:14px;font-weight:600;cursor:pointer;white-space:nowrap;">+ New project</button>' +
+      '</div>' +
+      '<input type="text" placeholder="Search projects…" style="width:100%;height:44px;padding:0 14px;border:1px solid var(--border-medium,#d5dae1);border-radius:10px;background:var(--surface-primary,#fff);color:var(--text-primary,#14171c);font-size:14px;outline:none;box-sizing:border-box;margin-bottom:18px;">' +
+      '<div style="display:flex;gap:20px;border-bottom:1px solid var(--border-light,#e6e9ee);margin-bottom:32px;">' +
+        '<button class="abk-proj-tab" data-tab="your" style="background:none;border:none;padding:0 0 10px;font-size:14px;font-weight:600;color:var(--ring-primary,#0071BC);border-bottom:2px solid var(--ring-primary,#0071BC);cursor:pointer;">Your projects</button>' +
+        '<button class="abk-proj-tab" data-tab="team" style="background:none;border:none;padding:0 0 10px;font-size:14px;font-weight:500;color:var(--text-tertiary,#8b94a1);border-bottom:2px solid transparent;cursor:pointer;">Team</button>' +
+        '<button class="abk-proj-tab" data-tab="shared" style="background:none;border:none;padding:0 0 10px;font-size:14px;font-weight:500;color:var(--text-tertiary,#8b94a1);border-bottom:2px solid transparent;cursor:pointer;">Shared with you</button>' +
+      '</div>' +
+      '<div style="text-align:center;color:var(--text-tertiary,#8b94a1);font-size:13.5px;padding:60px 0;">No projects yet.</div>'
+    );
+  }
+  function wireProjectsPanel(body) {
+    var tabs = body.querySelectorAll('.abk-proj-tab');
+    tabs.forEach(function(tab) {
+      tab.addEventListener('click', function() {
+        tabs.forEach(function(t) {
+          t.style.color = 'var(--text-tertiary,#8b94a1)';
+          t.style.fontWeight = '500';
+          t.style.borderBottomColor = 'transparent';
+        });
+        tab.style.color = 'var(--ring-primary,#0071BC)';
+        tab.style.fontWeight = '600';
+        tab.style.borderBottomColor = 'var(--ring-primary,#0071BC)';
+      });
+    });
+    var newBtn = body.querySelector('#abk-projects-new');
+    if (newBtn) newBtn.addEventListener('click', function() { showAbkToast('Έρχεται σύντομα'); });
+  }
+
+  // 8e. MCP Settings panel — UI shell only, genuinely empty (no seeded fake servers)
+  function buildMcpHtml() {
+    return (
+      '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">' +
+        '<h1 style="font-size:26px;font-weight:700;letter-spacing:-.02em;margin:0;">MCP Servers</h1>' +
+        '<button id="abk-mcp-add" style="height:38px;padding:0 16px;border:none;border-radius:8px;background:var(--ring-primary,#0071BC);color:#fff;font-size:14px;font-weight:600;cursor:pointer;white-space:nowrap;">+ Add MCP server</button>' +
+      '</div>' +
+      '<p style="color:var(--text-tertiary,#8b94a1);font-size:14px;margin:0 0 20px;">Σύνδεσε MCP servers για να δώσεις στο ABK Assistant και στους agents πρόσβαση σε εργαλεία και connectors.</p>' +
+      '<input type="text" placeholder="Filter MCP servers by name…" style="width:100%;height:44px;padding:0 14px;border:1px solid var(--border-medium,#d5dae1);border-radius:10px;background:var(--surface-primary,#fff);color:var(--text-primary,#14171c);font-size:14px;outline:none;box-sizing:border-box;margin-bottom:28px;">' +
+      '<div style="border:1.5px dashed var(--border-medium,#d5dae1);border-radius:12px;padding:52px 20px;text-align:center;">' +
+        '<div style="width:52px;height:52px;border-radius:10px;background:var(--surface-active,#e6f1f9);display:flex;align-items:center;justify-content:center;margin:0 auto 16px;">' +
+          '<svg width="26" height="26" viewBox="0 0 24 24" fill="none" style="stroke:var(--ring-primary,#0071BC);" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="7" rx="1.5"/><rect x="3" y="13" width="18" height="7" rx="1.5"/><line x1="7" y1="7.5" x2="7.1" y2="7.5"/><line x1="7" y1="16.5" x2="7.1" y2="16.5"/></svg>' +
+        '</div>' +
+        '<div style="font-size:15px;font-weight:600;margin-bottom:6px;">No MCP servers yet</div>' +
+        '<div style="font-size:13.5px;color:var(--text-tertiary,#8b94a1);margin-bottom:20px;">Create your first MCP server to get started</div>' +
+        '<button id="abk-mcp-add-2" style="height:38px;padding:0 16px;border:none;border-radius:8px;background:var(--ring-primary,#0071BC);color:#fff;font-size:14px;font-weight:600;cursor:pointer;">+ Add MCP server</button>' +
+      '</div>'
+    );
+  }
+  function wireMcpPanel(body) {
+    ['#abk-mcp-add', '#abk-mcp-add-2'].forEach(function(sel) {
+      var btn = body.querySelector(sel);
+      if (btn) btn.addEventListener('click', function() { showAbkToast('Έρχεται σύντομα'); });
+    });
+  }
+
+  // 8f. Add Projects + MCP Settings icons to the left icon rail (cloning a
+  // sibling's classes so they visually match, same technique as the
+  // Organization Settings rail icon above).
+  function addAbkRailIcon(dataAttr, titleText, svgHtml, onClick) {
+    if (document.querySelector('[' + dataAttr + ']')) return;
+    var skillsBtn = null;
+    document.querySelectorAll('button, a').forEach(function(el) {
+      if (skillsBtn) return;
+      var lbl = (el.getAttribute('aria-label') || el.getAttribute('title') || '').trim();
+      if (lbl === 'Skills') skillsBtn = el;
+    });
+    if (!skillsBtn || !skillsBtn.parentElement) return;
+    var rail = skillsBtn.parentElement;
+    if (rail.children.length < 3) return;
+
+    var template = null;
+    for (var i = 0; i < rail.children.length; i++) {
+      var sib = rail.children[i];
+      if (sib !== skillsBtn && (sib.tagName === 'BUTTON' || sib.tagName === 'A')) { template = sib; break; }
+    }
+    if (!template) template = skillsBtn;
+
+    var newBtn = document.createElement(template.tagName);
+    newBtn.className = template.className;
+    newBtn.setAttribute(dataAttr, '1');
+    newBtn.setAttribute('title', titleText);
+    newBtn.setAttribute('aria-label', titleText);
+    newBtn.innerHTML = svgHtml;
+    newBtn.addEventListener('click', function(e) {
+      e.preventDefault();
+      e.stopPropagation();
+      onClick();
+    });
+    rail.appendChild(newBtn);
+  }
+
+  function patchProjectsAndMcpRail() {
+    addAbkRailIcon('data-abk-rail-projects', 'Projects',
+      '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/></svg>',
+      function() {
+        var body = showAbkPanelModal('Projects', buildProjectsHtml());
+        wireProjectsPanel(body);
+      });
+    addAbkRailIcon('data-abk-rail-mcp', 'MCP Settings',
+      '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="7" rx="1.5"/><rect x="3" y="13" width="18" height="7" rx="1.5"/><line x1="7" y1="7.5" x2="7.1" y2="7.5"/><line x1="7" y1="16.5" x2="7.1" y2="16.5"/></svg>',
+      function() {
+        var body = showAbkPanelModal('MCP Servers', buildMcpHtml());
+        wireMcpPanel(body);
+      });
+  }
+
+  // 8g. Add a "Connectors" tab to the native Settings modal. UI shell only —
+  // every connector is shown as NOT connected (the real, current state,
+  // since there is no OAuth backend wired up yet) rather than seeded/fake data.
+  var ABK_CONNECTORS = [
+    { key: 'gdrive', name: 'Google Drive', desc: 'Access files from Google Drive.', color: '#1a73e8', initials: 'GD' },
+    { key: 'gmail', name: 'Gmail', desc: 'Read and search your Gmail messages.', color: '#d64545', initials: 'GM' },
+    { key: 'gcal', name: 'Google Calendar', desc: 'View and manage calendar events.', color: '#1a73e8', initials: 'GC' },
+    { key: 'slack', name: 'Slack', desc: 'Search and post to Slack channels.', color: '#4a154b', initials: 'SL' },
+    { key: 'github', name: 'GitHub', desc: 'Access repositories and issues.', color: '#24292f', initials: 'GH' },
+    { key: 'notion', name: 'Notion', desc: 'Search and read Notion pages.', color: '#37352f', initials: 'NO' },
+    { key: 'confluence', name: 'Confluence', desc: 'Search Confluence spaces and pages.', color: '#0071BC', initials: 'CF' }
+  ];
+
+  function buildConnectorsHtml() {
+    var rows = ABK_CONNECTORS.map(function(c) {
+      return (
+        '<div style="display:flex;align-items:center;gap:14px;padding:14px 0;border-bottom:1px solid var(--border-light,#e6e9ee);">' +
+          '<div style="width:36px;height:36px;border-radius:8px;background:' + c.color + ';color:#fff;font-size:12px;font-weight:600;display:flex;align-items:center;justify-content:center;flex-shrink:0;">' + c.initials + '</div>' +
+          '<div style="flex:1;min-width:0;">' +
+            '<div style="font-size:14px;font-weight:600;">' + c.name + '</div>' +
+            '<div style="font-size:12.5px;color:var(--text-tertiary,#8b94a1);margin-top:1px;">' + c.desc + '</div>' +
+          '</div>' +
+          '<button class="abk-connector-btn" data-key="' + c.key + '" style="height:34px;padding:0 16px;border:1px solid var(--ring-primary,#0071BC);border-radius:8px;background:none;color:var(--ring-primary,#0071BC);font-size:13px;font-weight:600;cursor:pointer;flex-shrink:0;white-space:nowrap;">Connect</button>' +
+        '</div>'
+      );
+    }).join('');
+    return (
+      '<h2 style="font-size:16px;font-weight:600;margin:0 0 4px;">Connectors</h2>' +
+      '<p style="font-size:13.5px;color:var(--text-tertiary,#8b94a1);margin:0 0 16px;">Connect third-party services to give ABK Assistant more context.</p>' +
+      '<div style="display:inline-block;font-size:12.5px;font-weight:600;padding:4px 10px;border-radius:6px;background:var(--surface-active,#e6f1f9);color:var(--ring-primary,#0071BC);margin-bottom:8px;">0 / ' + ABK_CONNECTORS.length + ' connected</div>' +
+      '<div>' + rows + '</div>'
+    );
+  }
+  function wireConnectorsPanel(panel) {
+    panel.querySelectorAll('.abk-connector-btn').forEach(function(btn) {
+      btn.addEventListener('click', function() { showAbkToast('Έρχεται σύντομα'); });
+    });
+  }
+
+  function findSettingsTabList() {
+    var accountTab = null;
+    document.querySelectorAll('button, [role="tab"], a').forEach(function(el) {
+      if (accountTab) return;
+      if ((el.textContent || '').trim() === 'Account') accountTab = el;
+    });
+    if (!accountTab || !accountTab.parentElement) return null;
+    var tabList = accountTab.parentElement;
+    if (tabList.children.length < 4) return null; // sanity: a real settings nav has several tabs
+    return { tabList: tabList, accountTab: accountTab };
+  }
+
+  function injectConnectorsTab() {
+    if (document.querySelector('[data-abk-connectors-tab]')) return;
+    var found = findSettingsTabList();
+    if (!found) return;
+    var newTab = found.accountTab.cloneNode(true);
+    newTab.removeAttribute('id');
+    newTab.setAttribute('data-abk-connectors-tab', '1');
+    var walker = document.createTreeWalker(newTab, NodeFilter.SHOW_TEXT, null, false);
+    var node;
+    while ((node = walker.nextNode())) {
+      if (node.textContent.trim() === 'Account') { node.textContent = 'Connectors'; break; }
+    }
+    found.tabList.insertBefore(newTab, found.accountTab);
+
+    newTab.addEventListener('click', function(e) {
+      e.preventDefault();
+      e.stopPropagation();
+      showConnectorsPanel();
+    }, true);
+  }
+
+  function showConnectorsPanel() {
+    var tab = document.querySelector('[data-abk-connectors-tab]');
+    if (!tab || !tab.parentElement) return;
+    var tabList = tab.parentElement;
+    var dialogBody = tabList.parentElement;
+    if (!dialogBody) return;
+    var contentPane = null;
+    for (var i = 0; i < dialogBody.children.length; i++) {
+      if (dialogBody.children[i] !== tabList) { contentPane = dialogBody.children[i]; break; }
+    }
+    if (!contentPane) return;
+
+    var panel = document.getElementById('abk-connectors-panel');
+    if (!panel) {
+      panel = document.createElement('div');
+      panel.id = 'abk-connectors-panel';
+      panel.className = 'abk-scroll';
+      panel.style.cssText = 'position:absolute;inset:0;background:var(--surface-dialog,#fff);overflow:auto;z-index:5;padding:20px 24px;';
+      panel.innerHTML = buildConnectorsHtml();
+      if (getComputedStyle(contentPane).position === 'static') contentPane.style.position = 'relative';
+      contentPane.appendChild(panel);
+      wireConnectorsPanel(panel);
+    }
+    panel.style.display = 'block';
+    tab.style.background = 'var(--surface-active)';
+    tab.style.color = 'var(--ring-primary)';
+  }
+
+  var abkConnectorsClickInstalled = false;
+  function hideConnectorsPanelIfClickedElsewhere() {
+    if (abkConnectorsClickInstalled) return;
+    abkConnectorsClickInstalled = true;
+    document.addEventListener('click', function(e) {
+      var el = e.target;
+      var isOurTab = false;
+      for (var i = 0; i < 6 && el && el !== document.body; i++, el = el.parentElement) {
+        if (el.hasAttribute && el.hasAttribute('data-abk-connectors-tab')) { isOurTab = true; break; }
+      }
+      if (isOurTab) return;
+      var panel = document.getElementById('abk-connectors-panel');
+      if (panel) panel.style.display = 'none';
+      var tab = document.querySelector('[data-abk-connectors-tab]');
+      if (tab) { tab.style.background = ''; tab.style.color = ''; }
+    }, true);
+  }
+
   // 9. Hide Sign Up link and redirect /register → / (registration is admin-only via org settings)
   function hideSignUp() {
     // Redirect anyone who navigates directly to /register
@@ -812,6 +1101,9 @@ if ('serviceWorker' in navigator) {
     try { patchAdminLink(); } catch(e) {}
     try { renameAdminLink(); } catch(e) {}
     try { moveOrgSettingsToRail(); } catch(e) {}
+    try { patchProjectsAndMcpRail(); } catch(e) {}
+    try { injectConnectorsTab(); } catch(e) {}
+    try { hideConnectorsPanelIfClickedElsewhere(); } catch(e) {}
     try { patchGreeting(); } catch(e) {}
   }
 
