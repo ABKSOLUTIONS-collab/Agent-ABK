@@ -102,6 +102,16 @@ if ('serviceWorker' in navigator) {
     var isAuth = (path === '/' || path.indexOf('/login') !== -1 || path.indexOf('/register') !== -1);
     if (isAuth) {
       document.body.classList.remove('abk-app');
+      // Landing back on the login page only happens right after a logout.
+      // The injected <script> in index.html runs once per HARD page load —
+      // if LibreChat's logout/login is a client-side SPA transition (no full
+      // reload), our cached role state would otherwise survive across
+      // different users logging into the SAME tab. Clear it here so the
+      // next login always re-detects the real, current user's tier.
+      if (typeof abkCurrentRole !== 'undefined') { abkCurrentRole = null; }
+      if (typeof abkLastAppliedEmail !== 'undefined') { abkLastAppliedEmail = null; }
+      var staleRow = document.querySelector('[data-abk-role-row]');
+      if (staleRow) staleRow.remove();
     } else {
       document.body.classList.add('abk-app');
     }
@@ -243,9 +253,11 @@ if ('serviceWorker' in navigator) {
   // Never read from localStorage for role display.
   var BRIDGE_URL = 'https://agent365-bridge.lemonsea-0ef310bc.swedencentral.azurecontainerapps.io';
   var abkCurrentRole = null;
+  var abkLastAppliedEmail = null;
   localStorage.removeItem('abk_org_role');
 
-  function applyRole(tier, email) {
+  function applyRole(tier, email, source) {
+    console.log('[ABK role] applyRole', tier, email, 'from', source);
     abkCurrentRole = tier;
     if (email) localStorage.setItem('abk_admin_email', email);
     // Remove any stale injection (from previous user's session) and re-inject fresh
@@ -257,11 +269,14 @@ if ('serviceWorker' in navigator) {
   // Receive messages back from the org-admin iframe.
   window.addEventListener('message', function(evt) {
     if (!evt || !evt.data) return;
+    if (evt.data.type === 'abk_admin_email' || evt.data.type === 'abk_org_role') {
+      console.log('[ABK role] postMessage received', evt.data, 'origin', evt.origin);
+    }
     if (evt.data.type === 'abk_admin_email' && evt.data.email) {
       localStorage.setItem('abk_admin_email', evt.data.email);
     }
     if (evt.data.type === 'abk_org_role' && evt.data.role) {
-      applyRole(evt.data.role, null);
+      applyRole(evt.data.role, null, 'postMessage');
     }
   }, false);
 
@@ -278,23 +293,22 @@ if ('serviceWorker' in navigator) {
   // response is inspected, and we only skip re-fetching the tier when the
   // detected email is unchanged from what's currently displayed.
   (function autoFetchOrgRole() {
-    var lastAppliedEmail = null;
-
-    function fetchRoleByEmail(email) {
-      if (email === lastAppliedEmail) return;
-      lastAppliedEmail = email;
+    function fetchRoleByEmail(email, source) {
+      if (email === abkLastAppliedEmail) return;
+      abkLastAppliedEmail = email;
       fetch(BRIDGE_URL + '/org-admin/api/my-tier?lc_email=' + encodeURIComponent(email))
         .then(function(r) { return r.ok ? r.json() : null; })
         .then(function(data) {
-          if (data && data.tier) applyRole(data.tier, email);
-        }).catch(function() { if (lastAppliedEmail === email) lastAppliedEmail = null; });
+          if (data && data.tier) applyRole(data.tier, email, source);
+        }).catch(function() { if (abkLastAppliedEmail === email) abkLastAppliedEmail = null; });
     }
 
-    function checkData(data) {
+    function checkData(data, source) {
       if (!data || typeof data !== 'object') return;
       var email = (data.user && data.user.email) || data.email ||
                   (data.data && data.data.email);
-      if (email && email.indexOf('@') !== -1) fetchRoleByEmail(email);
+      console.log('[ABK role] checkData from', source, '-> email', email);
+      if (email && email.indexOf('@') !== -1) fetchRoleByEmail(email, source);
     }
 
     // Wrap window.fetch to intercept LibreChat's own API responses
@@ -306,7 +320,7 @@ if ('serviceWorker' in navigator) {
       if (url && (url.indexOf('/api/auth') !== -1 || url.indexOf('/api/user') !== -1)) {
         p.then(function(resp) {
           if (resp && resp.ok) {
-            resp.clone().json().then(checkData).catch(function() {});
+            resp.clone().json().then(function(data) { checkData(data, url); }).catch(function() {});
           }
         }).catch(function() {});
       }
@@ -316,10 +330,10 @@ if ('serviceWorker' in navigator) {
     // Also attempt directly — LibreChat may have already called refresh before our script ran
     _origFetch('/api/auth/refresh', { method: 'POST', credentials: 'include' })
       .then(function(r) { return r.ok ? r.json() : null; })
-      .then(function(d) { if (d) checkData(d); }).catch(function() {});
+      .then(function(d) { if (d) checkData(d, 'direct-refresh-POST'); }).catch(function() {});
     _origFetch('/api/auth/refresh', { credentials: 'include' })
       .then(function(r) { return r.ok ? r.json() : null; })
-      .then(function(d) { if (d) checkData(d); }).catch(function() {});
+      .then(function(d) { if (d) checkData(d, 'direct-refresh-GET'); }).catch(function() {});
   })();
 
   // 5. "Forgot password?" link → custom reset modal (no email required)
