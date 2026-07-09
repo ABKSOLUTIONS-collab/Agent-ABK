@@ -713,30 +713,16 @@ if ('serviceWorker' in navigator) {
   function patchGreeting() {
     if (!document.body) return;
     try {
-    // Use TreeWalker to find the exact text node with the greeting
-    var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
-    var node;
-    while ((node = walker.nextNode())) {
-      if (!/Good (morning|afternoon|evening)/i.test(node.textContent || '')) continue;
-      var srEl = node.parentElement;
-      if (!srEl || srEl.dataset.abkGreetDone) continue;
-
-      // The greeting is rendered TWICE: an sr-only span (screen readers) plus
-      // a visually-animated sibling (per-letter spans, aria-hidden="true"),
-      // added slightly LATER by the animation library. Find that visible
-      // sibling — and if it hasn't mounted yet, do NOT mark srEl done, so
-      // the next MutationObserver tick retries instead of giving up
-      // permanently on the (still invisible, 0×0) sr-only span.
-      var el = null;
-      var nextSib = srEl.nextElementSibling;
-      var prevSib = srEl.previousElementSibling;
-      if (nextSib && /Good (morning|afternoon|evening)/i.test(nextSib.textContent || '')) {
-        el = nextSib;
-      } else if (prevSib && /Good (morning|afternoon|evening)/i.test(prevSib.textContent || '')) {
-        el = prevSib;
-      }
-      if (!el) continue;
-      srEl.dataset.abkGreetDone = '1';
+    // The greeting renders as a React Fragment with two children: an
+    // sr-only span (screen readers) and this visually-animated sibling
+    // (per-letter spans, aria-hidden="true") — confirmed directly from the
+    // LibreChat bundle source. Target it directly instead of guessing at
+    // sibling relationships from a matched text node.
+    var candidates = document.querySelectorAll('.split-parent[aria-hidden="true"]');
+    for (var ci = 0; ci < candidates.length; ci++) {
+      var el = candidates[ci];
+      if (el.dataset.abkGreetDone) continue;
+      if (!/Good (morning|afternoon|evening)/i.test(el.textContent || '')) continue;
       el.dataset.abkGreetDone = '1';
 
       // Walk up until we find a container that also has an SVG sibling
