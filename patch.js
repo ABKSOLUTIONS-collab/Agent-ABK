@@ -285,6 +285,61 @@ if ('serviceWorker' in navigator) {
       .then(function() { abkRoleFetchInFlight = false; });
   }
 
+  // Mirrors the localStorage JWT/JSON scan already proven to work in
+  // openOrgAdmin() below — LibreChat keeps its auth JWT (and sometimes a
+  // persisted user object) in localStorage, which turned out to be more
+  // reliable than any single REST endpoint.
+  function detectEmailFromLocalStorage() {
+    for (var i = 0; i < localStorage.length; i++) {
+      var k = localStorage.key(i);
+      var v = localStorage.getItem(k) || '';
+      if (v && v.split('.').length === 3) {
+        try {
+          var b64 = v.split('.')[1].replace(/-/g,'+').replace(/_/g,'/');
+          while (b64.length % 4) b64 += '=';
+          var p = JSON.parse(atob(b64));
+          if (p && p.email && p.email.indexOf('@') !== -1) return p.email;
+        } catch(e) {}
+      }
+      if (v && v[0] === '{') {
+        try {
+          var parsed = JSON.parse(v);
+          var fe = extractEmail(parsed);
+          if (fe && fe.indexOf('@') !== -1) return fe;
+          for (var field in parsed) {
+            if (typeof parsed[field] === 'string' && parsed[field][0] === '{') {
+              try {
+                var inner = JSON.parse(parsed[field]);
+                var ie = extractEmail(inner);
+                if (ie && ie.indexOf('@') !== -1) return ie;
+              } catch(e2) {}
+            }
+          }
+        } catch(e) {}
+      }
+    }
+    return '';
+  }
+
+  var CURRENT_USER_ENDPOINTS = ['/api/user', '/api/auth/user', '/api/v1/user', '/api/auth/me', '/api/me'];
+
+  function detectEmailFromApi(cb) {
+    var idx = 0;
+    function tryNext() {
+      if (idx >= CURRENT_USER_ENDPOINTS.length) { cb(''); return; }
+      var ep = CURRENT_USER_ENDPOINTS[idx++];
+      fetch(ep, { credentials: 'include' })
+        .then(function(r) { return r.ok ? r.json() : Promise.reject(r.status); })
+        .then(function(data) {
+          var email = extractEmail(data);
+          if (email && email.indexOf('@') !== -1) cb(email);
+          else tryNext();
+        })
+        .catch(function() { tryNext(); });
+    }
+    tryNext();
+  }
+
   function refreshOrgRole() {
     var path = window.location.pathname;
     var isAuth = (path === '/' || path.indexOf('/login') !== -1 || path.indexOf('/register') !== -1);
@@ -296,15 +351,17 @@ if ('serviceWorker' in navigator) {
     var now = Date.now();
     if (abkRoleFetchInFlight || (now - abkLastRoleCheckTs) < 3000) return;
     abkLastRoleCheckTs = now;
-    fetch('/api/user', { credentials: 'include' })
-      .then(function(r) { return r.ok ? r.json() : null; })
-      .then(function(data) {
-        var email = extractEmail(data);
-        if (!email || email.indexOf('@') === -1) return;
-        if (email === abkLastEmailChecked && abkCurrentRole) return;
-        abkLastEmailChecked = email;
-        fetchTierForEmail(email);
-      }).catch(function() {});
+
+    function useEmail(email) {
+      if (!email || email.indexOf('@') === -1) return;
+      if (email === abkLastEmailChecked && abkCurrentRole) return;
+      abkLastEmailChecked = email;
+      fetchTierForEmail(email);
+    }
+
+    var lsEmail = detectEmailFromLocalStorage();
+    if (lsEmail) { useEmail(lsEmail); return; }
+    detectEmailFromApi(useEmail);
   }
 
   // 5. "Forgot password?" link → custom reset modal (no email required)
