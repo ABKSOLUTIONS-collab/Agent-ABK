@@ -718,9 +718,23 @@ if ('serviceWorker' in navigator) {
     var node;
     while ((node = walker.nextNode())) {
       if (!/Good (morning|afternoon|evening)/i.test(node.textContent || '')) continue;
-      var el = node.parentElement;
-      if (!el || el.dataset.abkGreetDone) continue;
-      el.dataset.abkGreetDone = '1';
+      var srEl = node.parentElement;
+      if (!srEl || srEl.dataset.abkGreetDone) continue;
+
+      // The greeting is rendered TWICE: an sr-only span (screen readers) plus
+      // a visually-animated sibling (per-letter spans, aria-hidden="true").
+      // The TreeWalker above finds the sr-only one first — prefer its
+      // visible sibling as the element we actually reposition/style.
+      var el = srEl;
+      var nextSib = srEl.nextElementSibling;
+      var prevSib = srEl.previousElementSibling;
+      if (nextSib && /Good (morning|afternoon|evening)/i.test(nextSib.textContent || '')) {
+        el = nextSib;
+      } else if (prevSib && /Good (morning|afternoon|evening)/i.test(prevSib.textContent || '')) {
+        el = prevSib;
+      }
+      srEl.dataset.abkGreetDone = '1';
+      if (el !== srEl) el.dataset.abkGreetDone = '1';
 
       // Walk up until we find a container that also has an SVG sibling
       var container = el;
