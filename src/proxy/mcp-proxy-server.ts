@@ -9,16 +9,11 @@ import {
 import { ResolvedServer } from "../config/types";
 import { ToolForwarder } from "./tool-forwarder";
 import { CachedTool, loadToolsCache, saveToolsCache } from "../auth/tools-cache";
-import { getUserToken, getGraphToken, getTokenEmail, getStoredEmail, pruneExpiredTokens } from "../auth/user-token-store";
+import { getUserToken, getGraphToken, getStoredEmail, pruneExpiredTokens } from "../auth/user-token-store";
 import { registerOAuthEndpoints } from "../auth/oauth-handler";
-import { SHAREPOINT_TOOLS, SHAREPOINT_LIST_TOOLS, SHAREPOINT_TOOL_NAMES, SharePointToolHandler } from "../tools/sharepoint-tools";
+import { SHAREPOINT_TOOLS, SHAREPOINT_TOOL_NAMES, SharePointToolHandler } from "../tools/sharepoint-tools";
 import { OCR_TOOL, OCR_TOOL_NAMES, OcrToolHandler } from "../tools/ocr-tool";
 import { EMAIL_GRAPH_TOOLS, EMAIL_GRAPH_TOOL_NAMES, EmailGraphToolHandler } from "../tools/email-graph-tools";
-import { CALENDAR_GRAPH_TOOLS, CALENDAR_GRAPH_TOOL_NAMES, CalendarGraphToolHandler } from "../tools/calendar-graph-tools";
-import { WORD_GRAPH_TOOLS, WORD_GRAPH_TOOL_NAMES, WordGraphToolHandler } from "../tools/word-graph-tools";
-import { EXCEL_GRAPH_TOOLS, EXCEL_GRAPH_TOOL_NAMES, ExcelGraphToolHandler } from "../tools/excel-graph-tools";
-import { TEAMS_GRAPH_TOOLS, TEAMS_GRAPH_TOOL_NAMES, TeamsGraphToolHandler } from "../tools/teams-graph-tools";
-import { KNOWLEDGE_GRAPH_TOOLS, KNOWLEDGE_GRAPH_TOOL_NAMES, KnowledgeGraphToolHandler } from "../tools/knowledge-graph-tools";
 import {
   SIGNATURE_STYLE_TOOL,
   SIGNATURE_STYLE_TOOL_NAME,
@@ -32,6 +27,13 @@ import { getUserSignature, appendSignature, LOGO_BASE64 } from "../tools/signatu
 import { ServerDiscovery } from "../discovery/server-discovery";
 import { AppConfig } from "../config/types";
 import express from "express";
+import cookieParser from "cookie-parser";
+import path from "node:path";
+import { createAuthRoutes } from "../routes/auth-routes";
+import { createAdminRoutes } from "../routes/admin-routes";
+import { ensureAppTables, countUsers, upsertUser, logAppError } from "../auth/app-store";
+import { hashPassword } from "../auth/app-auth";
+import { registerOrgAdminEndpoints } from "../admin/org-admin";
 
 function log(message: string): void {
   process.stderr.write(`[agent365-bridge] ${message}\n`);
@@ -174,7 +176,46 @@ export class McpProxyServer {
     return null;
   }
 
+  private getHealthSnapshot() {
+    return {
+      status: "ok",
+      server: "agent365-bridge",
+      cachedTools: this.sharedToolRegistry.size + SHAREPOINT_TOOLS.length + 2,
+      activeUsers: this.userCache.size,
+    };
+  }
+
+  /** Creates the first admin account (from env vars) if the Users table is empty. */
+  private async bootstrapAdmin(): Promise<void> {
+    try {
+      await ensureAppTables();
+      const existing = await countUsers();
+      if (existing > 0) return;
+
+      const email = process.env.INITIAL_ADMIN_EMAIL;
+      const password = process.env.INITIAL_ADMIN_PASSWORD;
+      if (!email || !password) {
+        log("No app users exist yet and INITIAL_ADMIN_EMAIL/INITIAL_ADMIN_PASSWORD are not set — /app login will be unusable until an admin is bootstrapped.");
+        return;
+      }
+
+      await upsertUser({
+        email,
+        passwordHash: await hashPassword(password),
+        role: "admin",
+        createdAt: Date.now(),
+        isActive: true,
+      });
+      log(`Bootstrapped initial admin account: ${email}`);
+    } catch (err) {
+      log(`bootstrapAdmin failed: ${err}`);
+      await logAppError("bootstrap", "Failed to bootstrap initial admin", String(err));
+    }
+  }
+
   async start(): Promise<void> {
+    await this.bootstrapAdmin();
+
     const app = express();
     app.use(express.json());
     app.use(express.urlencoded({ extended: false }));
@@ -196,11 +237,19 @@ export class McpProxyServer {
     const sessions: Record<string, SSEServerTransport> = {};
 
     app.get("/health", (_req, res) => {
-      res.json({
-        status: "ok",
-        server: "agent365-bridge",
-        cachedTools: this.sharedToolRegistry.size + SHAREPOINT_TOOLS.length + 2,
-        activeUsers: this.userCache.size,
+      res.json(this.getHealthSnapshot());
+    });
+
+    // ── Login / Admin console app (independent of the MCP/OAuth routes below) ──
+    app.use(cookieParser());
+    app.use("/api/auth", createAuthRoutes());
+    app.use("/api/admin", createAdminRoutes(() => this.getHealthSnapshot()));
+
+    const webDistPath = path.join(__dirname, "../../web/dist");
+    app.use("/app", express.static(webDistPath));
+    app.get("/app/*", (_req, res) => {
+      res.sendFile(path.join(webDistPath, "index.html"), (err) => {
+        if (err) res.status(404).send("Admin console UI is not built (web/dist missing). Run `npm run build:web`.");
       });
     });
 
@@ -218,6 +267,8 @@ export class McpProxyServer {
     } else {
       log("Warning: OAuth not configured");
     }
+
+    registerOrgAdminEndpoints(app);
 
     app.head("/mcp", (_req, res) => {
       res.set("MCP-Protocol-Version", "2025-06-18");
@@ -265,13 +316,7 @@ export class McpProxyServer {
           tools: [
             ...Array.from(toolRegistry.values()).map((e) => e.toolDef),
             ...SHAREPOINT_TOOLS,
-            ...SHAREPOINT_LIST_TOOLS,
             ...EMAIL_GRAPH_TOOLS,
-            ...CALENDAR_GRAPH_TOOLS,
-            ...WORD_GRAPH_TOOLS,
-            ...EXCEL_GRAPH_TOOLS,
-            ...TEAMS_GRAPH_TOOLS,
-            ...KNOWLEDGE_GRAPH_TOOLS,
             OCR_TOOL,
             SIGNATURE_STYLE_TOOL,
           ],
@@ -340,51 +385,6 @@ export class McpProxyServer {
               return { content: [{ type: "text", text: "Graph token not available. Please re-authenticate at /login." }] };
             }
             const handler = new EmailGraphToolHandler(graphToken);
-            return handler.handleToolCall(name, typedArgs);
-          }
-
-          // ── Calendar tools: Graph API directly (no Copilot license required) ──
-          if (CALENDAR_GRAPH_TOOL_NAMES.has(name)) {
-            if (!graphToken) {
-              return { content: [{ type: "text", text: "Graph token not available. Please re-authenticate at /login." }] };
-            }
-            const handler = new CalendarGraphToolHandler(graphToken);
-            return handler.handleToolCall(name, typedArgs);
-          }
-
-          // ── Word document tools: Graph API + DOCX (no Copilot license required) ──
-          if (WORD_GRAPH_TOOL_NAMES.has(name)) {
-            if (!graphToken) {
-              return { content: [{ type: "text", text: "Graph token not available. Please re-authenticate at /login." }] };
-            }
-            const handler = new WordGraphToolHandler(graphToken);
-            return handler.handleToolCall(name, typedArgs);
-          }
-
-          // ── Excel workbook tools: Graph Excel API (no Copilot license required) ──
-          if (EXCEL_GRAPH_TOOL_NAMES.has(name)) {
-            if (!graphToken) {
-              return { content: [{ type: "text", text: "Graph token not available. Please re-authenticate at /login." }] };
-            }
-            const handler = new ExcelGraphToolHandler(graphToken);
-            return handler.handleToolCall(name, typedArgs);
-          }
-
-          // ── Teams meeting tools: Graph API (no Copilot license required) ──
-          if (TEAMS_GRAPH_TOOL_NAMES.has(name)) {
-            if (!graphToken) {
-              return { content: [{ type: "text", text: "Graph token not available. Please re-authenticate at /login." }] };
-            }
-            const handler = new TeamsGraphToolHandler(graphToken);
-            return handler.handleToolCall(name, typedArgs);
-          }
-
-          // ── Knowledge / Search tools: Graph Search API ──────────────────
-          if (KNOWLEDGE_GRAPH_TOOL_NAMES.has(name)) {
-            if (!graphToken) {
-              return { content: [{ type: "text", text: "Graph token not available. Please re-authenticate at /login." }] };
-            }
-            const handler = new KnowledgeGraphToolHandler(graphToken);
             return handler.handleToolCall(name, typedArgs);
           }
 
@@ -571,7 +571,6 @@ export class McpProxyServer {
           ...Array.from(this.sharedToolRegistry.values()).map((e) => e.toolDef),
           ...SHAREPOINT_TOOLS,
           ...EMAIL_GRAPH_TOOLS,
-          ...CALENDAR_GRAPH_TOOLS,
           OCR_TOOL,
           SIGNATURE_STYLE_TOOL,
           SET_SIGNATURE_TOOL,
@@ -593,6 +592,13 @@ export class McpProxyServer {
       }
     }, DISCOVERY_TTL_MS);
 
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    app.use((err: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+      log(`Unhandled route error: ${err}`);
+      void logAppError("express", err.message || "Unhandled error", err.stack);
+      if (!res.headersSent) res.status(500).json({ error: "internal_error" });
+    });
+
     const PORT = process.env.PORT || 3000;
     app.listen(PORT, () => {
       log(`MCP server listening on port ${PORT}`);
@@ -611,7 +617,6 @@ export class McpProxyServer {
           ...Array.from(this.sharedToolRegistry.values()).map((e) => e.toolDef),
           ...SHAREPOINT_TOOLS,
           ...EMAIL_GRAPH_TOOLS,
-          ...CALENDAR_GRAPH_TOOLS,
           OCR_TOOL,
           SIGNATURE_STYLE_TOOL,
         ],

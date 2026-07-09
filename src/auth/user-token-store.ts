@@ -292,6 +292,13 @@ export function getTokenEmail(sessionToken: string): string | undefined {
   return undefined;
 }
 
+// Async variant that actually reads the stored email from Table Storage
+// (getTokenEmail above is a synchronous stub kept for backward compatibility).
+export async function getStoredEmail(sessionToken: string): Promise<string | undefined> {
+  const entry = await getEntry(sessionToken);
+  return entry?.email || undefined;
+}
+
 export async function removeUserToken(sessionToken: string): Promise<void> {
   try {
     const client = getClient();
