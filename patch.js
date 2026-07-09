@@ -723,8 +723,10 @@ if ('serviceWorker' in navigator) {
       var el = candidates[ci];
       if (el.dataset.abkGreetDone) continue;
       // Note: the rendered text uses U+00A0 (non-breaking space), not a
-      // regular space, between words — \s matches both.
-      if (!/Good\s(morning|afternoon|evening)/i.test(el.textContent || '')) continue;
+      // regular space, between words — \\s matches both (double backslash
+      // because this whole script is itself inside patch.js's own outer
+      // template literal, which eats a single backslash as its own escape).
+      if (!/Good\\s(morning|afternoon|evening)/i.test(el.textContent || '')) continue;
       el.dataset.abkGreetDone = '1';
 
       // Walk up until we find a container that also has an SVG sibling
