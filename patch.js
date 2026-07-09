@@ -742,30 +742,37 @@ if ('serviceWorker' in navigator) {
         s.setAttribute('data-abk-greet-icon-hidden', '1');
       });
 
-      // Insert ABK logo + vertical accent bar inline BEFORE the heading (as siblings)
+      // The heading's parent is a flex ROW (icon + text side by side), so a
+      // plain sibling <p> would render BESIDE the heading, not under it.
+      // Wrap the heading in its own column stack so the subtitle can sit
+      // directly below "Good afternoon, {name}" as intended.
+      var insertParent = el.parentElement || container;
+      var stack = document.createElement('div');
+      stack.setAttribute('data-abk-greet-stack', '1');
+      stack.style.cssText = 'display:flex;flex-direction:column;';
+      insertParent.insertBefore(stack, el);
+      stack.appendChild(el);
+
+      // Insert ABK logo + vertical accent bar before the stack (same row)
       if (!document.querySelector('[data-abk-greet-logo]')) {
         var img = document.createElement('img');
         img.src = '/assets/abk-logo.png?abk=1';
         img.setAttribute('data-abk-greet-logo', '1');
         img.style.cssText = 'height:26px;width:auto;object-fit:contain;vertical-align:middle;margin-right:14px;display:inline-block;';
-        // Insert at start of the parent container (same row as the text)
-        var insertParent = el.parentElement || container;
-        insertParent.insertBefore(img, insertParent.firstChild);
+        insertParent.insertBefore(img, stack);
 
         var bar = document.createElement('span');
         bar.setAttribute('data-abk-greet-bar', '1');
         bar.style.cssText = 'display:inline-block;width:2px;height:42px;background:var(--ring-primary);margin-right:14px;vertical-align:middle;';
-        insertParent.insertBefore(bar, img.nextSibling);
+        insertParent.insertBefore(bar, stack);
       }
 
-      // Primary-colored subtitle under the greeting heading
-      if (!document.querySelector('[data-abk-greet-sub]')) {
-        var sub = document.createElement('p');
-        sub.setAttribute('data-abk-greet-sub', '1');
-        sub.textContent = 'Πώς μπορώ να βοηθήσω σήμερα;';
-        sub.style.cssText = 'margin:4px 0 0;font-size:14px;font-weight:500;';
-        el.parentNode.insertBefore(sub, el.nextSibling);
-      }
+      // Primary-colored subtitle below the greeting heading
+      var sub = document.createElement('p');
+      sub.setAttribute('data-abk-greet-sub', '1');
+      sub.textContent = 'Πώς μπορώ να βοηθήσω σήμερα;';
+      sub.style.cssText = 'margin:4px 0 0;font-size:14px;font-weight:500;';
+      stack.appendChild(sub);
       break;
     }
     } catch(e) {}
