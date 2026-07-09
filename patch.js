@@ -265,109 +265,62 @@ if ('serviceWorker' in navigator) {
     }
   }, false);
 
-  // Directly ask LibreChat's own /api/user for the current session's email
-  // (stable, known-good endpoint — same one openOrgAdmin() already falls back
-  // to) instead of guessing which internal fetch call carries it. Runs from
-  // tryPatch on every DOM mutation but throttled + deduped so it's cheap, and
-  // it re-checks on every route change — so switching accounts in the same
-  // tab (login/logout without a full reload) always ends up showing the
-  // NEW user's real tier instead of a stale cached one.
-  var abkLastEmailChecked = null;
-  var abkRoleFetchInFlight = false;
-  var abkLastRoleCheckTs = 0;
+  // LibreChat keeps its access token in memory (not localStorage, not a
+  // readable cookie) and attaches it as an Authorization header via its own
+  // axios/fetch wrapper — confirmed live: a plain fetch('/api/user') from
+  // this injected script gets 401 even with credentials:'include', while
+  // every other guessed endpoint is a flat 404. So we cannot make our own
+  // authenticated request; instead we snoop on the RESPONSE BODY of
+  // LibreChat's own already-authenticated '/api/auth' or '/api/user' calls.
+  //
+  // lastAppliedEmail (not a permanent "resolved" flag) is what makes this
+  // safe across account switches within the same tab: every intercepted
+  // response is inspected, and we only skip re-fetching the tier when the
+  // detected email is unchanged from what's currently displayed.
+  (function autoFetchOrgRole() {
+    var lastAppliedEmail = null;
 
-  function fetchTierForEmail(email) {
-    abkRoleFetchInFlight = true;
-    console.log('[ABK role] fetching tier for', email);
-    fetch(BRIDGE_URL + '/org-admin/api/my-tier?lc_email=' + encodeURIComponent(email))
-      .then(function(r) { console.log('[ABK role] my-tier status', r.status); return r.ok ? r.json() : null; })
-      .then(function(data) {
-        console.log('[ABK role] my-tier data', data);
-        if (data && data.tier) applyRole(data.tier, email);
-      })
-      .catch(function(e) { console.warn('[ABK role] my-tier error', e); })
-      .then(function() { abkRoleFetchInFlight = false; });
-  }
-
-  // Mirrors the localStorage JWT/JSON scan already proven to work in
-  // openOrgAdmin() below — LibreChat keeps its auth JWT (and sometimes a
-  // persisted user object) in localStorage, which turned out to be more
-  // reliable than any single REST endpoint.
-  function detectEmailFromLocalStorage() {
-    for (var i = 0; i < localStorage.length; i++) {
-      var k = localStorage.key(i);
-      var v = localStorage.getItem(k) || '';
-      if (v && v.split('.').length === 3) {
-        try {
-          var b64 = v.split('.')[1].replace(/-/g,'+').replace(/_/g,'/');
-          while (b64.length % 4) b64 += '=';
-          var p = JSON.parse(atob(b64));
-          if (p && p.email && p.email.indexOf('@') !== -1) return p.email;
-        } catch(e) {}
-      }
-      if (v && v[0] === '{') {
-        try {
-          var parsed = JSON.parse(v);
-          var fe = extractEmail(parsed);
-          if (fe && fe.indexOf('@') !== -1) return fe;
-          for (var field in parsed) {
-            if (typeof parsed[field] === 'string' && parsed[field][0] === '{') {
-              try {
-                var inner = JSON.parse(parsed[field]);
-                var ie = extractEmail(inner);
-                if (ie && ie.indexOf('@') !== -1) return ie;
-              } catch(e2) {}
-            }
-          }
-        } catch(e) {}
-      }
-    }
-    return '';
-  }
-
-  var CURRENT_USER_ENDPOINTS = ['/api/user', '/api/auth/user', '/api/v1/user', '/api/auth/me', '/api/me'];
-
-  function detectEmailFromApi(cb) {
-    var idx = 0;
-    function tryNext() {
-      if (idx >= CURRENT_USER_ENDPOINTS.length) { console.warn('[ABK role] no API endpoint returned an email'); cb(''); return; }
-      var ep = CURRENT_USER_ENDPOINTS[idx++];
-      fetch(ep, { credentials: 'include' })
-        .then(function(r) { console.log('[ABK role]', ep, '->', r.status); return r.ok ? r.json() : Promise.reject(r.status); })
+    function fetchRoleByEmail(email) {
+      if (email === lastAppliedEmail) return;
+      lastAppliedEmail = email;
+      fetch(BRIDGE_URL + '/org-admin/api/my-tier?lc_email=' + encodeURIComponent(email))
+        .then(function(r) { return r.ok ? r.json() : null; })
         .then(function(data) {
-          var email = extractEmail(data);
-          if (email && email.indexOf('@') !== -1) cb(email);
-          else tryNext();
-        })
-        .catch(function() { tryNext(); });
-    }
-    tryNext();
-  }
-
-  function refreshOrgRole() {
-    var path = window.location.pathname;
-    var isAuth = (path === '/' || path.indexOf('/login') !== -1 || path.indexOf('/register') !== -1);
-    if (isAuth) {
-      abkCurrentRole = null;
-      abkLastEmailChecked = null;
-      return;
-    }
-    var now = Date.now();
-    if (abkRoleFetchInFlight || (now - abkLastRoleCheckTs) < 3000) return;
-    abkLastRoleCheckTs = now;
-
-    function useEmail(email) {
-      if (!email || email.indexOf('@') === -1) return;
-      if (email === abkLastEmailChecked && abkCurrentRole) return;
-      abkLastEmailChecked = email;
-      fetchTierForEmail(email);
+          if (data && data.tier) applyRole(data.tier, email);
+        }).catch(function() { if (lastAppliedEmail === email) lastAppliedEmail = null; });
     }
 
-    var lsEmail = detectEmailFromLocalStorage();
-    console.log('[ABK role] localStorage scan ->', lsEmail || '(none)');
-    if (lsEmail) { useEmail(lsEmail); return; }
-    detectEmailFromApi(useEmail);
-  }
+    function checkData(data) {
+      if (!data || typeof data !== 'object') return;
+      var email = (data.user && data.user.email) || data.email ||
+                  (data.data && data.data.email);
+      if (email && email.indexOf('@') !== -1) fetchRoleByEmail(email);
+    }
+
+    // Wrap window.fetch to intercept LibreChat's own API responses
+    var _origFetch = window.fetch;
+    window.fetch = function(resource, init) {
+      var url = typeof resource === 'string' ? resource
+              : (resource && typeof resource.url === 'string' ? resource.url : '');
+      var p = _origFetch.apply(this, arguments);
+      if (url && (url.indexOf('/api/auth') !== -1 || url.indexOf('/api/user') !== -1)) {
+        p.then(function(resp) {
+          if (resp && resp.ok) {
+            resp.clone().json().then(checkData).catch(function() {});
+          }
+        }).catch(function() {});
+      }
+      return p;
+    };
+
+    // Also attempt directly — LibreChat may have already called refresh before our script ran
+    _origFetch('/api/auth/refresh', { method: 'POST', credentials: 'include' })
+      .then(function(r) { return r.ok ? r.json() : null; })
+      .then(function(d) { if (d) checkData(d); }).catch(function() {});
+    _origFetch('/api/auth/refresh', { credentials: 'include' })
+      .then(function(r) { return r.ok ? r.json() : null; })
+      .then(function(d) { if (d) checkData(d); }).catch(function() {});
+  })();
 
   // 5. "Forgot password?" link → custom reset modal (no email required)
   function showResetPasswordModal() {
@@ -828,7 +781,6 @@ if ('serviceWorker' in navigator) {
     try { patchAdminLink(); } catch(e) {}
     try { renameAdminLink(); } catch(e) {}
     try { moveOrgSettingsToRail(); } catch(e) {}
-    try { refreshOrgRole(); } catch(e) {}
     try { injectAccountRole(); } catch(e) {}
     try { patchGreeting(); } catch(e) {}
   }
