@@ -722,10 +722,12 @@ if ('serviceWorker' in navigator) {
       if (!srEl || srEl.dataset.abkGreetDone) continue;
 
       // The greeting is rendered TWICE: an sr-only span (screen readers) plus
-      // a visually-animated sibling (per-letter spans, aria-hidden="true").
-      // The TreeWalker above finds the sr-only one first — prefer its
-      // visible sibling as the element we actually reposition/style.
-      var el = srEl;
+      // a visually-animated sibling (per-letter spans, aria-hidden="true"),
+      // added slightly LATER by the animation library. Find that visible
+      // sibling — and if it hasn't mounted yet, do NOT mark srEl done, so
+      // the next MutationObserver tick retries instead of giving up
+      // permanently on the (still invisible, 0×0) sr-only span.
+      var el = null;
       var nextSib = srEl.nextElementSibling;
       var prevSib = srEl.previousElementSibling;
       if (nextSib && /Good (morning|afternoon|evening)/i.test(nextSib.textContent || '')) {
@@ -733,8 +735,9 @@ if ('serviceWorker' in navigator) {
       } else if (prevSib && /Good (morning|afternoon|evening)/i.test(prevSib.textContent || '')) {
         el = prevSib;
       }
+      if (!el) continue;
       srEl.dataset.abkGreetDone = '1';
-      if (el !== srEl) el.dataset.abkGreetDone = '1';
+      el.dataset.abkGreetDone = '1';
 
       // Walk up until we find a container that also has an SVG sibling
       var container = el;
