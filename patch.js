@@ -130,7 +130,6 @@ if ('serviceWorker' in navigator) {
       if (el.textContent.trim() === 'Welcome back' && !el.dataset.abkDone) {
         el.dataset.abkDone = '1';
         el.textContent = 'Welcome Back';
-        el.style.color = '#0066CC';
 
         // Hide LibreChat native appTitle shown above (avoid duplicate)
         var prev = el.previousElementSibling;
@@ -151,23 +150,8 @@ if ('serviceWorker' in navigator) {
         var sub = document.createElement('p');
         sub.className = 'abk-subtitle';
         sub.textContent = 'ABK Assistant';
-        sub.style.cssText = 'margin:6px 0 0;font-size:0.9rem;color:#0066CC;font-weight:400;text-align:center;letter-spacing:0.04em;';
+        sub.style.cssText = 'margin:6px 0 0;font-size:0.9rem;color:#6b7280;font-weight:400;text-align:center;letter-spacing:0.04em;';
         el.parentNode.insertBefore(sub, el.nextSibling);
-      }
-    });
-  }
-
-  // 2b. Color the "Email address" / "Password" field labels blue on the login page
-  function patchLoginLabels() {
-    var path = window.location.pathname;
-    var onAuthPage = path === '/' || path.indexOf('login') !== -1;
-    if (!onAuthPage) return;
-    var targets = ['Email address', 'Password', 'Username or email'];
-    document.querySelectorAll('label, span, div, p').forEach(function(el) {
-      if (el.children.length > 0) return;
-      var txt = (el.textContent || '').trim();
-      if (targets.indexOf(txt) !== -1) {
-        el.style.color = '#0066CC';
       }
     });
   }
@@ -281,57 +265,47 @@ if ('serviceWorker' in navigator) {
     }
   }, false);
 
-  // Intercept LibreChat's own fetch calls to grab the authenticated user's email.
-  // This piggybacks on LibreChat's auth/refresh call it makes on every page load,
-  // so we never need to guess the endpoint name, method, or token format.
-  (function autoFetchOrgRole() {
-    // Tracks the email the currently-displayed role belongs to, NOT whether
-    // we've "ever" resolved — so switching accounts within the same SPA
-    // session (login/logout without a full page reload) always re-fetches
-    // the new user's real role instead of showing the previous user's tier.
-    var lastAppliedEmail = null;
+  // Directly ask LibreChat's own /api/user for the current session's email
+  // (stable, known-good endpoint — same one openOrgAdmin() already falls back
+  // to) instead of guessing which internal fetch call carries it. Runs from
+  // tryPatch on every DOM mutation but throttled + deduped so it's cheap, and
+  // it re-checks on every route change — so switching accounts in the same
+  // tab (login/logout without a full reload) always ends up showing the
+  // NEW user's real tier instead of a stale cached one.
+  var abkLastEmailChecked = null;
+  var abkRoleFetchInFlight = false;
+  var abkLastRoleCheckTs = 0;
 
-    function fetchRoleByEmail(email) {
-      if (email === lastAppliedEmail) return;
-      lastAppliedEmail = email;
-      fetch(BRIDGE_URL + '/org-admin/api/my-tier?lc_email=' + encodeURIComponent(email))
-        .then(function(r) { return r.ok ? r.json() : null; })
-        .then(function(data) {
-          if (data && data.tier) applyRole(data.tier, email);
-        }).catch(function() { if (lastAppliedEmail === email) lastAppliedEmail = null; });
-    }
-
-    function checkData(data) {
-      if (!data || typeof data !== 'object') return;
-      var email = (data.user && data.user.email) || data.email ||
-                  (data.data && data.data.email);
-      if (email && email.indexOf('@') !== -1) fetchRoleByEmail(email);
-    }
-
-    // Wrap window.fetch to intercept LibreChat's own API responses
-    var _origFetch = window.fetch;
-    window.fetch = function(resource, init) {
-      var url = typeof resource === 'string' ? resource
-              : (resource && typeof resource.url === 'string' ? resource.url : '');
-      var p = _origFetch.apply(this, arguments);
-      if (url && (url.indexOf('/api/auth') !== -1 || url.indexOf('/api/user') !== -1)) {
-        p.then(function(resp) {
-          if (resp && resp.ok) {
-            resp.clone().json().then(checkData).catch(function() {});
-          }
-        }).catch(function() {});
-      }
-      return p;
-    };
-
-    // Also attempt directly — LibreChat may have already called refresh before our script ran
-    _origFetch('/api/auth/refresh', { method: 'POST', credentials: 'include' })
+  function fetchTierForEmail(email) {
+    abkRoleFetchInFlight = true;
+    fetch(BRIDGE_URL + '/org-admin/api/my-tier?lc_email=' + encodeURIComponent(email))
       .then(function(r) { return r.ok ? r.json() : null; })
-      .then(function(d) { if (d) checkData(d); }).catch(function() {});
-    _origFetch('/api/auth/refresh', { credentials: 'include' })
+      .then(function(data) { if (data && data.tier) applyRole(data.tier, email); })
+      .catch(function() {})
+      .then(function() { abkRoleFetchInFlight = false; });
+  }
+
+  function refreshOrgRole() {
+    var path = window.location.pathname;
+    var isAuth = (path === '/' || path.indexOf('/login') !== -1 || path.indexOf('/register') !== -1);
+    if (isAuth) {
+      abkCurrentRole = null;
+      abkLastEmailChecked = null;
+      return;
+    }
+    var now = Date.now();
+    if (abkRoleFetchInFlight || (now - abkLastRoleCheckTs) < 3000) return;
+    abkLastRoleCheckTs = now;
+    fetch('/api/user', { credentials: 'include' })
       .then(function(r) { return r.ok ? r.json() : null; })
-      .then(function(d) { if (d) checkData(d); }).catch(function() {});
-  })();
+      .then(function(data) {
+        var email = extractEmail(data);
+        if (!email || email.indexOf('@') === -1) return;
+        if (email === abkLastEmailChecked && abkCurrentRole) return;
+        abkLastEmailChecked = email;
+        fetchTierForEmail(email);
+      }).catch(function() {});
+  }
 
   // 5. "Forgot password?" link → custom reset modal (no email required)
   function showResetPasswordModal() {
@@ -786,13 +760,13 @@ if ('serviceWorker' in navigator) {
   function tryPatch() {
     try { updateAppClass(); } catch(e) {}
     try { patchLoginText(); } catch(e) {}
-    try { patchLoginLabels(); } catch(e) {}
     try { patchLogo(); } catch(e) {}
     try { patchForgotPassword(); } catch(e) {}
     try { hideSignUp(); } catch(e) {}
     try { patchAdminLink(); } catch(e) {}
     try { renameAdminLink(); } catch(e) {}
     try { moveOrgSettingsToRail(); } catch(e) {}
+    try { refreshOrgRole(); } catch(e) {}
     try { injectAccountRole(); } catch(e) {}
     try { patchGreeting(); } catch(e) {}
   }
