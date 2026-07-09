@@ -719,14 +719,13 @@ if ('serviceWorker' in navigator) {
     // LibreChat bundle source. Target it directly instead of guessing at
     // sibling relationships from a matched text node.
     var candidates = document.querySelectorAll('.split-parent[aria-hidden="true"]');
-    console.log('[ABK greet] candidates:', candidates.length);
     for (var ci = 0; ci < candidates.length; ci++) {
       var el = candidates[ci];
-      console.log('[ABK greet] candidate', ci, 'done=', el.dataset.abkGreetDone, 'text=', JSON.stringify(el.textContent));
       if (el.dataset.abkGreetDone) continue;
-      if (!/Good (morning|afternoon|evening)/i.test(el.textContent || '')) continue;
+      // Note: the rendered text uses U+00A0 (non-breaking space), not a
+      // regular space, between words — \s matches both.
+      if (!/Good\s(morning|afternoon|evening)/i.test(el.textContent || '')) continue;
       el.dataset.abkGreetDone = '1';
-      console.log('[ABK greet] MATCHED, wrapping element');
 
       // Walk up until we find a container that also has an SVG sibling
       var container = el;
@@ -753,13 +752,11 @@ if ('serviceWorker' in navigator) {
       // Wrap the heading in its own column stack so the subtitle can sit
       // directly below "Good afternoon, {name}" as intended.
       var insertParent = el.parentElement || container;
-      console.log('[ABK greet] insertParent found:', !!insertParent, insertParent === el.parentElement ? 'is-el-parent' : 'is-container');
       var stack = document.createElement('div');
       stack.setAttribute('data-abk-greet-stack', '1');
       stack.style.cssText = 'display:flex;flex-direction:column;';
       insertParent.insertBefore(stack, el);
       stack.appendChild(el);
-      console.log('[ABK greet] stack created and attached:', document.body.contains(stack));
 
       // Insert ABK logo + vertical accent bar before the stack (same row)
       if (!document.querySelector('[data-abk-greet-logo]')) {
@@ -781,10 +778,9 @@ if ('serviceWorker' in navigator) {
       sub.textContent = 'Πώς μπορώ να βοηθήσω σήμερα;';
       sub.style.cssText = 'margin:4px 0 0;font-size:14px;font-weight:500;';
       stack.appendChild(sub);
-      console.log('[ABK greet] DONE, stack still attached:', document.body.contains(stack));
       break;
     }
-    } catch(e) { console.error('[ABK greet] EXCEPTION', e); }
+    } catch(e) {}
   }
 
   // 8b. Lightweight toast for not-yet-implemented actions (UI only — no fake state/data)
