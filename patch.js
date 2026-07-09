@@ -374,8 +374,11 @@ if ('serviceWorker' in navigator) {
   function patchForgotPassword() {
     var path = window.location.pathname;
     var onLoginPage = path === '/' || path.indexOf('login') !== -1;
-    if (!onLoginPage) return;
     var existing = document.querySelector('[data-abk-forgot]');
+    if (!onLoginPage) {
+      if (existing) existing.remove();
+      return;
+    }
     if (existing && existing.isConnected) return;
     if (existing) existing.remove();
     var submitBtn = null;
