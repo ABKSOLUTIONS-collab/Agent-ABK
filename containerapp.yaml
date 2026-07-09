@@ -47,12 +47,22 @@ properties:
       - name: azure-storage-key
         keyVaultUrl: https://<YOUR_KEYVAULT_NAME>.vault.azure.net/secrets/AZURE-STORAGE-KEY
         identity: system
+      - name: jwt-secret
+        keyVaultUrl: https://<YOUR_KEYVAULT_NAME>.vault.azure.net/secrets/JWT-SECRET
+        identity: system
+      - name: initial-admin-email
+        keyVaultUrl: https://<YOUR_KEYVAULT_NAME>.vault.azure.net/secrets/INITIAL-ADMIN-EMAIL
+        identity: system
+      - name: initial-admin-password
+        keyVaultUrl: https://<YOUR_KEYVAULT_NAME>.vault.azure.net/secrets/INITIAL-ADMIN-PASSWORD
+        identity: system
 
     # ── Ingress ───────────────────────────────────────────────────────────────
-    # MCP over stdio does NOT need HTTP ingress.
-    # Only enable if you wrap the bridge in an HTTP server (OBO mode).
+    # MCP over stdio does NOT need HTTP ingress, but the /app login+admin
+    # console (added alongside the OAuth/MCP HTTP routes) does need inbound
+    # HTTP. Enable this before deploying the admin console:
     # ingress:
-    #   external: false
+    #   external: true
     #   targetPort: 3000
 
   template:
@@ -76,6 +86,14 @@ properties:
             secretRef: azure-storage-account
           - name: AZURE_STORAGE_KEY
             secretRef: azure-storage-key
+          - name: JWT_SECRET
+            secretRef: jwt-secret
+          - name: INITIAL_ADMIN_EMAIL
+            secretRef: initial-admin-email
+          - name: INITIAL_ADMIN_PASSWORD
+            secretRef: initial-admin-password
+          - name: PUBLIC_BASE_URL
+            value: https://agent365-bridge.lemonsea-0ef310bc.swedencentral.azurecontainerapps.io
           - name: MCP_PLATFORM_ENDPOINT
             value: https://agent365.svc.cloud.microsoft
           - name: MCP_PLATFORM_AUTHENTICATION_SCOPE

@@ -24,6 +24,18 @@ COPY ToolingManifest.json ./
 RUN npm run build
 
 
+# ── Stage 1b: Web builder (login/admin console SPA) ────────────────────────────
+FROM node:22-alpine AS web-builder
+
+WORKDIR /app/web
+
+COPY web/package.json web/package-lock.json* ./
+RUN npm ci
+
+COPY web/ ./
+RUN npm run build
+
+
 # ── Stage 2: Runtime ─────────────────────────────────────────────────────────
 FROM node:22-alpine AS runtime
 
@@ -37,6 +49,9 @@ RUN npm ci --omit=dev
 
 # Copy compiled output from builder
 COPY --from=builder /app/dist ./dist
+
+# Copy built login/admin console SPA, served by Express at /app
+COPY --from=web-builder /app/web/dist ./web/dist
 
 # Copy manifest (read at runtime by configuration.ts)
 COPY ToolingManifest.json ./
