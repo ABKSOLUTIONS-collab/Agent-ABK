@@ -278,10 +278,14 @@ if ('serviceWorker' in navigator) {
 
   function fetchTierForEmail(email) {
     abkRoleFetchInFlight = true;
+    console.log('[ABK role] fetching tier for', email);
     fetch(BRIDGE_URL + '/org-admin/api/my-tier?lc_email=' + encodeURIComponent(email))
-      .then(function(r) { return r.ok ? r.json() : null; })
-      .then(function(data) { if (data && data.tier) applyRole(data.tier, email); })
-      .catch(function() {})
+      .then(function(r) { console.log('[ABK role] my-tier status', r.status); return r.ok ? r.json() : null; })
+      .then(function(data) {
+        console.log('[ABK role] my-tier data', data);
+        if (data && data.tier) applyRole(data.tier, email);
+      })
+      .catch(function(e) { console.warn('[ABK role] my-tier error', e); })
       .then(function() { abkRoleFetchInFlight = false; });
   }
 
@@ -326,10 +330,10 @@ if ('serviceWorker' in navigator) {
   function detectEmailFromApi(cb) {
     var idx = 0;
     function tryNext() {
-      if (idx >= CURRENT_USER_ENDPOINTS.length) { cb(''); return; }
+      if (idx >= CURRENT_USER_ENDPOINTS.length) { console.warn('[ABK role] no API endpoint returned an email'); cb(''); return; }
       var ep = CURRENT_USER_ENDPOINTS[idx++];
       fetch(ep, { credentials: 'include' })
-        .then(function(r) { return r.ok ? r.json() : Promise.reject(r.status); })
+        .then(function(r) { console.log('[ABK role]', ep, '->', r.status); return r.ok ? r.json() : Promise.reject(r.status); })
         .then(function(data) {
           var email = extractEmail(data);
           if (email && email.indexOf('@') !== -1) cb(email);
@@ -360,6 +364,7 @@ if ('serviceWorker' in navigator) {
     }
 
     var lsEmail = detectEmailFromLocalStorage();
+    console.log('[ABK role] localStorage scan ->', lsEmail || '(none)');
     if (lsEmail) { useEmail(lsEmail); return; }
     detectEmailFromApi(useEmail);
   }
