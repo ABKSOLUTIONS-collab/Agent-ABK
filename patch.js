@@ -12,6 +12,8 @@ html = html.replace(/<title>[^<]*<\/title>/, '<title>ABK Assistant</title>');
 // Inject new branding with markers
 const inject = `<!-- ABK_START -->
 <style>
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap');
+
   /* Hide LibreChat footer and links */
   footer { display: none !important; }
   a[href*="librechat.ai"] { display: none !important; }
@@ -22,66 +24,126 @@ const inject = `<!-- ABK_START -->
   div:has(> a[href*="register"]),
   span:has(a[href*="register"]) { display: none !important; }
 
-  /* ── ABK Solutions color overrides ── */
-
-  /* Submit button: green → ABK blue */
-  html, .light, .dark {
-    --surface-submit: #0066CC !important;
-    --surface-submit-hover: #0055B3 !important;
-  }
-
-  /* Input focus ring/border: green → ABK blue */
-  input:focus,
-  input:focus-visible {
-    border-color: #0066CC !important;
-    --tw-ring-color: rgba(0, 102, 204, 0.35) !important;
-    box-shadow: 0 0 0 2px rgba(0, 102, 204, 0.25) !important;
-    outline: none !important;
-  }
-
-  /* "Sign up" and other auth links: teal → ABK blue */
-  a[href*="register"],
-  a[href*="signup"],
-  .login-form a,
-  form ~ div a,
-  form a {
-    color: #0066CC !important;
-  }
-
   /* Hide raven SVG logo (React-safe: hide in CSS, don't remove from DOM) */
-  svg[data-abk-hidden="1"] {
-    display: none !important;
-  }
-
-  /* ── ABK blue: ONLY for main app (not login/register) ── */
-  /* body.abk-app is added by JS only on non-auth pages */
-  body.abk-app { color: #0066CC !important; }
-  body.abk-app h1, body.abk-app h2,
-  body.abk-app h3, body.abk-app h4 { color: #0066CC !important; }
-  /* Keep muted / secondary text gray */
-  body.abk-app [class*="text-gray-4"],
-  body.abk-app [class*="text-gray-5"],
-  body.abk-app [class*="text-gray-6"],
-  body.abk-app [class*="text-muted"],
-  body.abk-app footer, body.abk-app footer * { color: #9ca3af !important; }
-  /* Keep white text on dark backgrounds */
-  body.abk-app [class*="bg-gray-9"] *,
-  body.abk-app [class*="bg-black"] *,
-  body.abk-app [style*="background-color: #0066"] *,
-  body.abk-app [style*="background:#0066"] * { color: #fff !important; }
-  /* Input typing text: keep dark */
-  body.abk-app input, body.abk-app textarea { color: #111827 !important; }
-  body.abk-app input::placeholder,
-  body.abk-app textarea::placeholder { color: #9ca3af !important; }
-  /* Green accents → ABK blue */
-  body.abk-app [class*="text-green-"] { color: #0066CC !important; }
-  body.abk-app [class*="bg-green-"] { background-color: rgba(0,102,204,0.12) !important; }
-  body.abk-app [class*="border-green-"] { border-color: #0066CC !important; }
-  /* Send button */
-  body.abk-app button[class*="bg-black"],
-  body.abk-app button[class*="bg-gray-900"] { background-color: #0066CC !important; }
+  svg[data-abk-hidden="1"] { display: none !important; }
   /* Greeting icon hidden by JS */
   [data-abk-greet-icon-hidden="1"] { display: none !important; }
+
+  /* ══════════════════════════════════════════════════════════════
+     ABK Solutions design tokens — mapped directly onto LibreChat's
+     OWN CSS variables (html{} = light, .dark{} = dark), so every
+     component that already consumes them re-themes automatically
+     instead of guessing at individual Tailwind utility classes.
+     ══════════════════════════════════════════════════════════════ */
+  html, body, input, button, select, textarea {
+    font-family: 'IBM Plex Sans', system-ui, sans-serif !important;
+  }
+  pre, code, kbd, samp, .font-mono {
+    font-family: 'IBM Plex Mono', ui-monospace, monospace !important;
+  }
+
+  html {
+    --text-primary: #14171c !important;
+    --text-secondary: #586170 !important;
+    --text-secondary-alt: #586170 !important;
+    --text-tertiary: #8b94a1 !important;
+    --text-destructive: #d64545 !important;
+    --header-primary: #ffffff !important;
+    --header-hover: #eef1f4 !important;
+    --header-button-hover: #eef1f4 !important;
+    --surface-active: #e6f1f9 !important;
+    --surface-active-alt: #e6f1f9 !important;
+    --surface-hover: #eef1f4 !important;
+    --surface-hover-alt: #eef1f4 !important;
+    --surface-primary: #ffffff !important;
+    --surface-primary-alt: #f6f7f9 !important;
+    --surface-primary-contrast: #fbfcfd !important;
+    --surface-secondary: #fbfcfd !important;
+    --surface-secondary-alt: #eef1f4 !important;
+    --surface-tertiary: #eef1f4 !important;
+    --surface-tertiary-alt: #ffffff !important;
+    --surface-dialog: #ffffff !important;
+    --surface-submit: #0071BC !important;
+    --surface-submit-hover: #005a96 !important;
+    --surface-destructive: #d64545 !important;
+    --surface-destructive-hover: #b83a3a !important;
+    --surface-chat: #ffffff !important;
+    --border-light: #e6e9ee !important;
+    --border-medium: #d5dae1 !important;
+    --border-medium-alt: #d5dae1 !important;
+    --border-heavy: #c3c9d1 !important;
+    --border-xheavy: #a8afb9 !important;
+    --border-destructive: #d64545 !important;
+    --ring-primary: #0071BC !important;
+    --ring: 204 100% 37% !important;
+    --primary: 204 100% 37% !important;
+    --primary-foreground: 0 0% 100% !important;
+    --border: 218 19% 92% !important;
+    --input: 215 17% 86% !important;
+    --destructive: 0 64% 55% !important;
+  }
+
+  .dark {
+    --text-primary: #eef1f5 !important;
+    --text-secondary: #9aa5b1 !important;
+    --text-secondary-alt: #9aa5b1 !important;
+    --text-tertiary: #69737f !important;
+    --text-destructive: #e46a6a !important;
+    --header-primary: #101317 !important;
+    --header-hover: #23282f !important;
+    --header-button-hover: #23282f !important;
+    --surface-active: #10293b !important;
+    --surface-active-alt: #10293b !important;
+    --surface-hover: #23282f !important;
+    --surface-hover-alt: #23282f !important;
+    --surface-primary: #101317 !important;
+    --surface-primary-alt: #15181d !important;
+    --surface-primary-contrast: #14171b !important;
+    --surface-secondary: #14171b !important;
+    --surface-secondary-alt: #23282f !important;
+    --surface-tertiary: #1a1e24 !important;
+    --surface-tertiary-alt: #1a1e24 !important;
+    --surface-dialog: #1a1e24 !important;
+    --surface-submit: #2e97e0 !important;
+    --surface-submit-hover: #4aa8e8 !important;
+    --surface-destructive: #e46a6a !important;
+    --surface-destructive-hover: #ea8484 !important;
+    --surface-chat: #101317 !important;
+    --border-light: #282e35 !important;
+    --border-medium: #353c44 !important;
+    --border-medium-alt: #353c44 !important;
+    --border-heavy: #454d57 !important;
+    --border-xheavy: #5a636e !important;
+    --border-destructive: #e46a6a !important;
+    --ring-primary: #2e97e0 !important;
+    --ring: 205 74% 53% !important;
+    --primary: 205 74% 53% !important;
+    --primary-foreground: 0 0% 100% !important;
+    --border: 212 14% 18% !important;
+    --input: 212 12% 24% !important;
+    --destructive: 0 69% 65% !important;
+  }
+
+  /* Focus ring on plain (non-Radix) inputs, matching the brief's spec */
+  input:focus, input:focus-visible, textarea:focus, textarea:focus-visible {
+    border-color: #0071BC !important;
+    box-shadow: 0 0 0 3px rgba(0,113,188,.15) !important;
+    outline: none !important;
+  }
+  .dark input:focus, .dark input:focus-visible, .dark textarea:focus, .dark textarea:focus-visible {
+    border-color: #2e97e0 !important;
+    box-shadow: 0 0 0 3px rgba(46,151,224,.2) !important;
+  }
+
+  /* 3px brand accent bar pinned to the very top of the app (echoes the logo blue) */
+  #abk-top-accent {
+    position: fixed; top: 0; left: 0; right: 0; height: 3px;
+    background: linear-gradient(90deg, #0071BC, #22a7e6);
+    z-index: 6; pointer-events: none;
+  }
+
+  /* Home greeting subtitle, adapts to light/dark brand blue */
+  [data-abk-greet-sub] { color: var(--ring-primary) !important; }
 </style>
 <script>
 // Unregister LibreChat's service worker so the latest index.html is always served.
@@ -676,15 +738,29 @@ if ('serviceWorker' in navigator) {
         s.setAttribute('data-abk-greet-icon-hidden', '1');
       });
 
-      // Insert ABK logo inline BEFORE the heading element (as a sibling)
+      // Insert ABK logo + vertical accent bar inline BEFORE the heading (as siblings)
       if (!document.querySelector('[data-abk-greet-logo]')) {
         var img = document.createElement('img');
         img.src = '/assets/abk-logo.png?abk=1';
         img.setAttribute('data-abk-greet-logo', '1');
-        img.style.cssText = 'height:28px;width:auto;object-fit:contain;vertical-align:middle;margin-right:10px;display:inline-block;';
+        img.style.cssText = 'height:26px;width:auto;object-fit:contain;vertical-align:middle;margin-right:14px;display:inline-block;';
         // Insert at start of the parent container (same row as the text)
         var insertParent = el.parentElement || container;
         insertParent.insertBefore(img, insertParent.firstChild);
+
+        var bar = document.createElement('span');
+        bar.setAttribute('data-abk-greet-bar', '1');
+        bar.style.cssText = 'display:inline-block;width:2px;height:42px;background:var(--ring-primary);margin-right:14px;vertical-align:middle;';
+        insertParent.insertBefore(bar, img.nextSibling);
+      }
+
+      // Primary-colored subtitle under the greeting heading
+      if (!document.querySelector('[data-abk-greet-sub]')) {
+        var sub = document.createElement('p');
+        sub.setAttribute('data-abk-greet-sub', '1');
+        sub.textContent = 'Πώς μπορώ να βοηθήσω σήμερα;';
+        sub.style.cssText = 'margin:4px 0 0;font-size:14px;font-weight:500;';
+        el.parentNode.insertBefore(sub, el.nextSibling);
       }
       break;
     }
@@ -717,8 +793,18 @@ if ('serviceWorker' in navigator) {
     });
   }
 
+  // 3px brand accent bar pinned to the very top of the viewport (added once, persists across routes)
+  function patchTopAccentBar() {
+    if (document.getElementById('abk-top-accent')) return;
+    if (!document.body) return;
+    var bar = document.createElement('div');
+    bar.id = 'abk-top-accent';
+    document.body.appendChild(bar);
+  }
+
   function tryPatch() {
     try { updateAppClass(); } catch(e) {}
+    try { patchTopAccentBar(); } catch(e) {}
     try { patchLoginText(); } catch(e) {}
     try { patchLogo(); } catch(e) {}
     try { patchForgotPassword(); } catch(e) {}
