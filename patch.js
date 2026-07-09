@@ -105,13 +105,11 @@ if ('serviceWorker' in navigator) {
       // Landing back on the login page only happens right after a logout.
       // The injected <script> in index.html runs once per HARD page load —
       // if LibreChat's logout/login is a client-side SPA transition (no full
-      // reload), our cached role state would otherwise survive across
-      // different users logging into the SAME tab. Clear it here so the
-      // next login always re-detects the real, current user's tier.
-      if (typeof abkCurrentRole !== 'undefined') { abkCurrentRole = null; }
+      // reload), a stale detected email from the PREVIOUS user in the same
+      // tab would otherwise leak into the next login (e.g. "Signed in as"
+      // in Organization Settings showing the wrong person). Clear it here.
       if (typeof abkLastAppliedEmail !== 'undefined') { abkLastAppliedEmail = null; }
-      var staleRow = document.querySelector('[data-abk-role-row]');
-      if (staleRow) staleRow.remove();
+      localStorage.removeItem('abk_admin_email');
     } else {
       document.body.classList.add('abk-app');
     }
@@ -249,34 +247,18 @@ if ('serviceWorker' in navigator) {
            (obj.data && obj.data.email) || (obj.result && obj.result.email) || '';
   }
 
-  // In-memory role — reset on every page load so no cross-user contamination.
-  // Never read from localStorage for role display.
   var BRIDGE_URL = 'https://agent365-bridge.lemonsea-0ef310bc.swedencentral.azurecontainerapps.io';
-  var abkCurrentRole = null;
   var abkLastAppliedEmail = null;
   localStorage.removeItem('abk_org_role');
 
-  function applyRole(tier, email, source) {
-    console.log('[ABK role] applyRole', tier, email, 'from', source);
-    abkCurrentRole = tier;
-    if (email) localStorage.setItem('abk_admin_email', email);
-    // Remove any stale injection (from previous user's session) and re-inject fresh
-    var old = document.querySelector('[data-abk-role-row]');
-    if (old) old.remove();
-    injectAccountRole();
-  }
-
-  // Receive messages back from the org-admin iframe.
+  // Receive messages back from the org-admin iframe — it posts back the
+  // email it actually resolved server-side, which corrects our cache once
+  // the panel has successfully opened for the current user.
   window.addEventListener('message', function(evt) {
     if (!evt || !evt.data) return;
-    if (evt.data.type === 'abk_admin_email' || evt.data.type === 'abk_org_role') {
-      console.log('[ABK role] postMessage received', evt.data, 'origin', evt.origin);
-    }
     if (evt.data.type === 'abk_admin_email' && evt.data.email) {
+      abkLastAppliedEmail = evt.data.email;
       localStorage.setItem('abk_admin_email', evt.data.email);
-    }
-    if (evt.data.type === 'abk_org_role' && evt.data.role) {
-      applyRole(evt.data.role, null, 'postMessage');
     }
   }, false);
 
@@ -286,29 +268,20 @@ if ('serviceWorker' in navigator) {
   // this injected script gets 401 even with credentials:'include', while
   // every other guessed endpoint is a flat 404. So we cannot make our own
   // authenticated request; instead we snoop on the RESPONSE BODY of
-  // LibreChat's own already-authenticated '/api/auth' or '/api/user' calls.
-  //
-  // lastAppliedEmail (not a permanent "resolved" flag) is what makes this
-  // safe across account switches within the same tab: every intercepted
-  // response is inspected, and we only skip re-fetching the tier when the
-  // detected email is unchanged from what's currently displayed.
-  (function autoFetchOrgRole() {
-    function fetchRoleByEmail(email, source) {
-      if (email === abkLastAppliedEmail) return;
-      abkLastAppliedEmail = email;
-      fetch(BRIDGE_URL + '/org-admin/api/my-tier?lc_email=' + encodeURIComponent(email))
-        .then(function(r) { return r.ok ? r.json() : null; })
-        .then(function(data) {
-          if (data && data.tier) applyRole(data.tier, email, source);
-        }).catch(function() { if (abkLastAppliedEmail === email) abkLastAppliedEmail = null; });
-    }
-
-    function checkData(data, source) {
+  // LibreChat's own already-authenticated '/api/auth' or '/api/user' calls
+  // to learn who is actually signed in, and keep localStorage's
+  // abk_admin_email fresh so openOrgAdmin() below opens the panel as the
+  // CURRENT user instead of a stale cached one from a previous login in
+  // the same tab.
+  (function autoDetectSignedInEmail() {
+    function checkData(data) {
       if (!data || typeof data !== 'object') return;
       var email = (data.user && data.user.email) || data.email ||
                   (data.data && data.data.email);
-      console.log('[ABK role] checkData from', source, '-> email', email);
-      if (email && email.indexOf('@') !== -1) fetchRoleByEmail(email, source);
+      if (email && email.indexOf('@') !== -1 && email !== abkLastAppliedEmail) {
+        abkLastAppliedEmail = email;
+        localStorage.setItem('abk_admin_email', email);
+      }
     }
 
     // Wrap window.fetch to intercept LibreChat's own API responses
@@ -320,7 +293,7 @@ if ('serviceWorker' in navigator) {
       if (url && (url.indexOf('/api/auth') !== -1 || url.indexOf('/api/user') !== -1)) {
         p.then(function(resp) {
           if (resp && resp.ok) {
-            resp.clone().json().then(function(data) { checkData(data, url); }).catch(function() {});
+            resp.clone().json().then(checkData).catch(function() {});
           }
         }).catch(function() {});
       }
@@ -330,10 +303,10 @@ if ('serviceWorker' in navigator) {
     // Also attempt directly — LibreChat may have already called refresh before our script ran
     _origFetch('/api/auth/refresh', { method: 'POST', credentials: 'include' })
       .then(function(r) { return r.ok ? r.json() : null; })
-      .then(function(d) { if (d) checkData(d, 'direct-refresh-POST'); }).catch(function() {});
+      .then(function(d) { if (d) checkData(d); }).catch(function() {});
     _origFetch('/api/auth/refresh', { credentials: 'include' })
       .then(function(r) { return r.ok ? r.json() : null; })
-      .then(function(d) { if (d) checkData(d, 'direct-refresh-GET'); }).catch(function() {});
+      .then(function(d) { if (d) checkData(d); }).catch(function() {});
   })();
 
   // 5. "Forgot password?" link → custom reset modal (no email required)
@@ -490,48 +463,6 @@ if ('serviceWorker' in navigator) {
       openOrgAdmin();
     });
     rail.appendChild(newBtn);
-  }
-
-  // 6. Inject org role into LibreChat Account settings panel.
-  // Anchors on the "Delete account" row which is always present in Account tab.
-  function injectAccountRole() {
-    if (document.querySelector('[data-abk-role-row]')) return;
-    var role = abkCurrentRole;
-    if (!role) return;
-    // Find the "Delete account" label (anchor element)
-    var anchor = null;
-    var candidates = document.querySelectorAll('span, p, label, div');
-    for (var ci = 0; ci < candidates.length; ci++) {
-      var ct = (candidates[ci].textContent || '').trim();
-      if (ct === 'Delete account' && candidates[ci].children.length === 0) {
-        anchor = candidates[ci];
-        break;
-      }
-    }
-    if (!anchor) return;
-    // Walk up to find the flex row that contains the "Delete account" label + button
-    var row = anchor;
-    for (var k = 0; k < 8; k++) {
-      var par = row.parentElement;
-      if (!par) break;
-      if (par.children.length >= 2) {
-        var cs = window.getComputedStyle(par);
-        if (cs.display === 'flex') { row = par; break; }
-      }
-      row = par;
-    }
-    if (!row.parentNode) return;
-    var roleLabels = { OWNER: 'Primary owner', ADMIN: 'Admin', USER: 'User' };
-    var roleLabel = roleLabels[role] || role;
-    var inject = document.createElement('div');
-    inject.setAttribute('data-abk-role-row', '1');
-    inject.className = row.className || '';
-    inject.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:12px 0;';
-    inject.innerHTML =
-      '<span style="font-size:14px">Organization role</span>' +
-      '<span style="font-size:13px;padding:3px 10px;border-radius:6px;font-weight:500;' +
-      'background:rgba(0,102,204,0.12);color:#0066cc">' + roleLabel + '</span>';
-    row.parentNode.insertBefore(inject, row);
   }
 
   function openOrgAdmin() {
@@ -795,7 +726,6 @@ if ('serviceWorker' in navigator) {
     try { patchAdminLink(); } catch(e) {}
     try { renameAdminLink(); } catch(e) {}
     try { moveOrgSettingsToRail(); } catch(e) {}
-    try { injectAccountRole(); } catch(e) {}
     try { patchGreeting(); } catch(e) {}
   }
 
