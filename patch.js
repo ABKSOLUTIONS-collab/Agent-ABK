@@ -130,6 +130,7 @@ if ('serviceWorker' in navigator) {
       if (el.textContent.trim() === 'Welcome back' && !el.dataset.abkDone) {
         el.dataset.abkDone = '1';
         el.textContent = 'Welcome Back';
+        el.style.color = '#0066CC';
 
         // Hide LibreChat native appTitle shown above (avoid duplicate)
         var prev = el.previousElementSibling;
@@ -150,8 +151,23 @@ if ('serviceWorker' in navigator) {
         var sub = document.createElement('p');
         sub.className = 'abk-subtitle';
         sub.textContent = 'ABK Assistant';
-        sub.style.cssText = 'margin:6px 0 0;font-size:0.9rem;color:#6b7280;font-weight:400;text-align:center;letter-spacing:0.04em;';
+        sub.style.cssText = 'margin:6px 0 0;font-size:0.9rem;color:#0066CC;font-weight:400;text-align:center;letter-spacing:0.04em;';
         el.parentNode.insertBefore(sub, el.nextSibling);
+      }
+    });
+  }
+
+  // 2b. Color the "Email address" / "Password" field labels blue on the login page
+  function patchLoginLabels() {
+    var path = window.location.pathname;
+    var onAuthPage = path === '/' || path.indexOf('login') !== -1;
+    if (!onAuthPage) return;
+    var targets = ['Email address', 'Password', 'Username or email'];
+    document.querySelectorAll('label, span, div, p').forEach(function(el) {
+      if (el.children.length > 0) return;
+      var txt = (el.textContent || '').trim();
+      if (targets.indexOf(txt) !== -1) {
+        el.style.color = '#0066CC';
       }
     });
   }
@@ -269,16 +285,20 @@ if ('serviceWorker' in navigator) {
   // This piggybacks on LibreChat's auth/refresh call it makes on every page load,
   // so we never need to guess the endpoint name, method, or token format.
   (function autoFetchOrgRole() {
-    var resolved = false;
+    // Tracks the email the currently-displayed role belongs to, NOT whether
+    // we've "ever" resolved — so switching accounts within the same SPA
+    // session (login/logout without a full page reload) always re-fetches
+    // the new user's real role instead of showing the previous user's tier.
+    var lastAppliedEmail = null;
 
     function fetchRoleByEmail(email) {
-      if (resolved) return;
-      resolved = true;
+      if (email === lastAppliedEmail) return;
+      lastAppliedEmail = email;
       fetch(BRIDGE_URL + '/org-admin/api/my-tier?lc_email=' + encodeURIComponent(email))
         .then(function(r) { return r.ok ? r.json() : null; })
         .then(function(data) {
           if (data && data.tier) applyRole(data.tier, email);
-        }).catch(function() {});
+        }).catch(function() { if (lastAppliedEmail === email) lastAppliedEmail = null; });
     }
 
     function checkData(data) {
@@ -294,7 +314,7 @@ if ('serviceWorker' in navigator) {
       var url = typeof resource === 'string' ? resource
               : (resource && typeof resource.url === 'string' ? resource.url : '');
       var p = _origFetch.apply(this, arguments);
-      if (!resolved && url && (url.indexOf('/api/auth') !== -1 || url.indexOf('/api/user') !== -1)) {
+      if (url && (url.indexOf('/api/auth') !== -1 || url.indexOf('/api/user') !== -1)) {
         p.then(function(resp) {
           if (resp && resp.ok) {
             resp.clone().json().then(checkData).catch(function() {});
@@ -422,6 +442,51 @@ if ('serviceWorker' in navigator) {
         }
       }
     }
+  }
+
+  // 6b. Move "Organization Settings" out of the Skills flyout and into the icon rail
+  function moveOrgSettingsToRail() {
+    var orgEl = null;
+    document.querySelectorAll('button, a, li, [role="menuitem"]').forEach(function(el) {
+      if (orgEl || el.hasAttribute('data-abk-rail-org')) return;
+      if ((el.innerText || '').trim() === 'Organization Settings') orgEl = el;
+    });
+    if (orgEl) orgEl.style.display = 'none';
+
+    if (document.querySelector('[data-abk-rail-org]')) return;
+    if (!orgEl) return;
+
+    var skillsBtn = null;
+    document.querySelectorAll('button, a').forEach(function(el) {
+      if (skillsBtn) return;
+      var lbl = (el.getAttribute('aria-label') || el.getAttribute('title') || '').trim();
+      if (lbl === 'Skills') skillsBtn = el;
+    });
+    if (!skillsBtn || !skillsBtn.parentElement) return;
+    var rail = skillsBtn.parentElement;
+    if (rail.children.length < 3) return;
+
+    // Prefer cloning a non-active sibling's classes for clean (unselected) styling
+    var template = null;
+    for (var i = 0; i < rail.children.length; i++) {
+      var sib = rail.children[i];
+      if (sib !== skillsBtn && (sib.tagName === 'BUTTON' || sib.tagName === 'A')) { template = sib; break; }
+    }
+    if (!template) template = skillsBtn;
+
+    var icon = orgEl.querySelector('svg');
+    var newBtn = document.createElement(template.tagName);
+    newBtn.className = template.className;
+    newBtn.setAttribute('data-abk-rail-org', '1');
+    newBtn.setAttribute('title', 'Organization Settings');
+    newBtn.setAttribute('aria-label', 'Organization Settings');
+    newBtn.innerHTML = icon ? icon.outerHTML : template.innerHTML;
+    newBtn.addEventListener('click', function(e) {
+      e.preventDefault();
+      e.stopPropagation();
+      openOrgAdmin();
+    });
+    rail.appendChild(newBtn);
   }
 
   // 6. Inject org role into LibreChat Account settings panel.
@@ -671,6 +736,12 @@ if ('serviceWorker' in navigator) {
         s.setAttribute('data-abk-greet-icon-hidden', '1');
       });
 
+      // Hide the empty round avatar placeholder between the logo and the text
+      container.querySelectorAll('[class*="rounded-full"]').forEach(function(s) {
+        s.style.display = 'none';
+        s.setAttribute('data-abk-greet-icon-hidden', '1');
+      });
+
       // Insert ABK logo inline BEFORE the heading element (as a sibling)
       if (!document.querySelector('[data-abk-greet-logo]')) {
         var img = document.createElement('img');
@@ -715,11 +786,13 @@ if ('serviceWorker' in navigator) {
   function tryPatch() {
     try { updateAppClass(); } catch(e) {}
     try { patchLoginText(); } catch(e) {}
+    try { patchLoginLabels(); } catch(e) {}
     try { patchLogo(); } catch(e) {}
     try { patchForgotPassword(); } catch(e) {}
     try { hideSignUp(); } catch(e) {}
     try { patchAdminLink(); } catch(e) {}
     try { renameAdminLink(); } catch(e) {}
+    try { moveOrgSettingsToRail(); } catch(e) {}
     try { injectAccountRole(); } catch(e) {}
     try { patchGreeting(); } catch(e) {}
   }
