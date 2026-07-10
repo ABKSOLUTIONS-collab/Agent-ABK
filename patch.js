@@ -817,77 +817,6 @@ if ('serviceWorker' in navigator) {
     }, 2200);
   }
 
-  // 8c. Generic full-screen panel modal (same chrome as Organization Settings) for Projects / MCP
-  function showAbkPanelModal(title, bodyHtml) {
-    var existing = document.getElementById('abk-panel-overlay');
-    if (existing) existing.remove();
-
-    var overlay = document.createElement('div');
-    overlay.id = 'abk-panel-overlay';
-    overlay.style.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(16,20,26,.5);display:flex;align-items:center;justify-content:center;';
-
-    var modal = document.createElement('div');
-    modal.style.cssText = 'position:relative;width:92%;max-width:960px;height:85vh;background:var(--surface-dialog,#fff);border-radius:14px;overflow:hidden;box-shadow:0 24px 80px rgba(0,0,0,.35);display:flex;flex-direction:column;';
-
-    var header = document.createElement('div');
-    header.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:14px 20px;background:var(--surface-dialog,#fff);border-bottom:1px solid var(--border-light,#e6e9ee);flex-shrink:0;';
-    var titleEl = document.createElement('span');
-    titleEl.style.cssText = 'font-weight:600;font-size:14px;color:var(--ring-primary,#0071BC);';
-    titleEl.textContent = title;
-    var closeBtn = document.createElement('button');
-    closeBtn.innerHTML = '&#215;';
-    closeBtn.style.cssText = 'background:none;border:none;font-size:22px;cursor:pointer;color:var(--text-tertiary,#8b94a1);padding:0 4px;line-height:1;';
-    closeBtn.onclick = function() { overlay.remove(); };
-    header.appendChild(titleEl);
-    header.appendChild(closeBtn);
-
-    var body = document.createElement('div');
-    body.className = 'abk-scroll';
-    body.style.cssText = 'flex:1;overflow-y:auto;padding:24px 28px;color:var(--text-primary,#14171c);';
-    body.innerHTML = bodyHtml;
-
-    modal.appendChild(header);
-    modal.appendChild(body);
-    overlay.appendChild(modal);
-    overlay.addEventListener('click', function(e) { if (e.target === overlay) overlay.remove(); });
-    document.body.appendChild(overlay);
-    return body;
-  }
-
-  // 8d. Projects panel — UI shell only, genuinely empty (no seeded fake projects)
-  function buildProjectsHtml() {
-    return (
-      '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:18px;">' +
-        '<h1 style="font-size:26px;font-weight:700;letter-spacing:-.02em;margin:0;">Projects</h1>' +
-        '<button id="abk-projects-new" style="height:38px;padding:0 16px;border:none;border-radius:8px;background:var(--ring-primary,#0071BC);color:#fff;font-size:14px;font-weight:600;cursor:pointer;white-space:nowrap;">+ New project</button>' +
-      '</div>' +
-      '<input type="text" placeholder="Search projects…" style="width:100%;height:44px;padding:0 14px;border:1px solid var(--border-medium,#d5dae1);border-radius:10px;background:var(--surface-primary,#fff);color:var(--text-primary,#14171c);font-size:14px;outline:none;box-sizing:border-box;margin-bottom:18px;">' +
-      '<div style="display:flex;gap:20px;border-bottom:1px solid var(--border-light,#e6e9ee);margin-bottom:32px;">' +
-        '<button class="abk-proj-tab" data-tab="your" style="background:none;border:none;padding:0 0 10px;font-size:14px;font-weight:600;color:var(--ring-primary,#0071BC);border-bottom:2px solid var(--ring-primary,#0071BC);cursor:pointer;">Your projects</button>' +
-        '<button class="abk-proj-tab" data-tab="team" style="background:none;border:none;padding:0 0 10px;font-size:14px;font-weight:500;color:var(--text-tertiary,#8b94a1);border-bottom:2px solid transparent;cursor:pointer;">Team</button>' +
-        '<button class="abk-proj-tab" data-tab="shared" style="background:none;border:none;padding:0 0 10px;font-size:14px;font-weight:500;color:var(--text-tertiary,#8b94a1);border-bottom:2px solid transparent;cursor:pointer;">Shared with you</button>' +
-      '</div>' +
-      '<div style="text-align:center;color:var(--text-tertiary,#8b94a1);font-size:13.5px;padding:60px 0;">No projects yet.</div>'
-    );
-  }
-  function wireProjectsPanel(body) {
-    var tabs = body.querySelectorAll('.abk-proj-tab');
-    tabs.forEach(function(tab) {
-      tab.addEventListener('click', function() {
-        tabs.forEach(function(t) {
-          t.style.color = 'var(--text-tertiary,#8b94a1)';
-          t.style.fontWeight = '500';
-          t.style.borderBottomColor = 'transparent';
-        });
-        tab.style.color = 'var(--ring-primary,#0071BC)';
-        tab.style.fontWeight = '600';
-        tab.style.borderBottomColor = 'var(--ring-primary,#0071BC)';
-      });
-    });
-    var newBtn = body.querySelector('#abk-projects-new');
-    if (newBtn) newBtn.addEventListener('click', function() { showAbkToast('Έρχεται σύντομα'); });
-  }
-
   // 8f. Add the Projects icon to the left icon rail (cloning a sibling's
   // classes so it visually matches, same technique as the Organization
   // Settings rail icon above). MCP Settings is NOT added here — LibreChat
@@ -931,8 +860,18 @@ if ('serviceWorker' in navigator) {
     addAbkRailIcon('data-abk-rail-projects', 'Projects',
       '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/></svg>',
       function() {
-        var body = showAbkPanelModal('Projects', buildProjectsHtml());
-        wireProjectsPanel(body);
+        // "Projects" opens LibreChat's OWN native Agents system (My Agents /
+        // Agent Builder / Agent Marketplace) instead of a separate cosmetic
+        // shell — Agents already provide exactly what a Projects feature
+        // needs: persistent custom instructions, knowledge/file search
+        // (RAG), and sharing, with a real backend behind them.
+        var agentsBtn = null;
+        document.querySelectorAll('button, a').forEach(function(el) {
+          if (agentsBtn) return;
+          if ((el.textContent || '').trim() === 'My Agents') agentsBtn = el;
+        });
+        if (agentsBtn) { agentsBtn.click(); return; }
+        showAbkToast('Δεν βρέθηκε η λίστα Agents');
       });
   }
 
