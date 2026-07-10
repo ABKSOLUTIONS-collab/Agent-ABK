@@ -605,31 +605,44 @@ if ('serviceWorker' in navigator) {
     var endpoints = ['/api/user', '/api/auth/user', '/api/v1/user', '/api/auth/me', '/api/me'];
     var idx = 0;
     function tryNext() {
-      if (idx >= endpoints.length) {
-        console.warn('[ABK] all API endpoints failed — opening modal (email form will appear)');
-        showOrgAdminModal('');
-        return;
-      }
+      if (idx >= endpoints.length) { tryRefresh('POST'); return; }
       var ep = endpoints[idx++];
       fetch(ep, { credentials: 'include' })
-        .then(function(r) {
-          console.log('[ABK] ' + ep + ' → ' + r.status);
-          return r.ok ? r.json() : Promise.reject(r.status);
-        })
+        .then(function(r) { return r.ok ? r.json() : Promise.reject(r.status); })
         .then(function(data) {
-          console.log('[ABK] ' + ep + ' data:', JSON.stringify(data).slice(0, 200));
           var email = extractEmail(data);
           if (email && email.indexOf('@') !== -1) {
-            console.log('[ABK] email from API:', email);
             localStorage.setItem('abk_admin_email', email);
             showOrgAdminModal('lc_email=' + encodeURIComponent(email));
           } else {
             tryNext();
           }
         })
-        .catch(function(e) {
-          console.warn('[ABK] ' + ep + ' failed:', e);
-          tryNext();
+        .catch(function() { tryNext(); });
+    }
+    // 3. Last resort before showing the manual email form: the same
+    // '/api/auth/refresh' call the background detector uses, which is the
+    // one endpoint confirmed to actually carry the authenticated identity
+    // (the others above return 401/404 for an independently-issued fetch).
+    // This closes the gap where the user clicks Organization Settings before
+    // the passive background detector has had a chance to run yet.
+    function tryRefresh(method) {
+      fetch('/api/auth/refresh', { method: method, credentials: 'include' })
+        .then(function(r) { return r.ok ? r.json() : Promise.reject(r.status); })
+        .then(function(data) {
+          var email = extractEmail(data);
+          if (email && email.indexOf('@') !== -1) {
+            localStorage.setItem('abk_admin_email', email);
+            showOrgAdminModal('lc_email=' + encodeURIComponent(email));
+          } else if (method === 'POST') {
+            tryRefresh('GET');
+          } else {
+            showOrgAdminModal('');
+          }
+        })
+        .catch(function() {
+          if (method === 'POST') tryRefresh('GET');
+          else showOrgAdminModal('');
         });
     }
     tryNext();
@@ -875,35 +888,12 @@ if ('serviceWorker' in navigator) {
     if (newBtn) newBtn.addEventListener('click', function() { showAbkToast('Έρχεται σύντομα'); });
   }
 
-  // 8e. MCP Settings panel — UI shell only, genuinely empty (no seeded fake servers)
-  function buildMcpHtml() {
-    return (
-      '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">' +
-        '<h1 style="font-size:26px;font-weight:700;letter-spacing:-.02em;margin:0;">MCP Servers</h1>' +
-        '<button id="abk-mcp-add" style="height:38px;padding:0 16px;border:none;border-radius:8px;background:var(--ring-primary,#0071BC);color:#fff;font-size:14px;font-weight:600;cursor:pointer;white-space:nowrap;">+ Add MCP server</button>' +
-      '</div>' +
-      '<p style="color:var(--text-tertiary,#8b94a1);font-size:14px;margin:0 0 20px;">Σύνδεσε MCP servers για να δώσεις στο ABK Assistant και στους agents πρόσβαση σε εργαλεία και connectors.</p>' +
-      '<input type="text" placeholder="Filter MCP servers by name…" style="width:100%;height:44px;padding:0 14px;border:1px solid var(--border-medium,#d5dae1);border-radius:10px;background:var(--surface-primary,#fff);color:var(--text-primary,#14171c);font-size:14px;outline:none;box-sizing:border-box;margin-bottom:28px;">' +
-      '<div style="border:1.5px dashed var(--border-medium,#d5dae1);border-radius:12px;padding:52px 20px;text-align:center;">' +
-        '<div style="width:52px;height:52px;border-radius:10px;background:var(--surface-active,#e6f1f9);display:flex;align-items:center;justify-content:center;margin:0 auto 16px;">' +
-          '<svg width="26" height="26" viewBox="0 0 24 24" fill="none" style="stroke:var(--ring-primary,#0071BC);" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="7" rx="1.5"/><rect x="3" y="13" width="18" height="7" rx="1.5"/><line x1="7" y1="7.5" x2="7.1" y2="7.5"/><line x1="7" y1="16.5" x2="7.1" y2="16.5"/></svg>' +
-        '</div>' +
-        '<div style="font-size:15px;font-weight:600;margin-bottom:6px;">No MCP servers yet</div>' +
-        '<div style="font-size:13.5px;color:var(--text-tertiary,#8b94a1);margin-bottom:20px;">Create your first MCP server to get started</div>' +
-        '<button id="abk-mcp-add-2" style="height:38px;padding:0 16px;border:none;border-radius:8px;background:var(--ring-primary,#0071BC);color:#fff;font-size:14px;font-weight:600;cursor:pointer;">+ Add MCP server</button>' +
-      '</div>'
-    );
-  }
-  function wireMcpPanel(body) {
-    ['#abk-mcp-add', '#abk-mcp-add-2'].forEach(function(sel) {
-      var btn = body.querySelector(sel);
-      if (btn) btn.addEventListener('click', function() { showAbkToast('Έρχεται σύντομα'); });
-    });
-  }
-
-  // 8f. Add Projects + MCP Settings icons to the left icon rail (cloning a
-  // sibling's classes so they visually match, same technique as the
-  // Organization Settings rail icon above).
+  // 8f. Add the Projects icon to the left icon rail (cloning a sibling's
+  // classes so it visually matches, same technique as the Organization
+  // Settings rail icon above). MCP Settings is NOT added here — LibreChat
+  // already has its own native MCP servers view (rail icon shows real
+  // configured servers like "Agent365 Bridge"); our earlier custom
+  // MCP panel was a redundant, always-empty duplicate and has been removed.
   function addAbkRailIcon(dataAttr, titleText, svgHtml, onClick) {
     if (document.querySelector('[' + dataAttr + ']')) return;
     var skillsBtn = null;
@@ -937,18 +927,12 @@ if ('serviceWorker' in navigator) {
     rail.appendChild(newBtn);
   }
 
-  function patchProjectsAndMcpRail() {
+  function patchProjectsRail() {
     addAbkRailIcon('data-abk-rail-projects', 'Projects',
       '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/></svg>',
       function() {
         var body = showAbkPanelModal('Projects', buildProjectsHtml());
         wireProjectsPanel(body);
-      });
-    addAbkRailIcon('data-abk-rail-mcp', 'MCP Settings',
-      '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="7" rx="1.5"/><rect x="3" y="13" width="18" height="7" rx="1.5"/><line x1="7" y1="7.5" x2="7.1" y2="7.5"/><line x1="7" y1="16.5" x2="7.1" y2="16.5"/></svg>',
-      function() {
-        var body = showAbkPanelModal('MCP Servers', buildMcpHtml());
-        wireMcpPanel(body);
       });
   }
 
@@ -1115,7 +1099,7 @@ if ('serviceWorker' in navigator) {
     try { patchAdminLink(); } catch(e) {}
     try { renameAdminLink(); } catch(e) {}
     try { moveOrgSettingsToRail(); } catch(e) {}
-    try { patchProjectsAndMcpRail(); } catch(e) {}
+    try { patchProjectsRail(); } catch(e) {}
     try { injectConnectorsTab(); } catch(e) {}
     try { hideConnectorsPanelIfClickedElsewhere(); } catch(e) {}
     try { patchGreeting(); } catch(e) {}
