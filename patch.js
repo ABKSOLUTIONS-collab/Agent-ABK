@@ -817,64 +817,6 @@ if ('serviceWorker' in navigator) {
     }, 2200);
   }
 
-  // 8f. Add the Projects icon to the left icon rail (cloning a sibling's
-  // classes so it visually matches, same technique as the Organization
-  // Settings rail icon above). MCP Settings is NOT added here — LibreChat
-  // already has its own native MCP servers view (rail icon shows real
-  // configured servers like "Agent365 Bridge"); our earlier custom
-  // MCP panel was a redundant, always-empty duplicate and has been removed.
-  function addAbkRailIcon(dataAttr, titleText, svgHtml, onClick) {
-    if (document.querySelector('[' + dataAttr + ']')) return;
-    var skillsBtn = null;
-    document.querySelectorAll('button, a').forEach(function(el) {
-      if (skillsBtn) return;
-      var lbl = (el.getAttribute('aria-label') || el.getAttribute('title') || '').trim();
-      if (lbl === 'Skills') skillsBtn = el;
-    });
-    if (!skillsBtn || !skillsBtn.parentElement) return;
-    var rail = skillsBtn.parentElement;
-    if (rail.children.length < 3) return;
-
-    var template = null;
-    for (var i = 0; i < rail.children.length; i++) {
-      var sib = rail.children[i];
-      if (sib !== skillsBtn && (sib.tagName === 'BUTTON' || sib.tagName === 'A')) { template = sib; break; }
-    }
-    if (!template) template = skillsBtn;
-
-    var newBtn = document.createElement(template.tagName);
-    newBtn.className = template.className;
-    newBtn.setAttribute(dataAttr, '1');
-    newBtn.setAttribute('title', titleText);
-    newBtn.setAttribute('aria-label', titleText);
-    newBtn.innerHTML = svgHtml;
-    newBtn.addEventListener('click', function(e) {
-      e.preventDefault();
-      e.stopPropagation();
-      onClick();
-    });
-    rail.appendChild(newBtn);
-  }
-
-  function patchProjectsRail() {
-    addAbkRailIcon('data-abk-rail-projects', 'Projects',
-      '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/></svg>',
-      function() {
-        // "Projects" opens LibreChat's OWN native Agents system (My Agents /
-        // Agent Builder / Agent Marketplace) instead of a separate cosmetic
-        // shell — Agents already provide exactly what a Projects feature
-        // needs: persistent custom instructions, knowledge/file search
-        // (RAG), and sharing, with a real backend behind them.
-        var agentsBtn = null;
-        document.querySelectorAll('button, a').forEach(function(el) {
-          if (agentsBtn) return;
-          if ((el.textContent || '').trim() === 'My Agents') agentsBtn = el;
-        });
-        if (agentsBtn) { agentsBtn.click(); return; }
-        showAbkToast('Δεν βρέθηκε η λίστα Agents');
-      });
-  }
-
   // 8g. Add a "Connectors" tab to the native Settings modal. UI shell only —
   // every connector is shown as NOT connected (the real, current state,
   // since there is no OAuth backend wired up yet) rather than seeded/fake data.
@@ -1038,7 +980,6 @@ if ('serviceWorker' in navigator) {
     try { patchAdminLink(); } catch(e) {}
     try { renameAdminLink(); } catch(e) {}
     try { moveOrgSettingsToRail(); } catch(e) {}
-    try { patchProjectsRail(); } catch(e) {}
     try { injectConnectorsTab(); } catch(e) {}
     try { hideConnectorsPanelIfClickedElsewhere(); } catch(e) {}
     try { patchGreeting(); } catch(e) {}
