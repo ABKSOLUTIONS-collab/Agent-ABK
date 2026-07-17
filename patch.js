@@ -171,11 +171,13 @@ if ('serviceWorker' in navigator) {
       // Landing back on the login page only happens right after a logout.
       // The injected <script> in index.html runs once per HARD page load —
       // if LibreChat's logout/login is a client-side SPA transition (no full
-      // reload), a stale detected email from the PREVIOUS user in the same
-      // tab would otherwise leak into the next login (e.g. "Signed in as"
-      // in Organization Settings showing the wrong person). Clear it here.
-      if (typeof abkLastAppliedEmail !== 'undefined') { abkLastAppliedEmail = null; }
-      localStorage.removeItem('abk_admin_email');
+      // reload), a cached org-admin session token for the PREVIOUS user in
+      // the same tab would otherwise carry over to whoever logs in next
+      // (the token itself is still valid and still says the old user's
+      // email — Organization Settings would silently open as them). Clear
+      // it here so the next login always starts a fresh org-admin session.
+      try { sessionStorage.removeItem('abk_org_session_token'); } catch(ex) {}
+      localStorage.removeItem('abk_admin_email'); // legacy key from the old (insecure) mechanism
     } else {
       document.body.classList.add('abk-app');
     }
@@ -268,13 +270,21 @@ if ('serviceWorker' in navigator) {
     }
   }
 
-  // 4. Intercept "Admin Settings" sidebar link → open org-admin as modal overlay
-  function showOrgAdminModal(authParam) {
+  // 4. Open Organization Settings as a modal overlay iframe.
+  //
+  // Auth is handled entirely server-side now: org-admin.ts shows its own
+  // real login form (email + password, verified with bcrypt against the
+  // same hash LibreChat itself checks) whenever there's no valid signed
+  // session token yet — see the security hardening pass that replaced the
+  // old "trust whatever email/token the client claims" mechanism. This
+  // file no longer guesses or intercepts anything to establish identity;
+  // it only caches the SIGNED token the server hands back after a real
+  // login, so re-opening the panel in the same tab doesn't need a re-login.
+  function showOrgAdminModal(extraParams) {
     var existing = document.getElementById('abk-org-overlay');
     if (existing) { existing.remove(); return; }
 
-    var url = 'https://agent365-bridge.lemonsea-0ef310bc.swedencentral.azurecontainerapps.io/org-admin?embed=1' +
-              (authParam ? '&' + authParam : '');
+    var url = BRIDGE_URL + '/org-admin?embed=1' + (extraParams ? '&' + extraParams : '');
 
     var overlay = document.createElement('div');
     overlay.id = 'abk-org-overlay';
@@ -286,7 +296,7 @@ if ('serviceWorker' in navigator) {
     var header = document.createElement('div');
     header.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:14px 20px;background:#fff;border-bottom:1px solid #e8e8e8;flex-shrink:0;';
     var title = document.createElement('span');
-    title.style.cssText = 'font-weight:600;font-size:14px;color:#0066cc;';
+    title.style.cssText = 'font-weight:600;font-size:14px;color:#0071BC;';
     title.textContent = 'Organization Settings';
     var closeBtn = document.createElement('button');
     closeBtn.innerHTML = '&#215;';
@@ -306,74 +316,22 @@ if ('serviceWorker' in navigator) {
     document.body.appendChild(overlay);
   }
 
-  function extractEmail(obj) {
-    if (!obj || typeof obj !== 'object') return '';
-    // Try every common nested path LibreChat might use
-    return obj.email || (obj.user && obj.user.email) ||
-           (obj.data && obj.data.email) || (obj.result && obj.result.email) || '';
-  }
-
   var BRIDGE_URL = 'https://agent365-bridge.lemonsea-0ef310bc.swedencentral.azurecontainerapps.io';
-  var abkLastAppliedEmail = null;
+  var ORG_SESSION_KEY = 'abk_org_session_token';
+  var ORG_EMAIL_HINT_KEY = 'abk_org_email_hint'; // UX-only prefill — never trusted as proof of identity
   localStorage.removeItem('abk_org_role');
+  localStorage.removeItem('abk_admin_email'); // legacy key from the old (insecure) mechanism
 
-  // Receive messages back from the org-admin iframe — it posts back the
-  // email it actually resolved server-side, which corrects our cache once
-  // the panel has successfully opened for the current user.
+  // Receive the signed session token back from the org-admin iframe after a
+  // real, password-verified login, so re-opening Organization Settings
+  // within the same browser tab doesn't require signing in again.
   window.addEventListener('message', function(evt) {
     if (!evt || !evt.data) return;
-    if (evt.data.type === 'abk_admin_email' && evt.data.email) {
-      abkLastAppliedEmail = evt.data.email;
-      localStorage.setItem('abk_admin_email', evt.data.email);
+    if (evt.data.type === 'abk_org_session' && evt.data.token) {
+      try { sessionStorage.setItem(ORG_SESSION_KEY, evt.data.token); } catch(ex) {}
+      if (evt.data.email) { try { localStorage.setItem(ORG_EMAIL_HINT_KEY, evt.data.email); } catch(ex) {} }
     }
   }, false);
-
-  // LibreChat keeps its access token in memory (not localStorage, not a
-  // readable cookie) and attaches it as an Authorization header via its own
-  // axios/fetch wrapper — confirmed live: a plain fetch('/api/user') from
-  // this injected script gets 401 even with credentials:'include', while
-  // every other guessed endpoint is a flat 404. So we cannot make our own
-  // authenticated request; instead we snoop on the RESPONSE BODY of
-  // LibreChat's own already-authenticated '/api/auth' or '/api/user' calls
-  // to learn who is actually signed in, and keep localStorage's
-  // abk_admin_email fresh so openOrgAdmin() below opens the panel as the
-  // CURRENT user instead of a stale cached one from a previous login in
-  // the same tab.
-  (function autoDetectSignedInEmail() {
-    function checkData(data) {
-      if (!data || typeof data !== 'object') return;
-      var email = (data.user && data.user.email) || data.email ||
-                  (data.data && data.data.email);
-      if (email && email.indexOf('@') !== -1 && email !== abkLastAppliedEmail) {
-        abkLastAppliedEmail = email;
-        localStorage.setItem('abk_admin_email', email);
-      }
-    }
-
-    // Wrap window.fetch to intercept LibreChat's own API responses
-    var _origFetch = window.fetch;
-    window.fetch = function(resource, init) {
-      var url = typeof resource === 'string' ? resource
-              : (resource && typeof resource.url === 'string' ? resource.url : '');
-      var p = _origFetch.apply(this, arguments);
-      if (url && (url.indexOf('/api/auth') !== -1 || url.indexOf('/api/user') !== -1)) {
-        p.then(function(resp) {
-          if (resp && resp.ok) {
-            resp.clone().json().then(checkData).catch(function() {});
-          }
-        }).catch(function() {});
-      }
-      return p;
-    };
-
-    // Also attempt directly — LibreChat may have already called refresh before our script ran
-    _origFetch('/api/auth/refresh', { method: 'POST', credentials: 'include' })
-      .then(function(r) { return r.ok ? r.json() : null; })
-      .then(function(d) { if (d) checkData(d); }).catch(function() {});
-    _origFetch('/api/auth/refresh', { credentials: 'include' })
-      .then(function(r) { return r.ok ? r.json() : null; })
-      .then(function(d) { if (d) checkData(d); }).catch(function() {});
-  })();
 
   // 5. "Forgot password?" link → custom reset modal (no email required)
   function showResetPasswordModal() {
@@ -532,120 +490,15 @@ if ('serviceWorker' in navigator) {
   }
 
   function openOrgAdmin() {
-    // Use previously saved email (set via postMessage after first form submit)
-    var savedEmail = localStorage.getItem('abk_admin_email');
-    if (savedEmail && savedEmail.indexOf('@') !== -1) {
-      console.log('[ABK] using saved email:', savedEmail);
-      showOrgAdminModal('lc_email=' + encodeURIComponent(savedEmail));
-      return;
-    }
+    var cachedToken = null;
+    try { cachedToken = sessionStorage.getItem(ORG_SESSION_KEY); } catch(ex) {}
+    var emailHint = null;
+    try { emailHint = localStorage.getItem(ORG_EMAIL_HINT_KEY); } catch(ex) {}
 
-    // 1. Scan ALL localStorage keys for JWT or JSON containing email
-    var lct = '';
-    var emailFromStorage = '';
-    for (var i = 0; i < localStorage.length; i++) {
-      var k = localStorage.key(i);
-      var v = localStorage.getItem(k) || '';
-
-      // Check for JWT (3 dot-separated parts with valid base64 payload)
-      if (!lct && v && v.split('.').length === 3) {
-        try {
-          var b64 = v.split('.')[1].replace(/-/g,'+').replace(/_/g,'/');
-          while (b64.length % 4) b64 += '=';
-          var p = JSON.parse(atob(b64));
-          if (p && (p.id || p.email || p.sub)) {
-            lct = v;
-            if (p.email) emailFromStorage = p.email;
-            console.log('[ABK] JWT found in localStorage key:', k, '| has email:', !!p.email);
-          }
-        } catch(e) {}
-      }
-
-      // Check for JSON object that may contain email
-      if (!emailFromStorage && v && v[0] === '{') {
-        try {
-          var parsed = JSON.parse(v);
-          var fe = extractEmail(parsed);
-          if (fe && fe.indexOf('@') !== -1) {
-            emailFromStorage = fe;
-            console.log('[ABK] email in localStorage key:', k, '→', fe);
-          } else {
-            // Handle persist:root style double-encoded JSON
-            for (var field in parsed) {
-              if (typeof parsed[field] === 'string' && parsed[field][0] === '{') {
-                try {
-                  var inner = JSON.parse(parsed[field]);
-                  var ie = extractEmail(inner);
-                  if (ie && ie.indexOf('@') !== -1) {
-                    emailFromStorage = ie;
-                    console.log('[ABK] email in nested localStorage key:', k + '.' + field, '→', ie);
-                    break;
-                  }
-                } catch(e2) {}
-              }
-            }
-          }
-        } catch(e) {}
-      }
-    }
-
-    if (emailFromStorage) {
-      console.log('[ABK] using email from localStorage:', emailFromStorage);
-      localStorage.setItem('abk_admin_email', emailFromStorage);
-      showOrgAdminModal(lct ? 'lc_token=' + encodeURIComponent(lct) : 'lc_email=' + encodeURIComponent(emailFromStorage));
-      return;
-    }
-    if (lct) {
-      console.log('[ABK] using JWT (no email in payload)');
-      showOrgAdminModal('lc_token=' + encodeURIComponent(lct));
-      return;
-    }
-
-    // 2. Try LibreChat API endpoints (browser sends httpOnly cookie automatically)
-    var endpoints = ['/api/user', '/api/auth/user', '/api/v1/user', '/api/auth/me', '/api/me'];
-    var idx = 0;
-    function tryNext() {
-      if (idx >= endpoints.length) { tryRefresh('POST'); return; }
-      var ep = endpoints[idx++];
-      fetch(ep, { credentials: 'include' })
-        .then(function(r) { return r.ok ? r.json() : Promise.reject(r.status); })
-        .then(function(data) {
-          var email = extractEmail(data);
-          if (email && email.indexOf('@') !== -1) {
-            localStorage.setItem('abk_admin_email', email);
-            showOrgAdminModal('lc_email=' + encodeURIComponent(email));
-          } else {
-            tryNext();
-          }
-        })
-        .catch(function() { tryNext(); });
-    }
-    // 3. Last resort before showing the manual email form: the same
-    // '/api/auth/refresh' call the background detector uses, which is the
-    // one endpoint confirmed to actually carry the authenticated identity
-    // (the others above return 401/404 for an independently-issued fetch).
-    // This closes the gap where the user clicks Organization Settings before
-    // the passive background detector has had a chance to run yet.
-    function tryRefresh(method) {
-      fetch('/api/auth/refresh', { method: method, credentials: 'include' })
-        .then(function(r) { return r.ok ? r.json() : Promise.reject(r.status); })
-        .then(function(data) {
-          var email = extractEmail(data);
-          if (email && email.indexOf('@') !== -1) {
-            localStorage.setItem('abk_admin_email', email);
-            showOrgAdminModal('lc_email=' + encodeURIComponent(email));
-          } else if (method === 'POST') {
-            tryRefresh('GET');
-          } else {
-            showOrgAdminModal('');
-          }
-        })
-        .catch(function() {
-          if (method === 'POST') tryRefresh('GET');
-          else showOrgAdminModal('');
-        });
-    }
-    tryNext();
+    var params = [];
+    if (cachedToken) params.push('org_token=' + encodeURIComponent(cachedToken));
+    else if (emailHint) params.push('prefill_email=' + encodeURIComponent(emailHint));
+    showOrgAdminModal(params.join('&'));
   }
 
   // Install ONE document-level capture listener — fires before React's root handler.
