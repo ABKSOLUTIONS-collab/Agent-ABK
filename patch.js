@@ -148,6 +148,19 @@ const inject = `<!-- ABK_START -->
   .abk-scroll::-webkit-scrollbar { width: 10px; height: 10px; }
   .abk-scroll::-webkit-scrollbar-thumb { background: var(--border-medium); border-radius: 8px; border: 3px solid transparent; background-clip: padding-box; }
   .abk-scroll::-webkit-scrollbar-track { background: transparent; }
+
+  /* SSO-only login: hide the native email/password form entirely */
+  form[aria-label="Login form"] { display: none !important; }
+
+  /* Style the OpenID SSO link as the primary blue CTA */
+  a[data-testid="openid"] {
+    background: var(--surface-submit) !important;
+    border-color: var(--surface-submit) !important;
+    color: #fff !important;
+  }
+  a[data-testid="openid"]:hover {
+    background: var(--surface-submit-hover) !important;
+  }
 </style>
 <script>
 // Unregister LibreChat's service worker so the latest index.html is always served.
@@ -423,6 +436,20 @@ if ('serviceWorker' in navigator) {
     a.addEventListener('click', function(e) { e.preventDefault(); showResetPasswordModal(); });
     wrap.appendChild(a);
     document.body.appendChild(wrap);
+  }
+
+  // 5b. Hide the "Or" divider between the (now-hidden) local form and the SSO button
+  function hideOrDivider() {
+    var path = window.location.pathname;
+    var onLoginPage = path === '/' || path.indexOf('login') !== -1;
+    if (!onLoginPage) return;
+    document.querySelectorAll('main div').forEach(function(el) {
+      if (el.dataset.abkOrHidden) return;
+      if (el.children.length === 1 && (el.children[0].textContent || '').trim().toLowerCase() === 'or') {
+        el.dataset.abkOrHidden = '1';
+        el.style.display = 'none';
+      }
+    });
   }
 
   // 6. Rename "Admin Settings" → "Organization Settings" in the sidebar
@@ -829,6 +856,7 @@ if ('serviceWorker' in navigator) {
     try { patchLoginText(); } catch(e) {}
     try { patchLogo(); } catch(e) {}
     try { patchForgotPassword(); } catch(e) {}
+    try { hideOrDivider(); } catch(e) {}
     try { hideSignUp(); } catch(e) {}
     try { patchAdminLink(); } catch(e) {}
     try { renameAdminLink(); } catch(e) {}
