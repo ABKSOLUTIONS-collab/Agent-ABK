@@ -471,17 +471,20 @@ if ('serviceWorker' in navigator) {
     }
   }
 
-  // 6b. Move "Organization Settings" out of the Skills flyout and into the icon rail
-  function moveOrgSettingsToRail() {
-    var orgEl = null;
-    document.querySelectorAll('button, a, li, [role="menuitem"]').forEach(function(el) {
-      if (orgEl || el.hasAttribute('data-abk-rail-org')) return;
-      if ((el.innerText || '').trim() === 'Organization Settings') orgEl = el;
-    });
-    if (orgEl) orgEl.style.display = 'none';
+  // 6b. Add an "Organization Settings" icon to the same rail as "Skills".
+  //
+  // Earlier versions of this found LibreChat's OWN native "Admin Settings"
+  // nav item (by matching its text) and converted/relocated it. That item
+  // no longer exists in the current LibreChat build (its admin/RBAC UI has
+  // moved on) — searching for it just silently found nothing forever, which
+  // is why Organization Settings quietly vanished from the app with no
+  // error. Inject directly next to "Skills" instead, with our own icon,
+  // so this doesn't depend on a LibreChat-internal element that can drift
+  // out from under us again.
+  var ORG_RAIL_ICON_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:20px;height:20px"><path d="M3 21h18"/><path d="M6 21V8l6-4 6 4v13"/><path d="M10 21v-6h4v6"/><path d="M9 11h.01M15 11h.01M9 15h.01M15 15h.01"/></svg>';
 
+  function moveOrgSettingsToRail() {
     if (document.querySelector('[data-abk-rail-org]')) return;
-    if (!orgEl) return;
 
     var skillsBtn = null;
     document.querySelectorAll('button, a').forEach(function(el) {
@@ -501,13 +504,12 @@ if ('serviceWorker' in navigator) {
     }
     if (!template) template = skillsBtn;
 
-    var icon = orgEl.querySelector('svg');
     var newBtn = document.createElement(template.tagName);
     newBtn.className = template.className;
     newBtn.setAttribute('data-abk-rail-org', '1');
     newBtn.setAttribute('title', 'Organization Settings');
     newBtn.setAttribute('aria-label', 'Organization Settings');
-    newBtn.innerHTML = icon ? icon.outerHTML : template.innerHTML;
+    newBtn.innerHTML = ORG_RAIL_ICON_SVG;
     newBtn.addEventListener('click', function(e) {
       e.preventDefault();
       e.stopPropagation();
