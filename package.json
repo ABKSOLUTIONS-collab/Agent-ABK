@@ -5,7 +5,6 @@
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
-    "build:web": "npm --prefix web run build",
     "dev": "ts-node src/index.ts",
     "start": "node dist/index.js",
     "setup": "ts-node scripts/setup.ts",
@@ -14,7 +13,7 @@
     "register": "ts-node scripts/register-claude.ts",
     "mock": "ts-node scripts/start-mock.ts",
     "test:e2e": "ts-node scripts/test-e2e.ts",
-    "clean": "rimraf dist web/dist"
+    "clean": "rimraf dist"
   },
   "dependencies": {
     "@azure-rest/ai-document-intelligence": "^1.1.0",
@@ -27,6 +26,7 @@
     "cookie-parser": "^1.4.7",
     "dotenv": "^16.4.5",
     "express": "^5.2.1",
+    "fflate": "^0.8.3",
     "jsonwebtoken": "^9.0.3",
     "mongodb": "^7.4.0",
     "sharp": "^0.34.5"

@@ -78,7 +78,9 @@ export class ServerDiscovery {
   private buildServerUrl(config: MCPServerConfig): string {
     if (config.url) return config.url;
     const base = this.config.mcpPlatformEndpoint.replace(/\/+$/, "");
-    return `${base}/agents/servers/${config.mcpServerName}/`;
+    // Pattern per Microsoft docs: {endpoint}/agents/tenants/{tenantId}/servers/{serverName}
+    // (the tenant segment was missing here, which is why every server 404'd as RouteNotFound)
+    return `${base}/agents/tenants/${this.config.tenantId}/servers/${config.mcpServerName}`;
   }
 
   private async discoverTools(

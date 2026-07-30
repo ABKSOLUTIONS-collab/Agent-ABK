@@ -9,11 +9,16 @@ import {
 import { ResolvedServer } from "../config/types";
 import { ToolForwarder } from "./tool-forwarder";
 import { CachedTool, loadToolsCache, saveToolsCache } from "../auth/tools-cache";
-import { getUserToken, getGraphToken, getStoredEmail, pruneExpiredTokens } from "../auth/user-token-store";
+import { getUserToken, getGraphToken, getTokenEmail, getStoredEmail, pruneExpiredTokens } from "../auth/user-token-store";
 import { registerOAuthEndpoints } from "../auth/oauth-handler";
 import { SHAREPOINT_TOOLS, SHAREPOINT_TOOL_NAMES, SharePointToolHandler } from "../tools/sharepoint-tools";
 import { OCR_TOOL, OCR_TOOL_NAMES, OcrToolHandler } from "../tools/ocr-tool";
 import { EMAIL_GRAPH_TOOLS, EMAIL_GRAPH_TOOL_NAMES, EmailGraphToolHandler } from "../tools/email-graph-tools";
+import { CALENDAR_GRAPH_TOOLS, CALENDAR_GRAPH_TOOL_NAMES, CalendarGraphToolHandler } from "../tools/calendar-graph-tools";
+import { WORD_GRAPH_TOOLS, WORD_GRAPH_TOOL_NAMES, WordGraphToolHandler } from "../tools/word-graph-tools";
+import { EXCEL_GRAPH_TOOLS, EXCEL_GRAPH_TOOL_NAMES, ExcelGraphToolHandler } from "../tools/excel-graph-tools";
+import { TEAMS_GRAPH_TOOLS, TEAMS_GRAPH_TOOL_NAMES, TeamsGraphToolHandler } from "../tools/teams-graph-tools";
+import { KNOWLEDGE_GRAPH_TOOLS, KNOWLEDGE_GRAPH_TOOL_NAMES, KnowledgeGraphToolHandler } from "../tools/knowledge-graph-tools";
 import {
   SIGNATURE_STYLE_TOOL,
   SIGNATURE_STYLE_TOOL_NAME,
@@ -23,21 +28,46 @@ import {
   handleGetSignatureStyle,
   handleSetSignature,
 } from "../tools/signature-style-tool";
-import { getUserSignature, appendSignature, LOGO_BASE64 } from "../tools/signature-service";
+import { getUserSignatureStrict, appendSignature, LOGO_BASE64 } from "../tools/signature-service";
 import { ServerDiscovery } from "../discovery/server-discovery";
 import { AppConfig } from "../config/types";
 import express from "express";
 import cookieParser from "cookie-parser";
-import path from "node:path";
-import { createAuthRoutes } from "../routes/auth-routes";
-import { createAdminRoutes } from "../routes/admin-routes";
-import { ensureAppTables, countUsers, upsertUser, logAppError } from "../auth/app-store";
-import { hashPassword } from "../auth/app-auth";
 import { registerOrgAdminEndpoints } from "../admin/org-admin";
 
 function log(message: string): void {
   process.stderr.write(`[agent365-bridge] ${message}\n`);
 }
+
+// Returned instead of sending/drafting when the user has no saved signature
+// yet, with isError:true so it's surfaced as a genuine tool failure rather
+// than free-form text the calling model has to interpret. Deliberately
+// phrased as a plain fact about current state, with zero imperative verbs
+// ("call X", "ask the user", "must") — any such directive inside a tool
+// result reads exactly like an injected instruction, and two earlier, more
+// forceful wordings of this were both (correctly) flagged as suspicious and
+// refused. The model already sees GetUserEmailSignatureStyle in its own
+// tool list with a description explaining what it's for; it doesn't need to
+// be told in-band to use it.
+const SIGNATURE_REQUIRED_MESSAGE =
+  "Precondition not met: this Microsoft 365 account has no email signature configured " +
+  "(Agent365-Bridge/signature.txt not found in its OneDrive). Email not sent or drafted.";
+
+// Tool names that already have a hardcoded Graph-API handler and are always
+// listed via their static tool arrays — used to keep discovered (dynamic)
+// tools from being listed a second time under the same name.
+const HARDCODED_TOOL_NAMES = new Set<string>([
+  ...SHAREPOINT_TOOL_NAMES,
+  ...OCR_TOOL_NAMES,
+  ...EMAIL_GRAPH_TOOL_NAMES,
+  ...CALENDAR_GRAPH_TOOL_NAMES,
+  ...WORD_GRAPH_TOOL_NAMES,
+  ...EXCEL_GRAPH_TOOL_NAMES,
+  ...TEAMS_GRAPH_TOOL_NAMES,
+  ...KNOWLEDGE_GRAPH_TOOL_NAMES,
+  SIGNATURE_STYLE_TOOL_NAME,
+  SET_SIGNATURE_TOOL_NAME,
+]);
 
 interface ToolRegistryEntry {
   uniqueName: string;
@@ -101,6 +131,10 @@ export class McpProxyServer {
     for (const s of servers) for (const t of s.tools) counts.set(t.name, (counts.get(t.name) || 0) + 1);
     for (const s of servers) {
       for (const t of s.tools) {
+        // These names already have a hardcoded Graph-API handler and are
+        // always listed via their static tool arrays — skip them here so
+        // discovery doesn't list the same tool name twice.
+        if (HARDCODED_TOOL_NAMES.has(t.name)) continue;
         const uniqueName = (counts.get(t.name) || 0) > 1 ? `${t.name}_${s.config.mcpServerName}` : t.name;
         registry.set(uniqueName, {
           uniqueName,
@@ -176,46 +210,7 @@ export class McpProxyServer {
     return null;
   }
 
-  private getHealthSnapshot() {
-    return {
-      status: "ok",
-      server: "agent365-bridge",
-      cachedTools: this.sharedToolRegistry.size + SHAREPOINT_TOOLS.length + 2,
-      activeUsers: this.userCache.size,
-    };
-  }
-
-  /** Creates the first admin account (from env vars) if the Users table is empty. */
-  private async bootstrapAdmin(): Promise<void> {
-    try {
-      await ensureAppTables();
-      const existing = await countUsers();
-      if (existing > 0) return;
-
-      const email = process.env.INITIAL_ADMIN_EMAIL;
-      const password = process.env.INITIAL_ADMIN_PASSWORD;
-      if (!email || !password) {
-        log("No app users exist yet and INITIAL_ADMIN_EMAIL/INITIAL_ADMIN_PASSWORD are not set — /app login will be unusable until an admin is bootstrapped.");
-        return;
-      }
-
-      await upsertUser({
-        email,
-        passwordHash: await hashPassword(password),
-        role: "admin",
-        createdAt: Date.now(),
-        isActive: true,
-      });
-      log(`Bootstrapped initial admin account: ${email}`);
-    } catch (err) {
-      log(`bootstrapAdmin failed: ${err}`);
-      await logAppError("bootstrap", "Failed to bootstrap initial admin", String(err));
-    }
-  }
-
   async start(): Promise<void> {
-    await this.bootstrapAdmin();
-
     const app = express();
     app.use(express.json());
     app.use(express.urlencoded({ extended: false }));
@@ -237,19 +232,11 @@ export class McpProxyServer {
     const sessions: Record<string, SSEServerTransport> = {};
 
     app.get("/health", (_req, res) => {
-      res.json(this.getHealthSnapshot());
-    });
-
-    // ── Login / Admin console app (independent of the MCP/OAuth routes below) ──
-    app.use(cookieParser());
-    app.use("/api/auth", createAuthRoutes());
-    app.use("/api/admin", createAdminRoutes(() => this.getHealthSnapshot()));
-
-    const webDistPath = path.join(__dirname, "../../web/dist");
-    app.use("/app", express.static(webDistPath));
-    app.get("/app/*", (_req, res) => {
-      res.sendFile(path.join(webDistPath, "index.html"), (err) => {
-        if (err) res.status(404).send("Admin console UI is not built (web/dist missing). Run `npm run build:web`.");
+      res.json({
+        status: "ok",
+        server: "agent365-bridge",
+        cachedTools: this.sharedToolRegistry.size + SHAREPOINT_TOOLS.length + 2,
+        activeUsers: this.userCache.size,
       });
     });
 
@@ -268,6 +255,7 @@ export class McpProxyServer {
       log("Warning: OAuth not configured");
     }
 
+    app.use(cookieParser());
     registerOrgAdminEndpoints(app);
 
     app.head("/mcp", (_req, res) => {
@@ -317,6 +305,11 @@ export class McpProxyServer {
             ...Array.from(toolRegistry.values()).map((e) => e.toolDef),
             ...SHAREPOINT_TOOLS,
             ...EMAIL_GRAPH_TOOLS,
+            ...CALENDAR_GRAPH_TOOLS,
+            ...WORD_GRAPH_TOOLS,
+            ...EXCEL_GRAPH_TOOLS,
+            ...TEAMS_GRAPH_TOOLS,
+            ...KNOWLEDGE_GRAPH_TOOLS,
             OCR_TOOL,
             SIGNATURE_STYLE_TOOL,
           ],
@@ -344,15 +337,19 @@ export class McpProxyServer {
 
           // ── CreateDraftMessage: inject signature + CID logo before creating ──
           if (name === "CreateDraftMessage" && graphToken) {
+            let signature: string | null = null;
             try {
-              const signature = await getUserSignature(graphToken);
-              if (signature) {
-                const rawBody  = String(typedArgs.body ?? typedArgs.emailBody ?? "");
-                const bodyType = String(typedArgs.contentType ?? typedArgs.bodyType ?? "text");
-                typedArgs = { ...typedArgs, body: appendSignature(rawBody, bodyType, signature), contentType: "HTML" };
-                log("Signature injected into CreateDraftMessage");
-              }
-            } catch (e) { log(`Signature inject failed: ${e}`); }
+              signature = await getUserSignatureStrict(graphToken);
+            } catch (e) { log(`Signature check failed: ${e}`); }
+
+            if (!signature) {
+              return { content: [{ type: "text", text: SIGNATURE_REQUIRED_MESSAGE }], isError: true };
+            }
+
+            const rawBody  = String(typedArgs.body ?? typedArgs.emailBody ?? "");
+            const bodyType = String(typedArgs.contentType ?? typedArgs.bodyType ?? "text");
+            typedArgs = { ...typedArgs, body: appendSignature(rawBody, bodyType, signature), contentType: "HTML" };
+            log("Signature injected into CreateDraftMessage");
 
             const handler = new EmailGraphToolHandler(graphToken);
             const result   = await handler.handleToolCall(name, typedArgs);
@@ -379,44 +376,27 @@ export class McpProxyServer {
             return result;
           }
 
-          // ── Email tools: Graph API directly (no Copilot license required) ──
-          if (EMAIL_GRAPH_TOOL_NAMES.has(name)) {
-            if (!graphToken) {
-              return { content: [{ type: "text", text: "Graph token not available. Please re-authenticate at /login." }] };
-            }
-            const handler = new EmailGraphToolHandler(graphToken);
-            return handler.handleToolCall(name, typedArgs);
-          }
-
-          // ── Signature tool (dual-purpose: save if name given, read otherwise) ──
-          if (name === SIGNATURE_STYLE_TOOL_NAME || name === SET_SIGNATURE_TOOL_NAME) {
-            if (!graphToken) {
-              return { content: [{ type: "text", text: "Graph token not available. Please re-authenticate." }] };
-            }
-            const result = await handleGetSignatureStyle(graphToken, typedArgs);
-            return { content: [{ type: "text", text: result }] };
-          }
-
-          const entry = toolRegistry.get(name);
-          if (!entry) return { content: [{ type: "text", text: `Error: Tool '${name}' not found.` }] };
-          if (!forwarder) return { content: [{ type: "text", text: "Tools still loading. Please try again in a moment." }] };
-
-          const targetServer = userCacheEntry!.servers.find((s) => s.config.mcpServerName === entry.serverName);
-          if (!targetServer) return { content: [{ type: "text", text: `Error: Server '${entry.serverName}' not found.` }] };
-
           // ── SendEmailWithAttachments: create draft + CID attachment + send ──
           // We can't call /me/sendMail directly (needs Mail.Send on graphToken).
           // Instead: create draft via Graph (Mail.ReadWrite ✓) → add CID attachment
           // → send via upstream SendDraftMessage tool (has Mail.Send ✓).
+          // NOTE: must run BEFORE the generic EMAIL_GRAPH_TOOL_NAMES check below,
+          // which would otherwise intercept this name first and skip signature/CID injection.
           if (name === "SendEmailWithAttachments" && graphToken && LOGO_BASE64) {
+            const signature = await getUserSignatureStrict(graphToken).catch(() => null);
+            if (!signature) {
+              return { content: [{ type: "text", text: SIGNATURE_REQUIRED_MESSAGE }], isError: true };
+            }
             try {
-              const signature = await getUserSignature(graphToken);
               const rawBody  = String(typedArgs.body ?? typedArgs.emailBody ?? "");
               const bodyType = String(typedArgs.contentType ?? typedArgs.bodyType ?? "text");
-              const htmlBody = signature ? appendSignature(rawBody, bodyType, signature) : rawBody;
+              const htmlBody = appendSignature(rawBody, bodyType, signature);
 
-              const buildRecipients = (arr: unknown) =>
-                (Array.isArray(arr) ? arr : []).map((r: unknown) => ({ emailAddress: { address: String(r) } }));
+              // Schema allows "to"/"cc"/"bcc" as either a single string or an
+              // array of strings — normalize both before mapping to Graph shape.
+              const buildRecipients = (val: unknown) =>
+                (Array.isArray(val) ? val : val ? [val] : [])
+                  .map((r: unknown) => ({ emailAddress: { address: String(r) } }));
 
               // 1️⃣ Create draft
               const draftResp = await fetch("https://graph.microsoft.com/v1.0/me/messages", {
@@ -463,19 +443,24 @@ export class McpProxyServer {
                 const sendErr = await sendRes.text().catch(() => "");
                 log(`Graph direct send failed (${sendRes.status}): ${sendErr} — trying upstream`);
 
-                // Fallback: upstream SendDraftMessage
-                const sendEntry = toolRegistry.get("SendDraftMessage");
-                if (sendEntry && forwarder) {
-                  const sendTarget = userCacheEntry!.servers.find(s => s.config.mcpServerName === sendEntry.serverName);
-                  if (sendTarget) {
-                    const result = await forwarder.callTool(sendEntry.originalName, { messageId: msgId }, sendTarget);
-                    log(`Email sent via draft+CID+upstream-send (msg: ${msgId})`);
-                    return result;
+                // Fallback: upstream SendDraftMessage. Look this up directly on the
+                // discovered servers (not the deduped toolRegistry, which excludes
+                // this name since it also has a hardcoded handler) so forwarding
+                // still works when the direct Graph send above fails for some
+                // reason other than the bug this was fixed for.
+                if (forwarder && userCacheEntry) {
+                  for (const s of userCacheEntry.servers) {
+                    const dynTool = s.tools.find(t => t.name === "SendDraftMessage");
+                    if (dynTool) {
+                      const result = await forwarder.callTool("SendDraftMessage", { messageId: msgId }, s);
+                      log(`Email sent via draft+CID+upstream-send (msg: ${msgId})`);
+                      return result;
+                    }
                   }
                 }
 
                 log(`Email draft created with CID logo (msg: ${msgId}) — could not auto-send`);
-                return { content: [{ type: "text", text: `Draft created with signature. Please send it from Outlook (id: ${msgId})` }] };
+                return { content: [{ type: "text", text: `Draft created with your signature, but could not send automatically (${sendErr || sendRes.status}). Please send it from Outlook (id: ${msgId})` }] };
               }
             } catch (sigErr) {
               log(`Draft+CID send failed (non-fatal): ${sigErr} — falling back to upstream`);
@@ -483,6 +468,7 @@ export class McpProxyServer {
           }
 
           // ── SendDraftMessage: add CID attachment then send directly via Graph ──
+          // NOTE: must also run BEFORE the generic EMAIL_GRAPH_TOOL_NAMES check below.
           if (name === "SendDraftMessage" && graphToken) {
             try {
               const msgId = String(typedArgs.messageId ?? typedArgs.draftId ?? typedArgs.id ?? "");
@@ -515,21 +501,95 @@ export class McpProxyServer {
             }
           }
 
-          // ── Other email tools: inject signature into body ───────────────────
+          // ── Email tools: Graph API directly (no Copilot license required) ──
+          if (EMAIL_GRAPH_TOOL_NAMES.has(name)) {
+            if (!graphToken) {
+              return { content: [{ type: "text", text: "Graph token not available. Please re-authenticate at /login." }] };
+            }
+            const handler = new EmailGraphToolHandler(graphToken);
+            return handler.handleToolCall(name, typedArgs);
+          }
+
+          // ── Calendar tools: Graph API directly (no Copilot license required) ──
+          if (CALENDAR_GRAPH_TOOL_NAMES.has(name)) {
+            if (!graphToken) {
+              return { content: [{ type: "text", text: "Graph token not available. Please re-authenticate at /login." }] };
+            }
+            const handler = new CalendarGraphToolHandler(graphToken);
+            return handler.handleToolCall(name, typedArgs);
+          }
+
+          // ── Word document tools: Graph API + DOCX (no Copilot license required) ──
+          if (WORD_GRAPH_TOOL_NAMES.has(name)) {
+            if (!graphToken) {
+              return { content: [{ type: "text", text: "Graph token not available. Please re-authenticate at /login." }] };
+            }
+            const handler = new WordGraphToolHandler(graphToken);
+            return handler.handleToolCall(name, typedArgs);
+          }
+
+          // ── Excel workbook tools: Graph Excel API (no Copilot license required) ──
+          if (EXCEL_GRAPH_TOOL_NAMES.has(name)) {
+            if (!graphToken) {
+              return { content: [{ type: "text", text: "Graph token not available. Please re-authenticate at /login." }] };
+            }
+            const handler = new ExcelGraphToolHandler(graphToken);
+            return handler.handleToolCall(name, typedArgs);
+          }
+
+          // ── Teams meeting tools: Graph API (no Copilot license required) ──
+          if (TEAMS_GRAPH_TOOL_NAMES.has(name)) {
+            if (!graphToken) {
+              return { content: [{ type: "text", text: "Graph token not available. Please re-authenticate at /login." }] };
+            }
+            const handler = new TeamsGraphToolHandler(graphToken);
+            return handler.handleToolCall(name, typedArgs);
+          }
+
+          // ── Knowledge / Search tools: Graph Search API ──────────────────
+          if (KNOWLEDGE_GRAPH_TOOL_NAMES.has(name)) {
+            if (!graphToken) {
+              return { content: [{ type: "text", text: "Graph token not available. Please re-authenticate at /login." }] };
+            }
+            const handler = new KnowledgeGraphToolHandler(graphToken);
+            return handler.handleToolCall(name, typedArgs);
+          }
+
+          // ── Signature tool (dual-purpose: save if name given, read otherwise) ──
+          if (name === SIGNATURE_STYLE_TOOL_NAME || name === SET_SIGNATURE_TOOL_NAME) {
+            if (!graphToken) {
+              return { content: [{ type: "text", text: "Graph token not available. Please re-authenticate." }] };
+            }
+            // Guard against saving someone else's details (e.g. a person the
+            // caller has emailed before) as THIS account's signature — the
+            // provided email, if any, must belong to the signed-in user.
+            const providedEmail = typeof typedArgs.email === "string" ? typedArgs.email.trim().toLowerCase() : "";
+            if (providedEmail && email && providedEmail !== email.toLowerCase()) {
+              return { content: [{ type: "text", text: `This account is signed in as ${email}, but the email provided (${providedEmail}) belongs to someone else. A signature must be the signed-in user's own details, not another person's (e.g. an email recipient). Ask the user to confirm their own name/title/contact info and call this tool again with those — or omit the email field.` }] };
+            }
+            const result = await handleGetSignatureStyle(graphToken, typedArgs);
+            return { content: [{ type: "text", text: result }] };
+          }
+
+          const entry = toolRegistry.get(name);
+          if (!entry) return { content: [{ type: "text", text: `Error: Tool '${name}' not found.` }] };
+          if (!forwarder) return { content: [{ type: "text", text: "Tools still loading. Please try again in a moment." }] };
+
+          const targetServer = userCacheEntry!.servers.find((s) => s.config.mcpServerName === entry.serverName);
+          if (!targetServer) return { content: [{ type: "text", text: `Error: Server '${entry.serverName}' not found.` }] };
+
+          // ── Other email tools: require + inject signature into body ─────────
           if (EMAIL_TOOLS_REQUIRING_SIGNATURE.has(name) && graphToken && name !== "SendEmailWithAttachments") {
-            try {
-              const signature = await getUserSignature(graphToken);
-              if (signature) {
-                const bodyKey = "body" in typedArgs ? "body" : "emailBody" in typedArgs ? "emailBody" : null;
-                const bodyTypeKey = "bodyType" in typedArgs ? "bodyType" : "contentType" in typedArgs ? "contentType" : null;
-                if (bodyKey && typeof typedArgs[bodyKey] === "string") {
-                  const bodyType = bodyTypeKey ? (typedArgs[bodyTypeKey] as string ?? "text") : "text";
-                  typedArgs = { ...typedArgs, [bodyKey]: appendSignature(typedArgs[bodyKey] as string, bodyType, signature), contentType: "HTML" };
-                  log(`Signature auto-injected into ${name}`);
-                }
-              }
-            } catch (sigErr) {
-              log(`Signature inject failed (non-fatal): ${sigErr}`);
+            const signature = await getUserSignatureStrict(graphToken).catch(() => null);
+            if (!signature) {
+              return { content: [{ type: "text", text: SIGNATURE_REQUIRED_MESSAGE }], isError: true };
+            }
+            const bodyKey = "body" in typedArgs ? "body" : "emailBody" in typedArgs ? "emailBody" : null;
+            const bodyTypeKey = "bodyType" in typedArgs ? "bodyType" : "contentType" in typedArgs ? "contentType" : null;
+            if (bodyKey && typeof typedArgs[bodyKey] === "string") {
+              const bodyType = bodyTypeKey ? (typedArgs[bodyTypeKey] as string ?? "text") : "text";
+              typedArgs = { ...typedArgs, [bodyKey]: appendSignature(typedArgs[bodyKey] as string, bodyType, signature), contentType: "HTML" };
+              log(`Signature auto-injected into ${name}`);
             }
           }
 
@@ -571,6 +631,7 @@ export class McpProxyServer {
           ...Array.from(this.sharedToolRegistry.values()).map((e) => e.toolDef),
           ...SHAREPOINT_TOOLS,
           ...EMAIL_GRAPH_TOOLS,
+          ...CALENDAR_GRAPH_TOOLS,
           OCR_TOOL,
           SIGNATURE_STYLE_TOOL,
           SET_SIGNATURE_TOOL,
@@ -592,13 +653,6 @@ export class McpProxyServer {
       }
     }, DISCOVERY_TTL_MS);
 
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    app.use((err: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
-      log(`Unhandled route error: ${err}`);
-      void logAppError("express", err.message || "Unhandled error", err.stack);
-      if (!res.headersSent) res.status(500).json({ error: "internal_error" });
-    });
-
     const PORT = process.env.PORT || 3000;
     app.listen(PORT, () => {
       log(`MCP server listening on port ${PORT}`);
@@ -617,6 +671,7 @@ export class McpProxyServer {
           ...Array.from(this.sharedToolRegistry.values()).map((e) => e.toolDef),
           ...SHAREPOINT_TOOLS,
           ...EMAIL_GRAPH_TOOLS,
+          ...CALENDAR_GRAPH_TOOLS,
           OCR_TOOL,
           SIGNATURE_STYLE_TOOL,
         ],

@@ -6,7 +6,8 @@
       "Bash(npm run *)",
       "Bash(Get-ChildItem -Recurse \".claude/\")",
       "Bash(Select-Object FullName)",
-      "WebFetch(domain:agent365-bridge.lemonsea-0ef310bc.swedencentral.azurecontainerapps.io)"
+      "WebFetch(domain:agent365-bridge.lemonsea-0ef310bc.swedencentral.azurecontainerapps.io)",
+      "Bash(PYTHONIOENCODING=utf-8 az acr build --registry agent365registry --image agent365-bridge:20260710sec5 --image agent365-bridge:latest .)"
     ]
   }
 }

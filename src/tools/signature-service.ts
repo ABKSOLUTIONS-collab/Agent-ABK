@@ -47,7 +47,11 @@ const signatureCache = new Map<string, CacheEntry>();
  * Tries OneDrive signature.txt first, then sent items. Cached 1 hour.
  */
 export async function getUserSignature(graphToken: string): Promise<string | null> {
-  const cacheKey = graphToken.substring(0, 16);
+  // Full token, not a prefix — Graph JWTs from the same tenant/app share an
+  // identical header, so the first N characters are the SAME across every
+  // user, and truncating here previously caused one user's cached signature
+  // to be served to everyone else until the cache entry expired.
+  const cacheKey = graphToken;
   const cached = signatureCache.get(cacheKey);
   if (cached && Date.now() - cached.fetchedAt < CACHE_TTL_MS) {
     log("Using cached signature");
@@ -71,6 +75,26 @@ export async function getUserSignature(graphToken: string): Promise<string | nul
   }
 
   log("No signature found");
+  return null;
+}
+
+/**
+ * Strict variant used for AUTOMATIC background injection (email send/draft
+ * tools) — OneDrive signature.txt only, no sent-items guessing. The
+ * sent-items heuristic can grab unrelated content after a stray <hr>, so it's
+ * only offered as a preview via the explicit GetUserEmailSignatureStyle tool,
+ * never silently attached to outgoing mail.
+ */
+export async function getUserSignatureStrict(graphToken: string): Promise<string | null> {
+  const cacheKey = `strict:${graphToken}`;
+  const cached = signatureCache.get(cacheKey);
+  if (cached && Date.now() - cached.fetchedAt < CACHE_TTL_MS) return cached.html;
+
+  const oneDriveSig = await fetchSignatureFromOneDrive(graphToken);
+  if (oneDriveSig) {
+    signatureCache.set(cacheKey, { html: oneDriveSig, fetchedAt: Date.now() });
+    return oneDriveSig;
+  }
   return null;
 }
 
@@ -109,12 +133,46 @@ export function appendSignature(
 }
 
 export function invalidateSignatureCache(graphToken: string): void {
-  signatureCache.delete(graphToken.substring(0, 16));
+  signatureCache.delete(graphToken);
+  signatureCache.delete(`strict:${graphToken}`);
 }
 
 // ── OneDrive signature.txt ────────────────────────────────────────────────────
 
 const ONEDRIVE_SIG_PATH = "Agent365-Bridge/signature.txt";
+
+/**
+ * Writes the user's signature details to Agent365-Bridge/signature.txt in
+ * their OneDrive (creating the Agent365-Bridge folder implicitly — Graph's
+ * PUT-by-path creates any missing parent folders), then returns the
+ * ready-to-use HTML block. Invalidates the cache so the new signature is
+ * picked up on the very next email.
+ */
+export async function saveUserSignature(
+  graphToken: string,
+  lines: string[]
+): Promise<{ ok: true; html: string } | { ok: false; error: string }> {
+  const fileContent = lines.filter(Boolean).join("\n");
+  try {
+    const url = `https://graph.microsoft.com/v1.0/me/drive/root:/${ONEDRIVE_SIG_PATH}:/content`;
+    const resp = await fetch(url, {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${graphToken}`, "Content-Type": "text/plain" },
+      body: fileContent,
+    });
+    if (!resp.ok) {
+      const err = await resp.text().catch(() => "");
+      log(`OneDrive signature save failed: ${resp.status} ${err}`);
+      return { ok: false, error: `${resp.status} ${err}` };
+    }
+    invalidateSignatureCache(graphToken);
+    log(`signature.txt saved to OneDrive (${fileContent.length} chars)`);
+    return { ok: true, html: buildSignatureHtml(fileContent) };
+  } catch (err) {
+    log(`OneDrive signature save error: ${err}`);
+    return { ok: false, error: String(err) };
+  }
+}
 
 /**
  * Reads Agent365-Bridge/signature.txt from the user's OneDrive and

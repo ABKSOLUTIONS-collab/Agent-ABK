@@ -2,10 +2,23 @@ import * as crypto from "crypto";
 import { Express, Request, Response } from "express";
 import { MongoClient, Db, ObjectId } from "mongodb";
 import bcrypt from "bcryptjs";
+import jwt from "jsonwebtoken";
 import { TableClient, AzureNamedKeyCredential } from "@azure/data-tables";
 import { getSessionTokenByEmail, removeUserToken, getGraphToken } from "../auth/user-token-store";
 
 const SERVER_BASE_URL = (process.env.SERVER_BASE_URL ?? "").replace(/\/$/, "");
+const LIBRECHAT_URL = (process.env.LIBRECHAT_URL ?? "").replace(/\/$/, "");
+
+// org-admin's OWN Microsoft SSO login (separate from LibreChat's — org-admin
+// is served cross-origin from agent365-bridge, so it can't read LibreChat's
+// session cookie; it needs its own real, verifiable identity proof instead
+// of trusting anything the parent page claims). Reuses the same Entra ID
+// app registration LibreChat's own SSO uses, with a second redirect URI
+// registered for this callback.
+const ORG_SSO_CLIENT_ID = process.env.ORG_SSO_CLIENT_ID ?? "";
+const ORG_SSO_CLIENT_SECRET = process.env.ORG_SSO_CLIENT_SECRET ?? "";
+const ORG_SSO_TENANT_ID = process.env.AZURE_TENANT_ID ?? "";
+const ORG_SSO_REDIRECT_URI = `${SERVER_BASE_URL}/org-admin/api/sso/callback`;
 
 function log(msg: string): void {
   process.stderr.write(`[org-admin] ${msg}\n`);
@@ -109,41 +122,58 @@ const ACCOUNT_KEY = process.env.AZURE_STORAGE_KEY ?? "";
 const TABLE = process.env.TOKEN_TABLE_NAME || "agent365tokens";
 
 // ── Auth resolution ─────────────────────────────────────────────────────────
+//
+// org-admin issues and verifies its OWN signed session tokens (below), backed
+// by the same bcrypt password hash LibreChat itself uses to log the user in.
+// This is a self-contained trust boundary: nobody can get a valid org_token
+// without knowing that account's actual password, and nobody can forge one
+// without knowing ORG_ADMIN_JWT_SECRET (a real Container App secret, never
+// sent to the browser). There is NO path left that trusts a bare,
+// caller-supplied email or an unsigned token — see feedback_2026-07-10
+// security review for why those were removed.
 
-function decodeJwtPayload(token: string): Record<string, unknown> | null {
+const ORG_ADMIN_JWT_SECRET = process.env.JWT_SECRET ?? "";
+const ORG_SESSION_ISSUER = "abk-org-admin";
+const ORG_SESSION_TTL = "8h";
+
+interface OrgSessionPayload {
+  email: string;
+  tier: Tier;
+}
+
+function signOrgSessionToken(email: string, tier: Tier): string {
+  if (!ORG_ADMIN_JWT_SECRET) throw new Error("JWT_SECRET not configured");
+  return jwt.sign({ email, tier }, ORG_ADMIN_JWT_SECRET, {
+    issuer: ORG_SESSION_ISSUER,
+    expiresIn: ORG_SESSION_TTL,
+  });
+}
+
+function verifyOrgSessionToken(token: string): OrgSessionPayload | null {
+  if (!ORG_ADMIN_JWT_SECRET || !token) return null;
   try {
-    const parts = token.split(".");
-    if (parts.length !== 3) return null;
-    const payload = Buffer.from(parts[1], "base64url").toString("utf8");
-    return JSON.parse(payload);
+    const payload = jwt.verify(token, ORG_ADMIN_JWT_SECRET, { issuer: ORG_SESSION_ISSUER }) as jwt.JwtPayload;
+    if (!payload || typeof payload.email !== "string") return null;
+    return { email: payload.email, tier: (payload.tier as Tier) ?? "USER" };
   } catch {
     return null;
   }
 }
 
-async function resolveByLcToken(lcToken: string): Promise<AuthInfo | null> {
-  const payload = decodeJwtPayload(lcToken);
-  if (!payload) return null;
-  const jwtEmail = payload.email as string | undefined;
-  const jwtId = payload.id as string | undefined;
-  if (!jwtEmail && !jwtId) return null;
+// ── org-admin's own SSO (PKCE authorization-code flow) ──────────────────────
 
-  const db = await getDb();
-  if (!db) return null;
-  try {
-    let user: LcUser | null = null;
-    if (jwtEmail) {
-      user = (await db.collection<LcUser>("users").findOne({ email: jwtEmail })) ?? null;
-    }
-    if (!user && jwtId) {
-      user = (await db.collection<LcUser>("users").findOne({ _id: new ObjectId(jwtId) })) ?? null;
-    }
-    if (!user) return null;
-    return { email: user.email, tier: getTier(user.email, user.role, user.orgRole) };
-  } catch (e) {
-    log(`resolveByLcToken error: ${e}`);
-    return null;
-  }
+interface SsoStateData {
+  verifier: string;
+  silent: boolean;
+  embed: boolean;
+}
+
+function base64url(buf: Buffer): string {
+  return buf.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function ssoStateCookieName(state: string): string {
+  return `abk_sso_${state}`;
 }
 
 async function resolveByM365Token(sessionToken: string): Promise<AuthInfo | null> {
@@ -167,19 +197,25 @@ function qstr(v: unknown): string | undefined {
   return undefined;
 }
 
-async function resolveByLcEmail(email: string): Promise<AuthInfo | null> {
-  if (!email || !email.includes("@")) return null;
-  const user = await getLcUserByEmail(email);
-  if (!user) return null;
-  return { email: user.email, tier: getTier(user.email, user.role, user.orgRole) };
+function bearerToken(req: Request): string | undefined {
+  const h = req.headers.authorization;
+  if (h && h.startsWith("Bearer ")) return h.slice(7).trim();
+  return undefined;
 }
 
 async function resolveAuth(req: Request): Promise<AuthInfo | null> {
-  const lcToken = qstr(req.query.lc_token);
-  const lcEmail = qstr(req.query.lc_email);
+  const orgToken = bearerToken(req) ?? qstr(req.query.org_token);
   const m365Token = qstr(req.query.token);
-  if (lcToken) return resolveByLcToken(lcToken);
-  if (lcEmail) return resolveByLcEmail(lcEmail);
+  if (orgToken) {
+    const session = verifyOrgSessionToken(orgToken);
+    if (!session) return null;
+    // Re-fetch the current role from Mongo rather than trusting the token's
+    // snapshot, so a role change takes effect immediately without forcing
+    // the affected user to log back in to org-admin.
+    const user = await getLcUserByEmail(session.email);
+    if (!user) return null;
+    return { email: session.email, tier: getTier(session.email, user.role, user.orgRole) };
+  }
   if (m365Token) return resolveByM365Token(m365Token);
   return null;
 }
@@ -189,13 +225,17 @@ async function resolveAuth(req: Request): Promise<AuthInfo | null> {
 function buildHtml(email: string, tier: Tier, embed: boolean): string {
   const authParamJs = `
 const _p = new URLSearchParams(location.search);
-const LC_TOKEN   = _p.get('lc_token') || '';
-const LC_EMAIL   = _p.get('lc_email') || '';
-const M365_TOKEN = _p.get('token')    || '';
+const ORG_TOKEN  = _p.get('org_token') || '';
+const M365_TOKEN = _p.get('token')     || '';
 function authParam() {
-  if (LC_TOKEN)   return 'lc_token=' + encodeURIComponent(LC_TOKEN);
-  if (LC_EMAIL)   return 'lc_email=' + encodeURIComponent(LC_EMAIL);
+  if (ORG_TOKEN)  return 'org_token=' + encodeURIComponent(ORG_TOKEN);
   return 'token=' + encodeURIComponent(M365_TOKEN);
+}
+// A token that just arrived via the SSO redirect — hand it to the parent
+// LibreChat page so reopening Organization Settings in this tab doesn't
+// need to repeat the SSO round-trip.
+if (ORG_TOKEN) {
+  try { window.parent.postMessage({ type: 'abk_org_session', token: ORG_TOKEN, email: '${email.replace(/'/g, "\\'")}' }, '*'); } catch(ex) {}
 }`;
 
   const sidebarHtml = embed ? "" : `
@@ -236,7 +276,7 @@ function authParam() {
     .sb-section{margin-bottom:16px}
     .sb-label{font-size:11px;font-weight:500;color:#9ca3af;text-transform:uppercase;letter-spacing:.05em;padding:0 8px;margin-bottom:2px}
     .sb-item{display:flex;align-items:center;padding:7px 8px;border-radius:7px;font-size:13px;color:#374151;cursor:pointer;gap:8px;margin-bottom:1px;transition:background .15s ease,color .15s ease}
-    .sb-item.active{background:#eaf2fe;color:#0066cc;font-weight:500}
+    .sb-item.active{background:#eaf2fe;color:#0071bc;font-weight:500}
     .sb-item:hover:not(.active){background:#f9fafb}
     /* Main */
     .main{flex:1;padding:${embed ? "20px 24px" : "32px 40px"};max-width:900px}
@@ -247,12 +287,12 @@ function authParam() {
     .ov-item:last-child{border-right:none}
     .ov-label{font-size:11px;color:#9ca3af;margin-bottom:5px;font-weight:500;text-transform:uppercase;letter-spacing:.05em}
     .ov-val{font-size:14px;font-weight:600;color:#111}
-    .ov-sub{font-size:12px;color:#0066cc;margin-top:3px;font-weight:500}
+    .ov-sub{font-size:12px;color:#0071bc;margin-top:3px;font-weight:500}
     /* Members header */
     .m-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
     .m-title{font-size:15px;font-weight:600;color:#111}
-    .btn-primary{background:#0066cc;color:#fff;border:none;border-radius:8px;padding:7px 15px;font-size:13px;font-weight:500;cursor:pointer;transition:background .15s ease,transform .1s ease,box-shadow .15s ease;box-shadow:0 1px 2px rgba(0,102,204,.25)}
-    .btn-primary:hover{background:#0055b3;box-shadow:0 2px 8px rgba(0,102,204,.3)}
+    .btn-primary{background:#0071bc;color:#fff;border:none;border-radius:8px;padding:7px 15px;font-size:13px;font-weight:500;cursor:pointer;transition:background .15s ease,transform .1s ease,box-shadow .15s ease;box-shadow:0 1px 2px rgba(0,102,204,.25)}
+    .btn-primary:hover{background:#005a96;box-shadow:0 2px 8px rgba(0,102,204,.3)}
     .btn-primary:active{transform:translateY(1px)}
     /* Table */
     .table-wrap{background:#fff;border:1px solid #ececec;border-radius:12px;overflow:hidden;box-shadow:0 1px 2px rgba(16,24,40,.04)}
@@ -260,7 +300,7 @@ function authParam() {
     .search-wrap{position:relative;display:flex;align-items:center}
     .search-wrap svg{position:absolute;left:9px;pointer-events:none;color:#b0b3b9}
     .search{border:1px solid #e5e7eb;border-radius:7px;padding:6px 11px 6px 28px;font-size:13px;outline:none;width:200px;color:#111;background:#fff;transition:border-color .15s ease,box-shadow .15s ease}
-    .search:focus{border-color:#0066cc;box-shadow:0 0 0 3px rgba(0,102,204,.12)}
+    .search:focus{border-color:#0071bc;box-shadow:0 0 0 3px rgba(0,102,204,.12)}
     .count-lbl{font-size:13px;color:#9ca3af}
     table{width:100%;border-collapse:collapse}
     th{padding:10px 16px;text-align:left;font-size:11px;font-weight:500;color:#9ca3af;border-bottom:1px solid #ececec;text-transform:uppercase;letter-spacing:.05em}
@@ -273,12 +313,12 @@ function authParam() {
     .avatar{width:30px;height:30px;border-radius:50%;color:#fff;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:600;flex-shrink:0;text-transform:uppercase;box-shadow:inset 0 0 0 1px rgba(255,255,255,.15)}
     .name-primary{font-size:13px;font-weight:500;color:#111}
     .name-secondary{font-size:12px;color:#9ca3af}
-    .you-badge{font-size:11px;color:#0066cc;background:#eaf2fe;border-radius:5px;padding:1px 6px;margin-left:5px;font-weight:500}
+    .you-badge{font-size:11px;color:#0071bc;background:#eaf2fe;border-radius:5px;padding:1px 6px;margin-left:5px;font-weight:500}
     /* Role */
     .role-text{font-size:13px;color:#374151}
     .role-select{padding:4px 28px 4px 8px;border:1px solid #e5e7eb;border-radius:7px;font-size:13px;cursor:pointer;background:#fff;color:#374151;outline:none;appearance:auto;transition:border-color .15s ease}
     .role-select:hover{border-color:#c9ccd1}
-    .role-select:focus{border-color:#0066cc;box-shadow:0 0 0 3px rgba(0,102,204,.12)}
+    .role-select:focus{border-color:#0071bc;box-shadow:0 0 0 3px rgba(0,102,204,.12)}
     /* Actions */
     .btn-remove{background:none;border:none;cursor:pointer;padding:4px 10px;border-radius:6px;font-size:12.5px;color:#6b7280;white-space:nowrap;transition:background .15s ease,color .15s ease}
     .btn-remove:hover{background:#fef2f2;color:#dc2626}
@@ -289,7 +329,7 @@ function authParam() {
     .skeleton{background:linear-gradient(90deg,#f0f0f0,#f6f6f6,#f0f0f0);border-radius:6px;animation:abkPulse 1.3s ease infinite}
     /* Add member modal */
     .add-input{width:100%;padding:9px 12px;border:1px solid #e5e7eb;border-radius:8px;font-size:13px;margin-bottom:10px;outline:none;box-sizing:border-box;transition:border-color .15s ease,box-shadow .15s ease}
-    .add-input:focus{border-color:#0066cc;box-shadow:0 0 0 3px rgba(0,102,204,.12)}
+    .add-input:focus{border-color:#0071bc;box-shadow:0 0 0 3px rgba(0,102,204,.12)}
     #addMsg{font-size:13px;padding:10px 12px;border-radius:8px;margin-bottom:12px;display:none}
   </style>
 </head>
@@ -341,13 +381,10 @@ ${sidebarHtml}
 <div id="addModal" style="display:none;position:fixed;inset:0;z-index:9999;background:rgba(17,17,17,0.5);align-items:center;justify-content:center;backdrop-filter:blur(2px);">
   <div style="background:#fff;border-radius:14px;padding:28px 32px;width:380px;max-width:95vw;box-shadow:0 24px 60px rgba(0,0,0,.22);animation:abkFadeUp .18s ease;">
     <h2 style="font-size:15px;font-weight:600;color:#111;margin-bottom:6px">Add member</h2>
-    <p style="font-size:13px;color:#6b7280;margin-bottom:18px">Create a new @abk.gr account.</p>
+    <p style="font-size:13px;color:#6b7280;margin-bottom:18px">Invite a new @abk.gr member. They'll sign in with their ABK Microsoft 365 account — no password to set.</p>
     <div id="addMsg"></div>
-    <input id="addName"  class="add-input" type="text"     placeholder="Full name">
-    <input id="addEmail" class="add-input" type="email"    placeholder="you@abk.gr">
-    <input id="addPw1"   class="add-input" type="password" placeholder="Password (min 8 chars)">
-    <input id="addPw2"   class="add-input" type="password" placeholder="Confirm password" style="margin-bottom:16px">
-    <button id="addSubmitBtn" class="btn-primary" onclick="submitAdd()" style="width:100%;padding:10px;margin-bottom:8px">Create account</button>
+    <input id="addEmail" class="add-input" type="email" placeholder="you@abk.gr" style="margin-bottom:16px">
+    <button id="addSubmitBtn" class="btn-primary" onclick="submitAdd()" style="width:100%;padding:10px;margin-bottom:8px">Send invitation</button>
     <button onclick="hideAddModal()" style="width:100%;padding:8px;background:none;border:none;font-size:13px;color:#6b7280;cursor:pointer;border-radius:8px;transition:background .15s ease" onmouseover="this.style.background='#f5f5f5'" onmouseout="this.style.background='none'">Cancel</button>
   </div>
 </div>
@@ -452,19 +489,16 @@ function showErr(msg) {
 function esc(s) { return s.replace(/'/g,"\\'"); }
 
 function showAddModal() {
-  ['addName','addEmail','addPw1','addPw2'].forEach(function(id){ document.getElementById(id).value=''; });
+  document.getElementById('addEmail').value='';
   var msg=document.getElementById('addMsg'); msg.style.display='none';
-  var btn=document.getElementById('addSubmitBtn'); btn.disabled=false; btn.textContent='Create account'; btn.style.display='';
+  var btn=document.getElementById('addSubmitBtn'); btn.disabled=false; btn.textContent='Send invitation'; btn.style.display='';
   var m=document.getElementById('addModal'); m.style.display='flex';
 }
 function hideAddModal() { document.getElementById('addModal').style.display='none'; }
 document.getElementById('addModal').addEventListener('click', function(e){ if(e.target===this) hideAddModal(); });
 
 async function submitAdd() {
-  var name=document.getElementById('addName').value.trim();
   var email=document.getElementById('addEmail').value.trim().toLowerCase();
-  var pw1=document.getElementById('addPw1').value;
-  var pw2=document.getElementById('addPw2').value;
   var msg=document.getElementById('addMsg');
   function showAddMsg(txt,isErr){
     msg.style.display='block';
@@ -472,27 +506,24 @@ async function submitAdd() {
     msg.style.color=isErr?'#dc2626':'#16a34a';
     msg.textContent=txt;
   }
-  if(!name){showAddMsg('Enter a full name.',true);return;}
   if(!email||email.indexOf('@')===-1){showAddMsg('Enter a valid email.',true);return;}
-  if(pw1.length<8){showAddMsg('Password must be at least 8 characters.',true);return;}
-  if(pw1!==pw2){showAddMsg('Passwords do not match.',true);return;}
   var btn=document.getElementById('addSubmitBtn');
-  btn.disabled=true; btn.textContent='Creating…';
+  btn.disabled=true; btn.textContent='Sending…';
   try {
     const r=await fetch('/org-admin/api/users?'+authParam(),{
       method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({name,email,password:pw1})
+      body:JSON.stringify({email})
     });
     const d=await r.json();
     if(r.ok){
-      showAddMsg('Account created!',false);
+      showAddMsg('Invitation sent!',false);
       btn.style.display='none';
       setTimeout(function(){ hideAddModal(); load(); },1200);
     } else {
-      showAddMsg(d.error||'Error creating account.',true);
-      btn.disabled=false; btn.textContent='Create account';
+      showAddMsg(d.error||'Error sending invitation.',true);
+      btn.disabled=false; btn.textContent='Send invitation';
     }
-  } catch(e){ showAddMsg('Connection error.',true); btn.disabled=false; btn.textContent='Create account'; }
+  } catch(e){ showAddMsg('Connection error.',true); btn.disabled=false; btn.textContent='Send invitation'; }
 }
 
 load();
@@ -501,9 +532,12 @@ load();
 </html>`;
 }
 
-// ── Email prompt HTML (shown in embed mode when no auth provided) ─────────────
+// ── SSO error / status pages (shown in embed mode for the SSO flow) ─────────
 
-function buildEmailPromptHtml(showError: boolean): string {
+function buildSsoErrorPage(message: string, opts?: { retry?: boolean }): string {
+  const retryBtn = opts?.retry
+    ? `<button onclick="location.href='/org-admin/api/sso/start?silent=0&embed=1'">Try again</button>`
+    : "";
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -514,39 +548,19 @@ function buildEmailPromptHtml(showError: boolean): string {
     *{box-sizing:border-box;margin:0;padding:0}
     @keyframes abkFadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
     body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#fafafa;min-height:100vh;display:flex;align-items:center;justify-content:center}
-    .card{background:#fff;border:1px solid #f0f0f0;border-radius:14px;padding:36px 40px;box-shadow:0 8px 28px rgba(16,24,40,.08);width:300px;animation:abkFadeUp .25s ease}
+    .card{background:#fff;border:1px solid #f0f0f0;border-radius:14px;padding:36px 40px;box-shadow:0 8px 28px rgba(16,24,40,.08);width:320px;animation:abkFadeUp .25s ease;text-align:center}
     h2{font-size:16px;font-weight:600;color:#111;margin-bottom:8px}
-    p{color:#777;font-size:13px;margin-bottom:20px;line-height:1.5}
-    input{width:100%;padding:10px 14px;border:1px solid #e3e3e3;border-radius:9px;font-size:14px;margin-bottom:12px;outline:none;transition:border-color .15s ease,box-shadow .15s ease}
-    input:focus{border-color:#0066cc;box-shadow:0 0 0 3px rgba(0,102,204,.14)}
-    button{width:100%;padding:11px;background:#0066cc;color:#fff;border:none;border-radius:9px;font-size:14px;font-weight:500;cursor:pointer;transition:background .15s ease,box-shadow .15s ease}
+    p{color:#6b7280;font-size:13px;margin-bottom:20px;line-height:1.5}
+    button{width:100%;padding:11px;background:#0071bc;color:#fff;border:none;border-radius:9px;font-size:14px;font-weight:500;cursor:pointer;transition:background .15s ease,box-shadow .15s ease}
     button:hover{background:#0055bb;box-shadow:0 2px 10px rgba(0,102,204,.28)}
-    .err{color:#dc2626;font-size:12px;margin-bottom:12px;background:#fef2f2;padding:8px 10px;border-radius:7px}
   </style>
 </head>
 <body>
   <div class="card">
-    <h2>Organization Settings</h2>
-    <p>Enter your ABK email to continue</p>
-    ${showError ? '<div class="err">Email not recognized. Use your @abk.gr account.</div>' : ""}
-    <input type="email" id="emailInput" placeholder="you@abk.gr" autofocus>
-    <button onclick="go()">Continue</button>
+    <h2>Sign-in required</h2>
+    <p>${message.replace(/</g, "&lt;")}</p>
+    ${retryBtn}
   </div>
-  <script>
-    var saved = localStorage.getItem('abk_admin_email');
-    if (saved) document.getElementById('emailInput').value = saved;
-    document.getElementById('emailInput').addEventListener('keydown', function(e){ if(e.key==='Enter') go(); });
-    function go() {
-      var e = document.getElementById('emailInput').value.trim();
-      if (!e || !e.includes('@')) return;
-      localStorage.setItem('abk_admin_email', e);
-      // Tell the parent LibreChat page to cache this email in its own localStorage
-      try { window.parent.postMessage({ type: 'abk_admin_email', email: e }, '*'); } catch(ex) {}
-      var p = new URLSearchParams(location.search);
-      p.set('lc_email', e);
-      location.href = '/org-admin?' + p.toString();
-    }
-  </script>
 </body>
 </html>`;
 }
@@ -563,9 +577,9 @@ function buildResetPage(token: string): string {
   h2{font-size:18px;font-weight:600;margin:0 0 6px;color:#111;}
   p{font-size:13px;color:#6b7280;margin:0 0 20px;line-height:1.5}
   input{width:100%;padding:10px 14px;border:1px solid #e3e3e3;border-radius:9px;font-size:14px;margin-bottom:10px;box-sizing:border-box;outline:none;transition:border-color .15s ease,box-shadow .15s ease}
-  input:focus{border-color:#0066CC;box-shadow:0 0 0 3px rgba(0,102,204,.14);}
-  button{width:100%;padding:11px;background:#0066CC;color:#fff;border:none;border-radius:9px;font-size:14px;font-weight:500;cursor:pointer;transition:background .15s ease,box-shadow .15s ease}
-  button:hover{background:#0055b3;box-shadow:0 2px 10px rgba(0,102,204,.28);}
+  input:focus{border-color:#0071BC;box-shadow:0 0 0 3px rgba(0,102,204,.14);}
+  button{width:100%;padding:11px;background:#0071BC;color:#fff;border:none;border-radius:9px;font-size:14px;font-weight:500;cursor:pointer;transition:background .15s ease,box-shadow .15s ease}
+  button:hover{background:#005a96;box-shadow:0 2px 10px rgba(0,102,204,.28);}
   #msg{display:none;padding:10px 12px;border-radius:8px;font-size:13px;margin-bottom:12px;}
   img{height:36px;margin-bottom:20px;display:block;}
 </style></head>
@@ -590,7 +604,7 @@ function submit(){
     body:JSON.stringify({token:'${token}',newPassword:pw1})
   }).then(function(r){return r.json();}).then(function(d){
     if(d.success){
-      document.querySelector('.card').innerHTML='<img src="${SERVER_BASE_URL}/assets/abk-logo.png" alt="ABK" style="height:36px;margin-bottom:20px;display:block;"><h2 style="color:#0066CC">Password Updated!</h2><p>Your password has been changed. You can now <a href="${SERVER_BASE_URL.replace("agent365-bridge", "abkagent-backup").replace(/agent365.*/, "")}" style="color:#0066CC">log in</a>.</p>';
+      document.querySelector('.card').innerHTML='<img src="${SERVER_BASE_URL}/assets/abk-logo.png" alt="ABK" style="height:36px;margin-bottom:20px;display:block;"><h2 style="color:#0071BC">Password Updated!</h2><p>Your password has been changed. You can now <a href="${SERVER_BASE_URL.replace("agent365-bridge", "abkagent-backup").replace(/agent365.*/, "")}" style="color:#0071BC">log in</a>.</p>';
     } else { show(d.error||'Something went wrong.',true); }
   }).catch(function(){show('Connection error.',true);});
 }
@@ -627,9 +641,9 @@ async function sendResetEmail(toEmail: string, resetUrl: string, graphToken: str
             contentType: "HTML",
             content: `<div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:480px;margin:0 auto;padding:32px 24px;">
                 <img src="${SERVER_BASE_URL}/assets/abk-logo.png" height="36" style="margin-bottom:24px;display:block;">
-                <h2 style="color:#0066CC;font-size:20px;margin:0 0 12px;">Reset your password</h2>
+                <h2 style="color:#0071BC;font-size:20px;margin:0 0 12px;">Reset your password</h2>
                 <p style="color:#444;line-height:1.6;">We received a request to reset your <strong>ABK Assistant</strong> password. Click below to set a new password. This link expires in <strong>1 hour</strong>.</p>
-                <a href="${resetUrl}" style="display:inline-block;margin:24px 0;padding:12px 28px;background:#0066CC;color:#fff;text-decoration:none;border-radius:8px;font-weight:600;">Reset Password</a>
+                <a href="${resetUrl}" style="display:inline-block;margin:24px 0;padding:12px 28px;background:#0071BC;color:#fff;text-decoration:none;border-radius:8px;font-weight:600;">Reset Password</a>
                 <p style="color:#888;font-size:12px;">If you didn't request this, you can ignore this email.</p>
               </div>`,
           },
@@ -649,18 +663,99 @@ async function sendResetEmail(toEmail: string, resetUrl: string, graphToken: str
   }
 }
 
+async function sendInviteEmail(toEmail: string, graphToken: string): Promise<boolean> {
+  try {
+    const res = await fetch(`https://graph.microsoft.com/v1.0/users/${encodeURIComponent(PRIMARY_OWNER_EMAIL)}/sendMail`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${graphToken}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        message: {
+          subject: "You've been invited to ABK Assistant",
+          body: {
+            contentType: "HTML",
+            content: `<div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:480px;margin:0 auto;padding:32px 24px;">
+                <img src="${SERVER_BASE_URL}/assets/abk-logo.png" height="36" style="margin-bottom:24px;display:block;">
+                <h2 style="color:#0071BC;font-size:20px;margin:0 0 12px;">You're invited to ABK Assistant</h2>
+                <p style="color:#444;line-height:1.6;">An administrator has added you to ABK Assistant. Sign in with your ABK Microsoft 365 account to get started — no separate password needed.</p>
+                <a href="${LIBRECHAT_URL}/login" style="display:inline-block;margin:24px 0;padding:12px 28px;background:#0071BC;color:#fff;text-decoration:none;border-radius:8px;font-weight:600;">Sign in to ABK Assistant</a>
+                <p style="color:#888;font-size:12px;">If you weren't expecting this, you can ignore this email.</p>
+              </div>`,
+          },
+          toRecipients: [{ emailAddress: { address: toEmail } }],
+        },
+        saveToSentItems: false,
+      }),
+    });
+    if (!res.ok) {
+      log(`Graph sendMail (invite) failed: ${await res.text()}`);
+      return false;
+    }
+    return true;
+  } catch (e) {
+    log(`sendInviteEmail error: ${e}`);
+    return false;
+  }
+}
+
+// ── CORS (scoped to /org-admin only) ─────────────────────────────────────────
+//
+// mcp-proxy-server.ts applies a wildcard Access-Control-Allow-Origin to the
+// whole app (reasonable for the bearer-token MCP/OAuth routes it's meant
+// for). org-admin's routes carry real session tokens and password data, so
+// they get a real origin allowlist here instead, which — since it runs
+// after and re-sets the header — overrides that permissive default for
+// every /org-admin* route specifically.
+const ORG_ADMIN_ALLOWED_ORIGIN_RE = process.env.ORG_ADMIN_ALLOWED_ORIGINS
+  ? new RegExp(
+      "^(" +
+        process.env.ORG_ADMIN_ALLOWED_ORIGINS.split(",")
+          .map((s) => s.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+          .join("|") +
+        ")$"
+    )
+  // Azure Container Apps FQDNs have multiple dot-separated labels before the
+  // suffix (e.g. abkagent-backup.mangoriver-ca6f548b.swedencentral.
+  // azurecontainerapps.io) — the previous version of this regex only
+  // allowed a single label and silently rejected every real deployment,
+  // stripping the CORS header on legitimate cross-origin calls (patch.js's
+  // "Forgot password?" fetch) so the browser blocked reading the response
+  // even though the request succeeded server-side (misleading "Connection
+  // error" while the reset email/password change actually went through).
+  : /^https:\/\/[a-z0-9-]+(\.[a-z0-9-]+)*\.azurecontainerapps\.io$/i;
+
+function orgAdminCors(req: Request, res: Response, next: () => void): void {
+  const origin = req.headers.origin;
+  if (origin && ORG_ADMIN_ALLOWED_ORIGIN_RE.test(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+  } else {
+    res.removeHeader("Access-Control-Allow-Origin");
+  }
+  if (req.method === "OPTIONS") {
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, PATCH, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    res.sendStatus(204);
+    return;
+  }
+  next();
+}
+
 // ── Express endpoints ──────────────────────────────────────────────────────────
 
 export function registerOrgAdminEndpoints(app: Express): void {
+  app.use("/org-admin", orgAdminCors);
+
   app.get("/org-admin", async (req: Request, res: Response) => {
     res.removeHeader("X-Frame-Options");
     const embed = qstr(req.query.embed) === "1";
     const info = await resolveAuth(req);
     if (!info) {
       if (embed) {
-        const hadAttempt = !!(qstr(req.query.lc_email) || qstr(req.query.lc_token) || qstr(req.query.token));
-        res.setHeader("Content-Type", "text/html");
-        res.status(401).send(buildEmailPromptHtml(hadAttempt));
+        // No valid session yet — kick off org-admin's own SSO flow (silent
+        // first: if this browser already has an active Microsoft session
+        // from the LibreChat login just now, this resolves invisibly with
+        // no prompt at all). See /org-admin/api/sso/start.
+        res.redirect("/org-admin/api/sso/start?silent=1&embed=1");
       } else {
         res.status(401).send("Unauthorized. Open via ABK Assistant.");
       }
@@ -668,6 +763,135 @@ export function registerOrgAdminEndpoints(app: Express): void {
     }
     res.setHeader("Content-Type", "text/html");
     res.send(buildHtml(info.email, info.tier, embed));
+  });
+
+  // ── org-admin's own Microsoft SSO (separate origin from LibreChat, so it
+  // needs its own real, verifiable sign-in rather than trusting anything the
+  // parent page claims — see the comment above ORG_SSO_CLIENT_ID). ──────────
+
+  app.get("/org-admin/api/sso/start", (req: Request, res: Response) => {
+    if (!ORG_SSO_CLIENT_ID || !ORG_SSO_CLIENT_SECRET || !ORG_SSO_TENANT_ID) {
+      res.status(500).send(buildSsoErrorPage("SSO is not configured for Organization Settings yet."));
+      return;
+    }
+    const silent = qstr(req.query.silent) !== "0";
+    const embed = qstr(req.query.embed) === "1";
+    const verifier = base64url(crypto.randomBytes(32));
+    const challenge = base64url(crypto.createHash("sha256").update(verifier).digest());
+    const state = crypto.randomBytes(16).toString("hex");
+    const stateData: SsoStateData = { verifier, silent, embed };
+    res.cookie(ssoStateCookieName(state), JSON.stringify(stateData), {
+      httpOnly: true,
+      secure: true,
+      sameSite: "lax",
+      maxAge: 5 * 60 * 1000,
+      path: "/org-admin/api/sso",
+    });
+    const params = new URLSearchParams({
+      client_id: ORG_SSO_CLIENT_ID,
+      response_type: "code",
+      redirect_uri: ORG_SSO_REDIRECT_URI,
+      response_mode: "query",
+      scope: "openid profile email",
+      state,
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+    });
+    if (silent) params.set("prompt", "none");
+    res.redirect(`https://login.microsoftonline.com/${ORG_SSO_TENANT_ID}/oauth2/v2.0/authorize?${params.toString()}`);
+  });
+
+  app.get("/org-admin/api/sso/callback", async (req: Request, res: Response) => {
+    const state = qstr(req.query.state) ?? "";
+    const cookieName = ssoStateCookieName(state);
+    const raw = req.cookies?.[cookieName] as string | undefined;
+    res.clearCookie(cookieName, { path: "/org-admin/api/sso" });
+    let stateData: SsoStateData | null = null;
+    try {
+      stateData = raw ? (JSON.parse(raw) as SsoStateData) : null;
+    } catch {
+      stateData = null;
+    }
+
+    const error = qstr(req.query.error);
+    if (error || !stateData) {
+      // Silent attempts routinely "fail" this way when the browser has no
+      // active Microsoft session yet (interaction_required / login_required)
+      // — that's expected, not a real error, so fall through to a real
+      // interactive sign-in instead of showing the user anything.
+      if (stateData?.silent) {
+        res.redirect(`/org-admin/api/sso/start?silent=0&embed=${stateData.embed ? "1" : "0"}`);
+        return;
+      }
+      res.status(401).send(buildSsoErrorPage(qstr(req.query.error_description) || error || "Sign-in failed.", { retry: true }));
+      return;
+    }
+
+    const code = qstr(req.query.code);
+    if (!code) {
+      res.status(400).send(buildSsoErrorPage("Missing authorization code.", { retry: true }));
+      return;
+    }
+
+    try {
+      const tokenRes = await fetch(`https://login.microsoftonline.com/${ORG_SSO_TENANT_ID}/oauth2/v2.0/token`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          client_id: ORG_SSO_CLIENT_ID,
+          client_secret: ORG_SSO_CLIENT_SECRET,
+          grant_type: "authorization_code",
+          code,
+          redirect_uri: ORG_SSO_REDIRECT_URI,
+          code_verifier: stateData.verifier,
+        }),
+      });
+      if (!tokenRes.ok) {
+        log(`sso token exchange failed: ${await tokenRes.text()}`);
+        if (stateData.silent) {
+          res.redirect(`/org-admin/api/sso/start?silent=0&embed=${stateData.embed ? "1" : "0"}`);
+          return;
+        }
+        res.status(401).send(buildSsoErrorPage("Could not complete sign-in.", { retry: true }));
+        return;
+      }
+      const tokenData = (await tokenRes.json()) as { access_token?: string };
+      if (!tokenData.access_token) {
+        res.status(401).send(buildSsoErrorPage("Could not complete sign-in.", { retry: true }));
+        return;
+      }
+      const userinfoRes = await fetch("https://graph.microsoft.com/oidc/userinfo", {
+        headers: { Authorization: `Bearer ${tokenData.access_token}` },
+      });
+      if (!userinfoRes.ok) {
+        res.status(401).send(buildSsoErrorPage("Could not verify your identity.", { retry: true }));
+        return;
+      }
+      const profile = (await userinfoRes.json()) as { email?: string; preferred_username?: string };
+      const email = (profile.email || profile.preferred_username || "").toLowerCase().trim();
+      if (!email) {
+        res.status(401).send(buildSsoErrorPage("Microsoft did not return an email address.", { retry: true }));
+        return;
+      }
+      const user = await getLcUserByEmail(email);
+      if (!user) {
+        res.status(403).send(
+          buildSsoErrorPage(`${email} isn't set up in ABK Assistant yet. Ask an administrator to add you first.`)
+        );
+        return;
+      }
+      const tier = getTier(email, user.role, user.orgRole);
+      const token = signOrgSessionToken(email, tier);
+      log(`org-admin SSO login: ${email} (${tier}) [${stateData.silent ? "silent" : "interactive"}]`);
+      res.redirect(`/org-admin?embed=${stateData.embed ? "1" : "0"}&org_token=${encodeURIComponent(token)}`);
+    } catch (e) {
+      log(`/api/sso/callback error: ${e}`);
+      if (stateData?.silent) {
+        res.redirect(`/org-admin/api/sso/start?silent=0&embed=${stateData.embed ? "1" : "0"}`);
+        return;
+      }
+      res.status(500).send(buildSsoErrorPage("Server error during sign-in.", { retry: true }));
+    }
   });
 
   app.get("/org-admin/api/users", async (req: Request, res: Response) => {
@@ -696,14 +920,14 @@ export function registerOrgAdminEndpoints(app: Express): void {
       res.status(403).json({ error: "Forbidden" });
       return;
     }
-    const { name, email, password } = req.body ?? {};
-    if (!name || !email || !password) {
-      res.status(400).json({ error: "name, email, and password are required" });
+    const { email } = req.body ?? {};
+    if (!email) {
+      res.status(400).json({ error: "email is required" });
       return;
     }
     const normalizedEmail = String(email).toLowerCase().trim();
-    if (String(password).length < 8) {
-      res.status(400).json({ error: "Password must be at least 8 characters" });
+    if (!normalizedEmail.endsWith("@abk.gr")) {
+      res.status(400).json({ error: "Only @abk.gr email addresses are allowed" });
       return;
     }
     const db = await getDb();
@@ -717,22 +941,39 @@ export function registerOrgAdminEndpoints(app: Express): void {
       return;
     }
     try {
-      const hash = await bcrypt.hash(password, 10);
       const username = normalizedEmail.split("@")[0].replace(/[^a-zA-Z0-9_-]/g, "").toLowerCase();
+      // No password: this account is pre-approved for SSO only. LibreChat's
+      // openidStrategy matches by email + provider === "openid" and fills in
+      // openidId itself on the member's first real Microsoft sign-in.
       await db.collection("users").insertOne({
-        name,
+        name: username,
         username,
         email: normalizedEmail,
-        password: hash,
+        provider: "openid",
         role: "USER",
         orgRole: "USER",
-        provider: "local",
         emailVerified: true,
         createdAt: new Date(),
         updatedAt: new Date(),
         __v: 0,
       });
-      log(`${info.tier} ${info.email} created account for ${normalizedEmail}`);
+      log(`${info.tier} ${info.email} invited ${normalizedEmail}`);
+
+      void (async () => {
+        const adminSession = await getSessionTokenByEmail(PRIMARY_OWNER_EMAIL);
+        if (!adminSession) {
+          log(`Invite: no session for admin ${PRIMARY_OWNER_EMAIL}`);
+          return;
+        }
+        const gToken = await getGraphToken(adminSession);
+        if (!gToken) {
+          log(`Invite: no Graph token for ${PRIMARY_OWNER_EMAIL}`);
+          return;
+        }
+        const ok = await sendInviteEmail(normalizedEmail, gToken);
+        log(`Invite: email ${ok ? "sent" : "FAILED"} to ${normalizedEmail}`);
+      })();
+
       res.json({ success: true });
     } catch (e) {
       res.status(500).json({ error: String(e) });
@@ -813,44 +1054,15 @@ export function registerOrgAdminEndpoints(app: Express): void {
     }
   });
 
-  // Password reset — no auth required (user is locked out).
-  app.options("/org-admin/api/reset-password", (_req: Request, res: Response) => {
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-    res.sendStatus(204);
-  });
-
-  app.post("/org-admin/api/reset-password", async (req: Request, res: Response) => {
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    const { email, newPassword } = req.body ?? {};
-    if (!email || !newPassword) {
-      res.status(400).json({ error: "email and newPassword required" });
-      return;
-    }
-    if (String(newPassword).length < 8) {
-      res.status(400).json({ error: "Password must be at least 8 characters" });
-      return;
-    }
-    const user = await getLcUserByEmail(email);
-    if (!user) {
-      res.status(404).json({ error: "No account found with that email" });
-      return;
-    }
-    try {
-      const hash = await bcrypt.hash(newPassword, 10);
-      const db = await getDb();
-      await db!.collection("users").updateOne({ email }, { $set: { password: hash } });
-      log(`Password reset for ${email}`);
-      res.json({ success: true });
-    } catch (e) {
-      res.status(500).json({ error: String(e) });
-    }
-  });
-
   // ── Email-based forgot password flow ─────────────────────────────────────────
+  // (The unauthenticated raw POST /org-admin/api/reset-password endpoint that
+  // used to sit here — taking {email, newPassword} with zero proof of email
+  // ownership — has been removed. It was confirmed dead code: nothing in
+  // patch.js or elsewhere in this repo ever called it, and the flow below is
+  // the real one: forgot-password emails a random 32-byte token, and only
+  // reset-password-confirm, which verifies that token, may change a
+  // password.)
   app.post("/org-admin/api/forgot-password", async (req: Request, res: Response) => {
-    res.setHeader("Access-Control-Allow-Origin", "*");
     const { email } = req.body ?? {};
     if (!email || String(email).indexOf("@") === -1) {
       res.status(400).json({ error: "Valid email required" });
@@ -911,7 +1123,6 @@ export function registerOrgAdminEndpoints(app: Express): void {
   });
 
   app.post("/org-admin/api/reset-password-confirm", async (req: Request, res: Response) => {
-    res.setHeader("Access-Control-Allow-Origin", "*");
     const { token, newPassword } = req.body ?? {};
     if (!token || !newPassword || String(newPassword).length < 8) {
       res.status(400).json({ error: "Invalid request" });
@@ -932,18 +1143,6 @@ export function registerOrgAdminEndpoints(app: Express): void {
     await db.collection("passwordResetTokens").updateOne({ token }, { $set: { used: true } });
     log(`Password reset confirmed for ${record.email}`);
     res.json({ success: true });
-  });
-
-  // Lightweight endpoint: returns just the current user's tier (for patch.js auto-fetch)
-  app.get("/org-admin/api/my-tier", async (req: Request, res: Response) => {
-    res.removeHeader("X-Frame-Options");
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    const info = await resolveAuth(req);
-    if (!info) {
-      res.status(401).json({ error: "Unauthorized" });
-      return;
-    }
-    res.json({ tier: info.tier });
   });
 
   log("Org admin endpoints registered at /org-admin");
