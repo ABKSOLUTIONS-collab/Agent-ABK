@@ -29,6 +29,19 @@ const inject = `<!-- ABK_START -->
   /* Greeting icon hidden by JS */
   [data-abk-greet-icon-hidden="1"] { display: none !important; }
 
+  /* ── Sidebar restrictions ──────────────────────────────────────────
+     Prompts / Memories / Bookmarks / Attach Files: removed for everyone.
+     Agent Builder / Skills: hidden by default, unhidden by JS
+     (applyAdminOnlyVisibility) only once the signed-in user is confirmed
+     an org ADMIN/OWNER — CSS-first so there's no flash of a forbidden nav
+     item for plain USERs while the role check is still in flight. */
+  button[aria-label="Prompts"],
+  button[aria-label="Memories"],
+  button[aria-label="Bookmarks"],
+  button[aria-label="Attach Files"] { display: none !important; }
+  button[aria-label="Agent Builder"]:not([data-abk-admin-ok]),
+  button[aria-label="Skills"]:not([data-abk-admin-ok]) { display: none !important; }
+
   /* ══════════════════════════════════════════════════════════════
      ABK Solutions design tokens — mapped directly onto LibreChat's
      OWN CSS variables (html{} = light, .dark{} = dark), so every
@@ -458,35 +471,27 @@ if ('serviceWorker' in navigator) {
     });
   }
 
-  // 6. Rename "Admin Settings" → "Organization Settings" in the sidebar
-  function renameAdminLink() {
+  // 6. LibreChat renders its OWN native "Admin Settings" button at the
+  // bottom of every sidebar sub-panel (Memories, MCP Settings, etc.) for
+  // native-role ADMIN users — completely separate from, and not gated the
+  // same way as, our own Organization Settings rail icon below. An earlier
+  // version of this patch renamed its text to "Organization Settings",
+  // which just produced a confusing SECOND (ungated) entry point into the
+  // feature, appearing at the bottom of whichever panel happens to be open.
+  // Hide it outright everywhere instead — the rail icon (6b) is the only
+  // supported entry point now.
+  function hideNativeAdminLink() {
     var els = document.querySelectorAll('a, button, li, [role="menuitem"]');
     for (var i = 0; i < els.length; i++) {
       var el = els[i];
-      if ((el.innerText || '').trim() === 'Admin Settings' && !el.dataset.abkRenamed) {
-        el.dataset.abkRenamed = '1';
-        var walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null, false);
-        var node;
-        while ((node = walker.nextNode())) {
-          if (node.textContent.trim() === 'Admin Settings') {
-            node.textContent = node.textContent.replace('Admin Settings', 'Organization Settings');
-            break;
-          }
-        }
+      if ((el.innerText || '').trim() === 'Admin Settings' && !el.dataset.abkHiddenNative) {
+        el.dataset.abkHiddenNative = '1';
+        el.style.display = 'none';
       }
     }
   }
 
   // 6b. Add an "Organization Settings" icon to the same rail as "Skills".
-  //
-  // Earlier versions of this found LibreChat's OWN native "Admin Settings"
-  // nav item (by matching its text) and converted/relocated it. That item
-  // no longer exists in the current LibreChat build (its admin/RBAC UI has
-  // moved on) — searching for it just silently found nothing forever, which
-  // is why Organization Settings quietly vanished from the app with no
-  // error. Inject directly next to "Skills" instead, with our own icon,
-  // so this doesn't depend on a LibreChat-internal element that can drift
-  // out from under us again.
   var ORG_RAIL_ICON_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:20px;height:20px"><path d="M3 21h18"/><path d="M6 21V8l6-4 6 4v13"/><path d="M10 21v-6h4v6"/><path d="M9 11h.01M15 11h.01M9 15h.01M15 15h.01"/></svg>';
 
   // Gate the rail icon on the user actually being an org ADMIN/OWNER.
@@ -516,9 +521,41 @@ if ('serviceWorker' in navigator) {
       .then(function(r) { return r.ok ? r.json() : null; })
       .then(function(d) {
         abkIsOrgAdmin = !!(d && d.user && d.user.role === 'ADMIN');
-        if (abkIsOrgAdmin) moveOrgSettingsToRail();
+        if (abkIsOrgAdmin) { moveOrgSettingsToRail(); applyAdminOnlyVisibility(); }
       })
       .catch(function() {});
+  }
+
+  // "Agent Builder" and "Skills" are hidden by default via CSS
+  // ([data-abk-admin-ok] gate, see the injected <style>) until we know the
+  // signed-in user is an org ADMIN/OWNER — same reasoning as the
+  // Organization Settings rail icon above: a plain USER should never see
+  // these entry points at all.
+  function applyAdminOnlyVisibility() {
+    if (abkIsOrgAdmin !== true) return;
+    document.querySelectorAll('button[aria-label="Agent Builder"], button[aria-label="Skills"]').forEach(function(b) {
+      b.setAttribute('data-abk-admin-ok', '1');
+    });
+  }
+
+  // Nobody — not even an org ADMIN/OWNER — should be able to revoke/delete
+  // the pre-configured "Agent365 Bridge" MCP connector from the sidebar;
+  // it's shared org infrastructure, not a personal connector. Only hide the
+  // destructive action on THAT specific row (identified by its own text),
+  // so users can still add/remove their own custom MCP servers normally.
+  function hideAgent365BridgeRevoke() {
+    document.querySelectorAll('[aria-label="Revoke"]').forEach(function(el) {
+      if (el.dataset.abkChecked) return;
+      var cur = el, isBridgeRow = false;
+      for (var d = 0; d < 6 && cur; d++) {
+        if (cur.textContent && cur.textContent.indexOf('Agent365 Bridge') !== -1) { isBridgeRow = true; break; }
+        cur = cur.parentElement;
+      }
+      if (isBridgeRow) {
+        el.dataset.abkChecked = '1';
+        el.style.display = 'none';
+      }
+    });
   }
 
   function moveOrgSettingsToRail() {
@@ -596,34 +633,6 @@ if ('serviceWorker' in navigator) {
     }).observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
   }
 
-  // Install ONE document-level capture listener — fires before React's root handler.
-  // React (v17+) delegates events to div#root, so document capture = before React.
-  var abkAdminInterceptorInstalled = false;
-  function patchAdminLink() {
-    if (abkAdminInterceptorInstalled) return;
-    // Only install once the element actually exists in the DOM
-    var found = false;
-    var els = document.querySelectorAll('a, button, [role="menuitem"]');
-    for (var i = 0; i < els.length; i++) {
-      if ((els[i].innerText || '').trim() === 'Admin Settings') { found = true; break; }
-    }
-    if (!found) return;
-
-    abkAdminInterceptorInstalled = true;
-    document.addEventListener('click', function(e) {
-      var el = e.target;
-      for (var i = 0; i < 5 && el && el !== document.body; i++, el = el.parentElement) {
-        var txt = (el.innerText || '').trim();
-        if (txt === 'Admin Settings' || txt === 'Organization Settings') {
-          e.preventDefault();
-          e.stopPropagation();
-          e.stopImmediatePropagation();
-          openOrgAdmin();
-          return;
-        }
-      }
-    }, true);
-  }
 
   // 7. Block registration for non-@abk.gr emails.
   // Disables the submit button in real-time as the user types.
@@ -926,9 +935,10 @@ if ('serviceWorker' in navigator) {
     try { patchForgotPassword(); } catch(e) {}
     try { hideOrDivider(); } catch(e) {}
     try { hideSignUp(); } catch(e) {}
-    try { patchAdminLink(); } catch(e) {}
-    try { renameAdminLink(); } catch(e) {}
+    try { hideNativeAdminLink(); } catch(e) {}
     try { moveOrgSettingsToRail(); } catch(e) {}
+    try { applyAdminOnlyVisibility(); } catch(e) {}
+    try { hideAgent365BridgeRevoke(); } catch(e) {}
     try { injectConnectorsTab(); } catch(e) {}
     try { hideConnectorsPanelIfClickedElsewhere(); } catch(e) {}
     try { patchGreeting(); } catch(e) {}
