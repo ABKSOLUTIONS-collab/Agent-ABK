@@ -1,439 +1,210 @@
-# Agent 365 Bridge for Claude Code
+# Agent 365 Bridge (ABK)
 
-Connect **Claude Code** to **Microsoft Agent 365 MCP servers** — giving Claude direct access to Outlook Mail, Calendar, Word, Excel, PowerPoint, Teams, SharePoint, OneDrive, Copilot Search, Knowledge, and User Profile data through the enterprise-grade MCP tooling gateway.
+A multi-tenant **HTTP MCP server** that gives Claude, ChatGPT, LibreChat, and other MCP-capable clients access to Microsoft 365 (Outlook Mail, Calendar, Word, Excel, Teams, SharePoint/OneDrive, Knowledge search, OCR) on behalf of a signed-in ABK user — plus a small org-admin console for managing who has access.
 
-## Architecture
-
-```
-┌─────────────┐      stdio       ┌──────────────────┐     HTTPS + Auth     ┌─────────────────────────┐
-│ Claude Code  │ ◄──────────────► │  MCP Proxy Bridge │ ◄──────────────────► │  Agent 365 MCP Servers  │
-│ (CLI / IDE)  │   MCP protocol   │  (this project)   │   StreamableHTTP    │  (Mail, Calendar, Word, │
-└─────────────┘                  └──────────────────┘                      │   Teams, SharePoint...) │
-                                                                           └─────────────────────────┘
-```
-
-The bridge runs as a **local stdio MCP server** that Claude Code connects to. When Claude calls a tool (e.g. `createMessage`, `getEvents`), the bridge authenticates with Azure Entra ID using **delegated permissions** and forwards the call to the appropriate Agent 365 MCP server — acting on behalf of the signed-in user.
-
-### Two-Layer Disk Caching
-
-Claude Desktop enforces a **5-second timeout** on `tools/list` requests. Since discovering 14 Agent 365 servers takes ~20 seconds, the bridge uses a two-layer caching strategy to serve tools instantly:
-
-```mermaid
-sequenceDiagram
-    participant User
-    participant Login as npm run login
-    participant Disk as ~/.agent365-bridge/
-    participant Bridge as Bridge Process
-    participant Claude as Claude Desktop
-
-    Note over User,Login: One-time setup
-    User->>Login: npm run login
-    Login->>Login: Device code auth
-    Login->>Disk: auth-record.json
-    Login->>Login: Discover 14 servers (56 tools)
-    Login->>Disk: tools-cache.json
-
-    Note over Bridge,Claude: Every subsequent launch
-    Claude->>Bridge: initialize
-    Bridge->>Disk: Load tools-cache.json
-    Bridge-->>Claude: initialize response
-    Claude->>Bridge: tools/list
-    Bridge-->>Claude: 56 tools (instant, <1ms)
-    Note over Bridge: Discovery runs in background (~20s)
-    Claude->>Bridge: tools/call SearchMessages
-    Note over Bridge: Waits for live discovery if needed
-    Bridge-->>Claude: Email results
-```
-
-### Compatibility Layer
-
-The bridge automatically fixes common MCP compatibility issues:
-1. **Schema Sanitization**: Strips `oneOf`, `allOf`, and `anyOf` from tool schemas (which Anthropic API rejects), merging properties where possible.
-2. **Name Deduplication**: Detects tools with identical names across different servers (e.g. `GetDocumentContent` in both Word and Excel) and automatically namespaces them (e.g. `GetDocumentContent_Word`) to prevent collisions.
-
-## Why this project exists?
-
-While Microsoft provides a rich set of tools for building and managing AI agents, there is currently a "protocol gap" for 3rd-party coding agents like Claude Code:
-
-1. **Protocol Translation**: Claude Code and most local IDEs speak the **stdio** dialect of the Model Context Protocol (MCP). However, the **Agent 365 Tooling Gateway** (the enterprise cloud back-end) speaks **StreamableHTTP**. This project acts as the necessary protocol translator.
-2. **Access to the "Synthetic Workforce"**: Agent 365 is designed to be the control plane for a new generation of autonomous agents. This bridge allows Claude to tap into that same infrastructure, giving a 3rd-party LLM the same enterprise-governed tools used by Microsoft's first-party agents.
-3. **Action over Search**: Unlike pure semantic search tools (like WorkIQ), this bridge focuses on **deterministic actions**. It exposes the granular Tooling Servers for Mail, Excel, Word, and Teams, allowing Claude to manipulate data, not just find it.
-4. **Developer-First Auth**: It simplifies the complex "Frontier Preview" and "StreamableHTTP" authentication handshake into a standard MCP sign-in flow that just works.
+> **This document reflects the code as of 2026-07-30.** The project has evolved substantially from its original design (a local stdio bridge with device-code sign-in); it is now a hosted, multi-tenant OAuth server. If you find a mismatch between this README and the code, trust the code and update this file.
 
 ## Status
 
-✅ **Production-tested and working** — Successfully authenticated and discovered 20+ tools from Microsoft Agent 365 MCP servers (Mail, Excel, Knowledge, and more confirmed).
+✅ Deployed and in active use at ABK as an Azure Container App, serving per-user Microsoft 365 access to Claude/ChatGPT custom connectors and to a branded internal LibreChat instance (see [LibreChat integration](#librechat-integration) below).
 
-## Prerequisites
+⚠️ Some parts of this repo are **not wired into the running server** — see [Known issues / dead code](#known-issues--dead-code) before you spend time on them.
+
+---
+
+## What this actually is
+
+This is **not** a local stdio process that Claude Code launches per-session. It is a standalone **Express HTTP server** (`src/index.ts` → `McpProxyServer`, `src/proxy/mcp-proxy-server.ts`) that:
+
+1. Acts as an **OAuth 2.0 authorization server** for MCP clients (Claude.ai/ChatGPT-style dynamic client registration + authorization-code flow), so each human user signs in with their own Microsoft 365 account once and gets a permanent personal MCP URL.
+2. Serves the actual **MCP protocol** (`/mcp`) over both modern StreamableHTTP and legacy SSE transports, per-request, per-user — it is stateless, keyed by a bearer session token.
+3. For most tools, calls the **Microsoft Graph API directly** with the signed-in user's delegated token (no Agent 365 / Copilot license required). For everything else, it proxies live to the **Agent 365 Tooling Gateway** using the same per-user token.
+4. Hosts a small **org-admin console** (`/org-admin`) for inviting/removing ABK users and managing roles — designed to be embedded (iframed) inside the internal LibreChat deployment and sharing LibreChat's own MongoDB user collection.
+
+```mermaid
+flowchart LR
+    subgraph Clients
+        A[Claude.ai / ChatGPT<br/>custom connector]
+        B[LibreChat<br/>(ABK-branded, separate app)]
+    end
+    subgraph Bridge["agent365-bridge (this repo)"]
+        L["/login /authorize /callback /token<br/>(OAuth server)"]
+        M["/mcp (StreamableHTTP + SSE)"]
+        O["/org-admin<br/>(member management console)"]
+    end
+    G[Microsoft Graph API]
+    P[Agent 365 Tooling Gateway]
+    D[(Azure Table Storage<br/>per-user tokens)]
+    N[(MongoDB<br/>LibreChat users)]
+
+    A -- Microsoft sign-in --> L
+    A -- tool calls --> M
+    B -. iframes .-> O
+    L --> D
+    M --> D
+    M -- hardcoded Graph tools --> G
+    M -- everything else --> P
+    O --> N
+```
+
+---
+
+## Auth: how a user actually connects
+
+The only **live** auth path is per-user Microsoft OAuth (delegated permissions). Everything else described in older versions of this README (device code, client credentials, on-behalf-of, bearer/mock modes) exists as leftover code from an earlier design but is **not reachable from the running server** — see [Known issues](#known-issues--dead-code).
+
+1. User opens `GET /login` (or `/authorize`, used by MCP clients doing dynamic registration) in a browser → redirected to Microsoft sign-in.
+2. `GET /callback` (`src/auth/oauth-handler.ts`) exchanges the code for:
+   - a token scoped to the Agent 365 gateway (`MCP_PLATFORM_AUTHENTICATION_SCOPE`), and
+   - a second Graph token (via the refresh token) with `Files.ReadWrite.All`, `Sites.ReadWrite.All`, `Mail.ReadWrite`, `offline_access`.
+3. Both tokens, the refresh token, and the user's email are stored in **Azure Table Storage** (table `agent365tokens`), keyed by a permanent random `sessionToken`. Tokens are silently refreshed 5 minutes before expiry; rows are never deleted (sessions don't expire).
+4. The user is handed a personal URL — `https://<host>/mcp?token=<sessionToken>` — to paste into Claude.ai / ChatGPT / another MCP client as a custom connector, or the MCP client completes the OAuth dance itself via `/register` + `/authorize` + `/token`.
+
+Separately, `src/auth/app-store.ts` + `src/auth/app-auth.ts` implement an **unrelated** email/password admin-account system (bcrypt, JWT cookie) for the not-currently-wired `web/` admin panel — see below. It has nothing to do with the Microsoft 365 sign-in above.
+
+---
+
+## Tool surface: hardcoded Graph calls + live Agent 365 proxy
+
+For history/licensing reasons, most day-to-day tools now call Microsoft Graph **directly** with the user's delegated token, bypassing the Agent 365 gateway (and its Copilot licensing requirement) entirely. Everything not in this hardcoded list still proxies live to Agent 365's MCP servers using the user's token.
+
+| Area | File | Tools |
+|---|---|---|
+| Mail | `src/tools/email-graph-tools.ts` | `SearchMessages`, `GetMessage`, `CreateDraftMessage`, `UpdateDraft`, `DeleteMessage`, `UpdateMessage`, `FlagEmail`, `Reply(All)ToMessage`(+`WithFullThread`), `Forward(WithFullThread)Message`, `Get/DownloadAttachments`, `Upload(Large)Attachment`, `AddDraftAttachments`, `DeleteAttachment`, `SendDraftMessage`, `SendEmailWithAttachments` |
+| Calendar | `src/tools/calendar-graph-tools.ts` | `List/ListCalendarView`, `Create/Update/DeleteEvent(ById)`, `Accept/Decline/TentativelyAcceptEvent`, `CancelEvent`, `ForwardEvent`, `FindMeetingTimes`, `GetRooms`, `GetUserDateAndTimeZoneSettings` |
+| Word | `src/tools/word-graph-tools.ts` | `CreateDocument`, `GetDocumentContent_mcp_WordServer`, `AddComment`, `ReplyToComment_mcp_WordServer` |
+| Excel | `src/tools/excel-graph-tools.ts` | `CreateWorkbook`, `GetDocumentContent_mcp_ExcelServer`, `CreateComment`, `ReplyToComment_mcp_ExcelServer` |
+| Teams meetings | `src/tools/teams-graph-tools.ts` | `GetOnlineMeetingTranscripts`, `GetOnlineMeetingAttendanceReports`, `GetOnlineMeetingAiInsights` |
+| SharePoint / OneDrive | `src/tools/sharepoint-tools.ts` | `create_sharepoint_folder`, `list_sharepoint_folder`, `upload_file_to_sharepoint`, `move_sharepoint_file`, `delete_sharepoint_file`, `create_onedrive_folder`, `upload_file_to_onedrive` |
+| Knowledge | `src/tools/knowledge-graph-tools.ts` | `query/configure/delete/ingest/retrieve_federated_knowledge` |
+| OCR | `src/tools/ocr-tool.ts` | `ocr_search_and_read` (Azure Document Intelligence over SharePoint/OneDrive files) |
+| Signature | `src/tools/signature-style-tool.ts` | `GetUserEmailSignatureStyle` / `SetMyEmailSignature` (stored on the user's OneDrive as `Agent365-Bridge/signature.txt`) |
+
+**Everything else** — Teams chat/channels, SharePoint Lists, PowerPoint, Dataverse, user-profile ("Me"), Copilot/Agent Directory search — comes from live discovery of the 14 servers in [`ToolingManifest.json`](ToolingManifest.json) via `src/discovery/server-discovery.ts` and `src/proxy/tool-forwarder.ts`, using the signed-in user's own Agent 365 token (25-minute per-user discovery cache).
+
+### Email signature + inline logo
+
+`CreateDraftMessage`, `SendDraftMessage`, and `SendEmailWithAttachments` are intercepted centrally in `mcp-proxy-server.ts` before reaching their handlers: the call is **rejected** if the user hasn't saved a signature yet, otherwise the signature HTML is appended and the ABK logo (`assets/abk-logo-email.png`) is attached inline via `contentId` so Outlook renders it correctly instead of as a regular attachment.
+
+---
+
+## Org-admin console (`/org-admin`)
+
+`src/admin/org-admin.ts` is the **only admin surface actually running in production**. It is built to be embedded as an iframe inside the ABK LibreChat deployment and shares LibreChat's own MongoDB `users` collection (`MONGO_URI`). It provides:
+
+- Its own Microsoft SSO (`/org-admin/api/sso/start` / `/callback`) — independent of the parent LibreChat session.
+- `GET/POST/DELETE/PATCH /org-admin/api/users` — invite (`@abk.gr` only), remove, promote/demote (`OWNER`/`ADMIN`/`USER`), revoke a user's stored Microsoft 365 token.
+- Full password-reset flow for LibreChat's own passwordless-invite accounts, emailed via app-only Graph send.
+- `postMessage`s the current user's role/session back to the parent LibreChat window (`abk_org_session` / `abk_org_role`).
+
+## LibreChat integration
+
+LibreChat integration is real but **lives partly outside this branch**:
+
+- In this repo (`main`): `org-admin.ts` is written directly against LibreChat's MongoDB schema and reads `LIBRECHAT_URL` to build sign-in links — it assumes it's running alongside a LibreChat instance.
+- The **`librechat` branch** of this same repo is a *separate application*: an ABK-branded fork of Microsoft's official LibreChat image (`Dockerfile: FROM agent365registry.azurecr.io/librechat:latest`), patched at build time (`patch.js`) to inject ABK branding/colors and restrict registration to `abk.gr` (`librechat.yaml`). It shares no source files with `main` — it's deployed as its own container, and the bridge (`agent365-bridge`) is registered as an MCP connector *inside* that LibreChat instance, with `/org-admin` iframed into its admin UI.
+
+If you're working across both apps, check out `origin/librechat` separately — it won't appear when browsing `main`.
+
+---
+
+## Setup & deployment
+
+### Prerequisites
 
 | Requirement | Purpose |
-|-------------|---------|
-| **Node.js ≥ 18** | Runtime |
-| **Claude Code CLI** | MCP client |
-| **Frontier Preview** | Required for Agent 365 access ([enroll here](https://adoption.microsoft.com/copilot/frontier-program/)) |
-| **Azure AD App Registration** | Authentication (see setup guide below) |
-| **A365 CLI** (optional) | Agent registration & mock server — requires [.NET 8+](https://dotnet.microsoft.com/download) |
+|---|---|
+| Node.js ≥ 18 | Runtime |
+| Azure AD App Registration | OAuth (delegated permissions) |
+| Azure Storage Account | Per-user token storage (Table Storage) + tools-cache (Blob Storage) |
+| Azure Document Intelligence resource | `ocr_search_and_read` tool |
+| MongoDB (LibreChat's DB) | `/org-admin` console only |
+| Docker + Azure CLI (`az`) | Building/deploying via `deploy.sh` |
 
----
+### Azure AD App Registration
 
-## Setup Guide
+1. **Entra ID → App registrations → New registration**, single-tenant, no redirect URI needed at creation (add `https://<host>/callback` and `https://<host>/org-admin/api/sso/callback` under **Authentication → Web** afterwards).
+2. **Certificates & secrets** → new client secret → `AZURE_CLIENT_SECRET`.
+3. **API permissions** → add delegated Microsoft Graph scopes: `Mail.ReadWrite`, `Files.ReadWrite.All`, `Sites.ReadWrite.All`, `offline_access`, `openid`, `profile`, `email` — plus the Agent 365 gateway scope (`McpServers.*.All`, see the table in the original setup notes below) for whichever Agent 365 servers you want proxied.
+4. **Authentication** → enable the redirect URIs above; public client flows are **not** required (this is a confidential client using authorization code + client secret, not device code).
+5. Grant admin consent.
 
-### Step 1: Install & Build
+### Environment variables
+
+| Variable | Required for | Notes |
+|---|---|---|
+| `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` | Core OAuth | From the app registration |
+| `AZURE_STORAGE_ACCOUNT`, `AZURE_STORAGE_KEY` | Per-user tokens, tools cache, app-store tables | **Without these, `/callback` throws the moment a user tries to sign in.** |
+| `TOKEN_TABLE_NAME` | optional | Defaults to `agent365tokens` |
+| `MCP_PLATFORM_ENDPOINT`, `MCP_PLATFORM_AUTHENTICATION_SCOPE` | Agent 365 gateway proxying | Defaults point at the production gateway |
+| `AGENTIC_APP_ID` | optional | Only for gateway-based server discovery |
+| `SERVER_BASE_URL` | OAuth redirect construction | Must match the deployed public URL |
+| `AZURE_DI_ENDPOINT`, `AZURE_DI_KEY` | `ocr_search_and_read` tool | Azure Document Intelligence resource |
+| `MONGO_URI` | `/org-admin` console | LibreChat's MongoDB connection string |
+| `LIBRECHAT_URL` | `/org-admin` invite emails | Public URL of the LibreChat instance |
+| `PRIMARY_OWNER_EMAIL` | `/org-admin` | Email pinned as the un-demotable `OWNER` |
+| `ORG_SSO_CLIENT_ID`, `ORG_SSO_CLIENT_SECRET` | `/org-admin` SSO | Can reuse the same app registration |
+| `ORG_ADMIN_ALLOWED_ORIGINS` | `/org-admin` CORS | Comma-separated origins allowed to iframe/call it |
+| `JWT_SECRET` | `web/` admin panel session cookies | Only relevant if you re-wire `admin-routes.ts`/`auth-routes.ts` (currently dead — see below) |
+| `PORT` | optional | Defaults to `3000` |
+| `NODE_ENV` | | `production` in deployment |
+
+`AUTH_MODE`, `BEARER_TOKEN`, and `MCP_API_KEY` are read/required by legacy scripts or `deploy.sh` but **not consumed by the running server** — see [Known issues](#known-issues--dead-code).
+
+### Run locally
 
 ```bash
-git clone https://github.com/ITSpecialist111/Agent365-Bridge.git
-cd Agent365-Bridge
 npm install
 npm run build
+npm run dev      # or: npm start (after build)
 ```
 
----
+The server listens on `http://localhost:3000`; visit `/login` to test the OAuth flow, `/health` for a status check.
 
-### Step 2: Create an Azure AD App Registration
+### Deploy (Azure Container Apps)
 
-You need an Azure AD app registration to authenticate with the Agent 365 platform. Follow these steps in the [Azure Portal](https://portal.azure.com):
-
-#### 2a. Register the application
-
-1. Navigate to **Microsoft Entra ID** → **App registrations** → **New registration**
-2. Fill in the details:
-   - **Name**: `Agent365-Claude-Bridge` (or any name you prefer)
-   - **Supported account types**: _"Accounts in this organizational directory only"_ (Single tenant)
-   - **Redirect URI**: Leave blank
-3. Click **Register**
-
-#### 2b. Collect the required details
-
-From the app registration **Overview** page, copy these two values:
-
-| Field | Where to find it | `.env` variable |
-|-------|-------------------|-----------------|
-| **Directory (tenant) ID** | Overview page, top section | `AZURE_TENANT_ID` |
-| **Application (client) ID** | Overview page, top section | `AZURE_CLIENT_ID` |
-
-#### 2c. Create a client secret _(optional — server deployment only)_
-
-> **Note:** If you're only using Claude Code / Claude Desktop with the default **Device Code** sign-in flow, you can **skip this step entirely**. The Device Code flow is a public client flow and does not require a client secret.
->
-> A client secret is only needed if you plan to:
-> - Deploy the bridge as an **HTTP server** with On-Behalf-Of (OBO) auth (`AUTH_MODE=obo`)
-> - Use **Application permissions** with Client Credentials (`AUTH_MODE=client_credentials`)
-
-1. Go to **Certificates & secrets** (left sidebar)
-2. Click **New client secret**
-3. Enter a description (e.g. `Agent365 Bridge`) and choose an expiry period
-4. Click **Add**
-5. **Copy the "Value" immediately** — this is your `AZURE_CLIENT_SECRET`
-
-> ⚠️ The secret value is only shown once. If you lose it, you'll need to create a new one.
-
-#### 2d. Add API Permissions
-
-1. Go to **API permissions** (left sidebar)
-2. Click **Add a permission** → **APIs my organization uses**
-3. Search for **Agent 365 Tools** (or the app ID `ea9ffc3e-8a23-4a7d-836d-234d7c7565c1`)
-4. Select **Delegated permissions** and add the scopes you need:
-
-| Permission | Description |
-|------------|-------------|
-| `McpServers.Calendar.All` | Calendar MCP Server |
-| `McpServers.CopilotMCP.All` | Copilot MCP Server |
-| `McpServers.DASearch.All` | M365 Copilot Agent Directory |
-| `McpServers.Dataverse.All` | Dataverse MCP Server |
-| `McpServers.Excel.All` | Excel MCP Server |
-| `McpServers.Files.All` | ODSP Files Tool MCP Server |
-| `McpServers.Knowledge.All` | Knowledge MCP Server |
-| `McpServers.Mail.All` | Mail MCP Server |
-| `McpServers.Me.All` | Me MCP Server (User Profile) |
-| `McpServers.OneDriveSharePoint.All` | OneDrive & SharePoint MCP Server |
-| `McpServers.PowerPoint.All` | PowerPoint MCP Server |
-| `McpServers.SharepointLists.All` | SharePoint Lists MCP Server |
-| `McpServers.Teams.All` | Teams MCP Server |
-| `McpServers.Word.All` | Word MCP Server |
-
-5. Click **Grant admin consent for [your organization]** (blue button at the top)
-6. Verify that each permission shows a green ✅ checkmark under **Status**
-
-#### 2e. Enable public client flows
-
-This is **required** for the device code sign-in flow:
-
-1. Go to **Authentication** (left sidebar)
-2. Scroll to **Advanced settings** at the bottom
-3. Set **"Allow public client flows"** to **Yes**
-4. Click **Save**
-
----
-
-### Step 3: Configure the `.env` file
-
-Create a `.env` file in the project root with your credentials:
-
-```env
-# Azure Entra ID Authentication
-AZURE_TENANT_ID=your-directory-tenant-id
-AZURE_CLIENT_ID=your-application-client-id
-
-# Client secret — only needed for OBO (server) or client_credentials mode.
-# For the default Device Code flow (Claude Code / Claude Desktop), leave this blank or omit it.
-# AZURE_CLIENT_SECRET=your-client-secret-value
-
-# Agent 365 Configuration
-MCP_PLATFORM_ENDPOINT=https://agent365.svc.cloud.microsoft
-MCP_PLATFORM_AUTHENTICATION_SCOPE=ea9ffc3e-8a23-4a7d-836d-234d7c7565c1/.default
-
-# Runtime
-NODE_ENV=development
-```
-
----
-
-### Step 4: Sign In (One-Time)
-
-Sign in to Microsoft 365 and cache your credentials:
+`deploy.sh` is the real, current deployment path: builds and pushes the image to ACR (`Agent365Registry`), provisions/reuses the `abkagent365storage` Storage Account, and creates/updates the `agent365-bridge` Container App (resource group `ABKAgent365`) with HTTP ingress on port 3000. It sets the core OAuth + storage + Document Intelligence env vars — **it does not set `MONGO_URI`, `JWT_SECRET`, `ORG_SSO_*`, `LIBRECHAT_URL`, or `PRIMARY_OWNER_EMAIL`**, so those must be maintained separately (Container App secrets/portal) if `/org-admin` is to keep working after a redeploy.
 
 ```bash
-npm run login
+export AZURE_TENANT_ID=... AZURE_CLIENT_ID=... AZURE_CLIENT_SECRET=...
+export MCP_API_KEY=... AZURE_DI_ENDPOINT=... AZURE_DI_KEY=...
+./deploy.sh
 ```
 
-You'll be prompted to visit a URL, then tools will be discovered and cached:
-
-```
-Agent 365 Bridge — Sign In & Setup
-
-Step 1: Sign in to Microsoft 365
-[agent365-bridge] SIGN IN REQUIRED
-[agent365-bridge] Go to: https://microsoft.com/devicelogin
-[agent365-bridge] Enter code: XXXXXXXX
-
-✅ Authentication successful!
-   Credentials cached at: ~/.agent365-bridge/auth-record.json
-
-Step 2: Discovering Agent 365 MCP servers...
-
-✅ Discovered 56 tools across 14 servers
-
-🎉 Setup complete!
-   Claude Desktop will now load all tools instantly.
-```
-
-**To complete sign-in:**
-
-1. Open [https://microsoft.com/devicelogin](https://microsoft.com/devicelogin) in your browser
-2. Enter the code shown in the terminal
-3. Sign in with your **Microsoft 365 account**
-4. Wait for tool discovery to complete (~20 seconds)
-
-> **Note:** This only needs to be done once. Both credentials and the tool list are cached to disk. Tokens refresh automatically on subsequent launches. Run `npm run logout` to clear cached credentials.
+`Dockerfile` builds only the Node backend (`dist/`) — the `web/` React app is not part of the image.
 
 ---
 
-### Step 5: Register with Claude Code / Claude Desktop
+## npm scripts
 
-For **Claude Code** (CLI):
+| Script | Status | Notes |
+|---|---|---|
+| `npm run build` | ✅ live | `tsc` |
+| `npm run dev` | ✅ live | `ts-node src/index.ts` — runs the real server |
+| `npm run start` | ✅ live | `node dist/index.js` — what the container runs |
+| `npm run clean` | ✅ live | `rimraf dist` |
+| `npm run setup` | ⚠️ stale | Interactive wizard for the old A365-CLI/device-code flow; not applicable to the OAuth server |
+| `npm run login` / `npm run logout` | ⚠️ stale | Old device-code login writing to `~/.agent365-bridge/`; unrelated to the live per-user Table Storage tokens |
+| `npm run register` | ❌ broken for this architecture | Registers the bridge with Claude Code CLI as a **stdio** server (`claude mcp add --transport stdio ...`), but `dist/index.js` is now an HTTP server that never speaks stdio JSON-RPC. Don't use this — add the bridge as a custom HTTP/OAuth connector instead. |
+| `npm run mock` | ⚠️ stale | Built for the old manifest-discovery flow |
+| `npm run test:e2e` | ❌ broken | Spawns `dist/index.js` over stdio and expects an MCP handshake; fails immediately against the current HTTP server |
 
-```bash
-npm run register
-```
-
-This registers the bridge as a global MCP server in Claude Code. After this, Agent 365 tools are available in **any** Claude Code session.
-
-For **Claude Desktop**, add the bridge to your config file (`%APPDATA%\Claude\claude_desktop_config.json`):
-
-```json
-{
-  "mcpServers": {
-    "agent365-bridge": {
-      "command": "node",
-      "args": ["C:/path/to/your/Agent365/dist/index.js"]
-    }
-  }
-}
-```
+`web/` (`npm run dev` / `build` / `lint` / `preview`) all work in isolation, but nothing in the deployed server currently serves this frontend — see below.
 
 ---
 
-### Step 6: Use Claude Code
+## Known issues / dead code
 
-Open Claude Code — Agent 365 tools will appear automatically. Try:
-
-```
-> Search my Outlook inbox for emails about the Q4 report
-> Create a new Word document summarizing the project status
-> List my upcoming calendar events for this week
-> Post a message in the Engineering team channel
-> Find files in SharePoint related to the budget
-> Create an Excel workbook with monthly revenue data
-```
+- **`web/` React admin app is fully built but not wired in.** Its backend, `src/routes/admin-routes.ts` and `src/routes/auth-routes.ts`, are never imported/mounted by `mcp-proxy-server.ts` or `index.ts`. The `/org-admin` console (MongoDB-backed) appears to have superseded it. Either wire the routes back in or remove the dead code — don't assume the admin UI works against the current server as-is.
+- **`register-claude.ts` and `test:e2e` assume a stdio server** that no longer exists; both will misbehave (see npm scripts table).
+- **`src/auth/token-provider.ts`, `token-cache.ts`, `auth-record-cache.ts`** (device code / client credentials / bearer / mock auth) are only referenced by the legacy `scripts/*.ts` files, not by the live server. `AUTH_MODE` is set in deployment configs but nothing in the live request path reads it.
+- **No OBO (on-behalf-of) implementation exists** despite being documented in earlier versions of this README.
+- **`mcp-proxy-server.ts` logs "Loaded N tools from Table Storage cache"** — the tools cache is actually Azure **Blob** Storage; only per-user OAuth tokens live in Table Storage.
+- **`MCP_API_KEY`** is required by `deploy.sh` but not read anywhere in `src/` — confirm whether it's still needed before assuming it does something.
+- **`containerapp.yaml`** is a generic template with placeholder values and comments claiming "MCP is stdio, no ingress needed" — both are stale; the real, current export is `app.yaml`, and ingress is genuinely external on port 3000.
 
 ---
-
----
-
-## Universal MCP Support (Claude Desktop & Others)
-
-This bridge complies with the **Model Context Protocol (MCP)** specification, meaning it can be used with **any** MCP-compatible client, not just Claude Code CLI.
-
-### adding to Claude Desktop (Windows/Mac)
-
-To use Agent 365 tools inside the Claude Desktop app:
-
-1. Open your config file:
-   - **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
-   - **Mac**: `~/Library/Application Support/Claude/claude_desktop_config.json`
-
-2. Add the bridge configuration:
-
-```json
-{
-  "mcpServers": {
-    "agent365-bridge": {
-      "command": "node",
-      "args": [
-        "C:/path/to/your/Agent365/dist/index.js"
-      ]
-    }
-  }
-}
-```
-
-> **Note**: Update the path to match where you cloned this repository.
-
-3. Restart Claude Desktop. The tools will appear in the 🔌 menu.
-
----
-
-## Available MCP Servers
-
-The bridge connects to all 13 Agent 365 MCP servers:
-
-| Server | Scope | Description |
-|--------|-------|-------------|
-| **Outlook Mail** | `McpServers.Mail.All` | Read, compose, send, search, and manage emails |
-| **Outlook Calendar** | `McpServers.Calendar.All` | Create, view, update, and manage calendar events |
-| **Word** | `McpServers.Word.All` | Create and read Word documents, add comments |
-| **Excel** | `McpServers.Excel.All` | Create workbooks, manage spreadsheets |
-| **PowerPoint** | `McpServers.PowerPoint.All` | Create and modify presentations |
-| **Teams** | `McpServers.Teams.All` | Chat, channels, and messaging operations |
-| **OneDrive & SharePoint** | `McpServers.OneDriveSharePoint.All` | File upload, search, and metadata |
-| **SharePoint Lists** | `McpServers.SharepointLists.All` | List and item CRUD operations |
-| **Copilot Search** | `McpServers.CopilotMCP.All` | AI-powered search across M365 data |
-| **Knowledge** | `McpServers.Knowledge.All` | Federated knowledge retrieval |
-| **User Profile** | `McpServers.Me.All` | Profile, manager, direct reports, user search |
-| **Files** | `McpServers.Files.All` | ODSP Files tool operations |
-| **Agent Directory** | `McpServers.DASearch.All` | Copilot Agent Directory search |
-| **Dataverse** | `McpServers.Dataverse.All` | CRUD operations, FetchXML, and Web API for Dataverse |
-| **Files** | `McpServers.Files.All` | ODSP Files tool operations |
-
----
-
-## Agent 365 Bridge vs. Microsoft WorkIQ
-
-While this bridge connects Claude to the core Agent 365 infrastructure for **action and orchestration**, Microsoft also provides [WorkIQ](https://github.com/microsoft/work-iq-mcp), an "intelligence layer" for M365.
-
-| Feature | Agent 365 Bridge (This Project) | Microsoft WorkIQ |
-| :--- | :--- | :--- |
-| **Primary Goal** | **Action & Automation**: Send mail, create docs, update calendar. | **Context & Intelligence**: "Summarize my meetings regarding X", "What did Sarah say?" |
-| **Data Scope** | 13+ Granular M365 Services (Word, Excel, Teams, etc.) | Federated search across Mail, Teams, and SharePoint. |
-| **Authentication** | Custom App Registration (Device Code by default — no client secret needed). | Microsoft-managed App (requires one-time Tenant Admin consent). |
-| **Setup Mode** | Local Proxy to Remote HTTP Gateway. | Native Local stdio Server. |
-
-### Using Both Together
-For the best experience, we recommend running both servers side-by-side in Claude. This gives Claude "hands" (the bridge) and a "brain" (WorkIQ).
-
-**Claude Desktop Configuration (`%APPDATA%/Claude/claude_desktop_config.json`):**
-
-```json
-{
-  "mcpServers": {
-    "agent365-bridge": {
-      "command": "node",
-      "args": ["C:/Path/To/Agent365-Bridge/dist/index.js"]
-    },
-    "workiq": {
-      "command": "npx",
-      "args": ["-y", "@microsoft/workiq", "mcp"]
-    }
-  }
-}
-```
-
-> [!NOTE]
-> WorkIQ is currently in Public Preview. For setup instructions and admin consent details, visit the [official WorkIQ repository](https://github.com/microsoft/work-iq-mcp).
-
-## Authentication Modes
-
-| Mode | When to use | Config | Client Secret? |
-|------|-------------|--------|----------------|
-| **Device Code** (default) | Claude Code / Desktop with Delegated permissions | Set `AZURE_TENANT_ID` + `AZURE_CLIENT_ID` | **No** — public client flow |
-| **Client Credentials** | Application-type permissions (headless) | Add `AUTH_MODE=client_credentials` + `AZURE_CLIENT_SECRET` | **Yes** |
-| **OBO (On-Behalf-Of)** | HTTP server deployment (Copilot Studio) | Add `AUTH_MODE=obo` + `AZURE_CLIENT_SECRET` | **Yes** |
-| **Bearer Token** | Testing with a pre-acquired token | Set `BEARER_TOKEN` in `.env` | No |
-| **Mock** | Local development without Azure | Endpoint set to `localhost` | No |
-
-## Project Structure
-
-```
-├── src/
-│   ├── index.ts                    # Entry point
-│   ├── auth/
-│   │   ├── token-provider.ts       # Device Code / Client Secret / Bearer auth
-│   │   └── token-cache.ts          # JWT token caching with auto-refresh
-│   ├── config/
-│   │   ├── configuration.ts        # Loads .env + ToolingManifest.json
-│   │   └── types.ts                # TypeScript interfaces
-│   ├── discovery/
-│   │   └── server-discovery.ts     # Discovers MCP servers (manifest or gateway)
-│   └── proxy/
-│       ├── mcp-proxy-server.ts     # stdio MCP server for Claude Code
-│       └── tool-forwarder.ts       # Forwards tool calls to remote servers
-├── scripts/
-│   ├── setup.ts                    # Interactive setup wizard
-│   ├── register-claude.ts          # Registers bridge with Claude Code CLI
-│   └── start-mock.ts              # Starts mock server for development
-├── ToolingManifest.json            # Declares 13 available MCP servers
-├── .mcp.json                       # Claude Code project-level MCP config
-├── .env.example                    # Environment variable template
-├── package.json
-└── tsconfig.json
-```
-
-## npm Scripts
-
-| Script | Description |
-|--------|-------------|
-| `npm run build` | Compile TypeScript to `dist/` |
-| `npm run dev` | Run with ts-node (development) |
-| `npm run start` | Run compiled output |
-| `npm run setup` | Interactive setup wizard |
-| `npm run login` | Sign in to M365 and cache credentials (one-time) |
-| `npm run logout` | Clear cached credentials |
-| `npm run register` | Register bridge with Claude Code CLI |
-| `npm run mock` | Start mock server + register |
-| `npm run clean` | Remove `dist/` directory |
-
-## Troubleshooting
-
-| Error | Cause | Fix |
-|-------|-------|-----|
-| `Access denied by Frontier access control` | Tenant not enrolled in Frontier preview | [Enroll here](https://adoption.microsoft.com/copilot/frontier-program/) |
-| `Scope 'McpServers.X.All' is not present` | API permissions not added or not consented | Add permissions in Azure Portal → Grant admin consent |
-| `Application not found in directory` | Wrong Tenant ID for the app registration | Check the Directory (tenant) ID on the app's Overview page |
-| `AADSTS7000218: request body must contain client_assertion` | Public client flows not enabled | Set "Allow public client flows" to Yes in Authentication settings |
-| `Scope doesn't exist on the resource` | Manifest scope names don't match Azure API | Update `ToolingManifest.json` scope names or use `/.default` |
-| `No authentication configured` | Missing credentials in `.env` | Add `AZURE_TENANT_ID` and `AZURE_CLIENT_ID` to `.env` |
-| Tools don't appear in Claude Desktop | Token not cached / timeout | Run `npm run login` first, then restart Claude Desktop |
-| `Request timed out` in MCP logs | Device code sign-in took too long | Run `npm run login` in terminal first for one-time setup |
-
-## References
-
-- [Agent 365 Tooling Servers Overview](https://learn.microsoft.com/en-us/microsoft-agent-365/tooling-servers-overview)
-- [Agent 365 SDK and CLI](https://learn.microsoft.com/en-us/microsoft-agent-365/developer/)
-- [Agent 365 CLI Install](https://learn.microsoft.com/en-us/microsoft-agent-365/developer/agent-365-cli) (requires .NET 8+: `dotnet tool install --global Microsoft.Agents.A365.DevTools.Cli --prerelease`)
-- [Agent 365 Samples](https://github.com/microsoft/Agent365-samples)
-- [MCP Server Reference](https://learn.microsoft.com/en-us/microsoft-agent-365/mcp-server-reference/)
-- [Frontier Preview Program](https://adoption.microsoft.com/copilot/frontier-program/)
 
 ## Disclaimer
 
-**Authentication & Liability**: This project is an open-source bridge and is not an official Microsoft product. It uses your own Azure AD App Registration and operates under the context of the signed-in user. You are responsible for managing the security of your client secrets and tokens. The maintainers of this repository accept no liability for any data loss, security breaches, or unexpected charges incurred by using this software. Use at your own risk.
+**Authentication & Liability**: This project uses ABK's own Azure AD App Registration and operates under the context of the signed-in user. Whoever operates this deployment is responsible for the security of client secrets, storage keys, and tokens. No warranty is made regarding data loss, security breaches, or unexpected charges arising from its use.
