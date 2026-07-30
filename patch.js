@@ -297,6 +297,7 @@ if ('serviceWorker' in navigator) {
     var existing = document.getElementById('abk-org-overlay');
     if (existing) { existing.remove(); return; }
 
+    var dark = isDarkMode();
     var url = BRIDGE_URL + '/org-admin?embed=1' + (extraParams ? '&' + extraParams : '');
 
     var overlay = document.createElement('div');
@@ -304,21 +305,26 @@ if ('serviceWorker' in navigator) {
     overlay.style.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center;';
 
     var modal = document.createElement('div');
-    modal.style.cssText = 'position:relative;width:92%;max-width:1060px;height:88vh;background:#f9f9f9;border-radius:14px;overflow:hidden;box-shadow:0 24px 80px rgba(0,0,0,.35);display:flex;flex-direction:column;';
+    modal.id = 'abk-org-modal';
+    modal.style.cssText = 'position:relative;width:92%;max-width:1060px;height:88vh;background:' + (dark ? '#101317' : '#f9f9f9') + ';border-radius:14px;overflow:hidden;box-shadow:0 24px 80px rgba(0,0,0,.35);display:flex;flex-direction:column;';
 
     var header = document.createElement('div');
-    header.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:14px 20px;background:#fff;border-bottom:1px solid #e8e8e8;flex-shrink:0;';
+    header.id = 'abk-org-header';
+    header.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:14px 20px;background:' + (dark ? '#15181d' : '#fff') + ';border-bottom:1px solid ' + (dark ? '#282e35' : '#e8e8e8') + ';flex-shrink:0;';
     var title = document.createElement('span');
-    title.style.cssText = 'font-weight:600;font-size:14px;color:#0071BC;';
+    title.id = 'abk-org-title';
+    title.style.cssText = 'font-weight:600;font-size:14px;color:' + (dark ? '#2e97e0' : '#0071BC') + ';';
     title.textContent = 'Organization Settings';
     var closeBtn = document.createElement('button');
+    closeBtn.id = 'abk-org-close';
     closeBtn.innerHTML = '&#215;';
-    closeBtn.style.cssText = 'background:none;border:none;font-size:22px;cursor:pointer;color:#888;padding:0 4px;line-height:1;';
+    closeBtn.style.cssText = 'background:none;border:none;font-size:22px;cursor:pointer;color:' + (dark ? '#9aa5b1' : '#888') + ';padding:0 4px;line-height:1;';
     closeBtn.onclick = function() { overlay.remove(); };
     header.appendChild(title);
     header.appendChild(closeBtn);
 
     var iframe = document.createElement('iframe');
+    iframe.id = 'abk-org-iframe';
     iframe.src = url;
     iframe.style.cssText = 'flex:1;width:100%;border:none;';
 
@@ -483,7 +489,41 @@ if ('serviceWorker' in navigator) {
   // out from under us again.
   var ORG_RAIL_ICON_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:20px;height:20px"><path d="M3 21h18"/><path d="M6 21V8l6-4 6 4v13"/><path d="M10 21v-6h4v6"/><path d="M9 11h.01M15 11h.01M9 15h.01M15 15h.01"/></svg>';
 
+  // Gate the rail icon on the user actually being an org ADMIN/OWNER.
+  // org-admin.ts keeps LibreChat's own 'role' field ('ADMIN' or 'USER') in
+  // sync with ABK's org tier specifically so we can read it here — a plain
+  // USER should never even see the entry point, not just be blocked from
+  // acting once inside it.
+  //
+  // IMPORTANT: LibreChat's own REST calls (e.g. /api/user) require an
+  // Authorization header carrying a JWT that LibreChat keeps in memory only
+  // (never in a cookie or localStorage) — an outside script has no way to
+  // read it, so a plain fetch('/api/user') always comes back 401 "No auth
+  // token", regardless of the real role. (An earlier version of this patch
+  // did exactly that and broke Organization Settings for every role,
+  // including admins.) /api/auth/refresh is the one endpoint that instead
+  // authenticates purely via the httpOnly refresh-token cookie the browser
+  // already carries, and its response includes the full user object
+  // (with role) — that's what LibreChat's own app calls to silently renew
+  // its session, so hitting it once here piggybacks on a flow LibreChat
+  // already expects rather than an unexpected 401 that might trip some
+  // global "log the user out on any 401" handling.
+  var abkIsOrgAdmin = null; // null = not checked yet, else boolean
+  function checkOrgAdminRole() {
+    if (abkIsOrgAdmin !== null) return;
+    abkIsOrgAdmin = false; // hidden by default until proven otherwise
+    fetch('/api/auth/refresh', { method: 'POST', credentials: 'include' })
+      .then(function(r) { return r.ok ? r.json() : null; })
+      .then(function(d) {
+        abkIsOrgAdmin = !!(d && d.user && d.user.role === 'ADMIN');
+        if (abkIsOrgAdmin) moveOrgSettingsToRail();
+      })
+      .catch(function() {});
+  }
+
   function moveOrgSettingsToRail() {
+    checkOrgAdminRole();
+    if (!abkIsOrgAdmin) return;
     if (document.querySelector('[data-abk-rail-org]')) return;
 
     var skillsBtn = null;
@@ -518,16 +558,42 @@ if ('serviceWorker' in navigator) {
     rail.appendChild(newBtn);
   }
 
+  function isDarkMode() {
+    try { return document.documentElement.classList.contains('dark'); } catch(ex) { return false; }
+  }
+
   function openOrgAdmin() {
     var cachedToken = null;
     try { cachedToken = sessionStorage.getItem(ORG_SESSION_KEY); } catch(ex) {}
     var emailHint = null;
     try { emailHint = localStorage.getItem(ORG_EMAIL_HINT_KEY); } catch(ex) {}
 
-    var params = [];
+    var params = ['theme=' + (isDarkMode() ? 'dark' : 'light')];
     if (cachedToken) params.push('org_token=' + encodeURIComponent(cachedToken));
     else if (emailHint) params.push('prefill_email=' + encodeURIComponent(emailHint));
     showOrgAdminModal(params.join('&'));
+  }
+
+  // Keep the Organization Settings modal (chrome + iframe content) in sync
+  // if the user toggles light/dark elsewhere in LibreChat while it's open.
+  var abkThemeObserverInstalled = false;
+  function installThemeSync() {
+    if (abkThemeObserverInstalled) return;
+    abkThemeObserverInstalled = true;
+    new MutationObserver(function() {
+      var iframe = document.getElementById('abk-org-iframe');
+      if (!iframe) return;
+      var dark = isDarkMode();
+      try { iframe.contentWindow.postMessage({ type: 'abk_theme', dark: dark }, BRIDGE_URL); } catch(ex) {}
+      var modal = document.getElementById('abk-org-modal');
+      var header = document.getElementById('abk-org-header');
+      var title = document.getElementById('abk-org-title');
+      var closeBtn = document.getElementById('abk-org-close');
+      if (modal) modal.style.background = dark ? '#101317' : '#f9f9f9';
+      if (header) { header.style.background = dark ? '#15181d' : '#fff'; header.style.borderBottom = '1px solid ' + (dark ? '#282e35' : '#e8e8e8'); }
+      if (title) title.style.color = dark ? '#2e97e0' : '#0071BC';
+      if (closeBtn) closeBtn.style.color = dark ? '#9aa5b1' : '#888';
+    }).observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
   }
 
   // Install ONE document-level capture listener — fires before React's root handler.
@@ -869,6 +935,8 @@ if ('serviceWorker' in navigator) {
   }
 
   function setup() {
+    installThemeSync();
+    checkOrgAdminRole();
     new MutationObserver(tryPatch).observe(document.documentElement, { childList: true, subtree: true });
     tryPatch();
   }
@@ -915,3 +983,32 @@ fs.writeFileSync(`${assetsDir}/logo.svg`, svgWrapper);
 console.log('  logo.svg overwritten with ABK logo SVG wrapper.');
 
 console.log(`ABK branding applied (idempotent)! Logo replaced in ${logoReplaced} JS file(s).`);
+
+// ── Force Microsoft account picker on the LibreChat OpenID login ────────────
+// LibreChat's OpenID strategy has no env var to control the authorization
+// `prompt` parameter, so without this patch, Microsoft silently reuses
+// whatever AAD session cookie is already in the browser instead of showing
+// "Pick an account" — confusing on shared/multi-account machines.
+// authorizationRequestParams() in api/strategies/openidStrategy.js is the
+// single place both the main login and admin-OIDC strategies build their
+// authorize request, so patching it here covers both.
+{
+  const stratPath = '/app/api/strategies/openidStrategy.js';
+  let strat = fs.readFileSync(stratPath, 'utf8');
+  const marker = "params.set('prompt', 'select_account'); // ABK: force account picker";
+  if (strat.includes(marker)) {
+    console.log('  openidStrategy.js already patched for account picker, skipping.');
+  } else {
+    const anchor = 'return params;';
+    const occurrences = strat.split(anchor).length - 1;
+    if (occurrences !== 1) {
+      throw new Error(
+        `openidStrategy.js: expected exactly 1 occurrence of "${anchor}", found ${occurrences}. ` +
+        'LibreChat likely changed this file — update the account-picker patch in patch.js.'
+      );
+    }
+    strat = strat.replace(anchor, `${marker}\n    ${anchor}`);
+    fs.writeFileSync(stratPath, strat);
+    console.log('  openidStrategy.js patched: Microsoft account picker forced on login.');
+  }
+}
