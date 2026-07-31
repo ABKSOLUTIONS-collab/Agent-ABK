@@ -176,12 +176,43 @@ const inject = `<!-- ABK_START -->
   }
 </style>
 <script>
-// Unregister LibreChat's service worker so the latest index.html is always served.
+// Kill LibreChat's service worker outright — don't just unregister existing
+// ones after the fact, actively block new registrations too. A stale SW
+// precache is a known cause of "first login after logout fails and bounces
+// back to /login, second attempt works" (see LibreChat issue #11534): the
+// SW can keep serving an old cached index.html/bundle to the very page that
+// needs to observe the freshly-set auth cookie, so the client-side session
+// check runs against stale JS and fails once, then self-corrects the next
+// load. Unregistering after the fact leaves a window where LibreChat's own
+// bundle can re-register a SW before we get to it; overriding register()
+// closes that gap, and clearing Cache Storage removes anything a past SW
+// already cached, not just its registration.
+function abkClearCaches() {
+  if (!(window.caches && caches.keys)) return Promise.resolve();
+  return caches.keys().then(function(keys) {
+    return Promise.all(keys.map(function(k) { return caches.delete(k); }));
+  }).catch(function() {});
+}
+abkClearCaches();
 if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register = function() {
+    return Promise.reject(new Error('Service worker registration disabled (ABK patch)'));
+  };
   navigator.serviceWorker.getRegistrations().then(function(regs) {
+    var hadRegs = regs.length > 0;
     regs.forEach(function(r) { r.unregister(); });
-    if (regs.length > 0) { console.log('[ABK] SW unregistered, reloading...'); window.location.reload(); }
-  });
+    // A page already controlled by a SW stays controlled until it's
+    // reloaded, even after unregister() — so force one reload to fully
+    // release control, but only the one time there was actually something
+    // to clean up (every load after that finds zero registrations, so this
+    // can't loop).
+    if (hadRegs) {
+      abkClearCaches().then(function() {
+        console.log('[ABK] SW unregistered + caches cleared, reloading...');
+        window.location.reload();
+      });
+    }
+  }).catch(function() {});
 }
 </script>
 <script>
@@ -513,19 +544,35 @@ if ('serviceWorker' in navigator) {
   // its session, so hitting it once here piggybacks on a flow LibreChat
   // already expects rather than an unexpected 401 that might trip some
   // global "log the user out on any 401" handling.
+  //
+  // IMPORTANT #2: /api/auth/refresh rotates a single-use refresh-token
+  // cookie on every call. LibreChat's own client already calls it once on
+  // initial load to restore the session — if OUR call fires around the same
+  // time, whichever of the two loses the race gets a 401 against an
+  // already-rotated cookie. When LibreChat's OWN call is the loser, its
+  // client treats that 401 as "not logged in" and bounces back to /login
+  // even though the sign-in genuinely succeeded (confirmed via server logs:
+  // the OpenID exchange always reports "login success" server-side, so this
+  // was never an actual auth failure, just us stepping on LibreChat's own
+  // token rotation). Delaying our call gives LibreChat's own bootstrap
+  // refresh a head start so we rotate the token only after it's done with
+  // it, not concurrently.
   var abkIsOrgAdmin = null; // null = not checked yet, else boolean
+  var abkRoleCheckScheduled = false;
   function checkOrgAdminRole() {
-    if (abkIsOrgAdmin !== null) return;
-    abkIsOrgAdmin = false; // hidden by default until proven otherwise
-    fetch('/api/auth/refresh', { method: 'POST', credentials: 'include' })
-      .then(function(r) { return r.ok ? r.json() : null; })
-      .then(function(d) {
-        abkIsOrgAdmin = !!(d && d.user && d.user.role === 'ADMIN');
-        if (abkIsOrgAdmin) { moveOrgSettingsToRail(); applyAdminOnlyVisibility(); }
-      })
-      .catch(function() {});
+    if (abkIsOrgAdmin !== null || abkRoleCheckScheduled) return;
+    abkRoleCheckScheduled = true;
+    setTimeout(function() {
+      abkIsOrgAdmin = false; // hidden by default until proven otherwise
+      fetch('/api/auth/refresh', { method: 'POST', credentials: 'include' })
+        .then(function(r) { return r.ok ? r.json() : null; })
+        .then(function(d) {
+          abkIsOrgAdmin = !!(d && d.user && d.user.role === 'ADMIN');
+          if (abkIsOrgAdmin) { moveOrgSettingsToRail(); applyAdminOnlyVisibility(); }
+        })
+        .catch(function() {});
+    }, 4000);
   }
-
   // "Agent Builder" and "Skills" are hidden by default via CSS
   // ([data-abk-admin-ok] gate, see the injected <style>) until we know the
   // signed-in user is an org ADMIN/OWNER — same reasoning as the
