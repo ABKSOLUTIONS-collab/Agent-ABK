@@ -267,7 +267,17 @@ export class McpProxyServer {
       log(`MCP request: ${req.body?.method ?? "unknown"}`);
 
       const sessionToken = this.extractToken(req);
-      if (!sessionToken) { await this.serveAnonymous(req, res); return; }
+      if (!sessionToken) {
+        log("No session token provided — sending WWW-Authenticate to trigger OAuth");
+        res.status(401)
+          .set("WWW-Authenticate", `Bearer realm="${serverBaseUrl}", error="invalid_token"`)
+          .json({
+            jsonrpc: "2.0",
+            error: { code: -32001, message: "Authentication required. Please connect via OAuth." },
+            id: null,
+          });
+        return;
+      }
 
       const [userToken, graphToken, email] = await Promise.all([
         getUserToken(sessionToken),
@@ -662,30 +672,6 @@ export class McpProxyServer {
     });
   }
 
-  private async serveAnonymous(req: express.Request, res: express.Response): Promise<void> {
-    try {
-      const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-      const server = new Server({ name: "agent365-bridge", version: "1.0.0" }, { capabilities: { tools: {} } });
-      server.setRequestHandler(ListToolsRequestSchema, async () => ({
-        tools: [
-          ...Array.from(this.sharedToolRegistry.values()).map((e) => e.toolDef),
-          ...SHAREPOINT_TOOLS,
-          ...EMAIL_GRAPH_TOOLS,
-          ...CALENDAR_GRAPH_TOOLS,
-          OCR_TOOL,
-          SIGNATURE_STYLE_TOOL,
-        ],
-      }));
-      server.setRequestHandler(CallToolRequestSchema, async () => ({
-        content: [{ type: "text", text: "Please visit /login to get your personal URL." }],
-      }));
-      res.on("close", () => { transport.close(); server.close(); });
-      await server.connect(transport);
-      await transport.handleRequest(req, res, req.body);
-    } catch {
-      if (!res.headersSent) res.status(500).json({ jsonrpc: "2.0", error: { code: -32603, message: "Internal error" }, id: null });
-    }
-  }
 }
 
 function sanitizeSchema(schema: Record<string, unknown>): Record<string, unknown> {
