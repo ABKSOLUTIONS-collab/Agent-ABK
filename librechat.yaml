@@ -2,3 +2,22 @@ version: 1.2.1
 registration:
   allowedDomains:
     - "abk.gr"
+
+# Per-user token usage tracking. Every request against a real LLM API key
+# (Claude/OpenAI/etc., not the Agent365 Graph tools) is logged to the
+# Transactions collection and deducted from each user's balance below —
+# no custom code needed, this is a native LibreChat feature.
+balance:
+  enabled: true
+  startBalance: 20000        # tokens credited to a user on first login
+  autoRefillEnabled: true
+  refillIntervalValue: 30
+  refillIntervalUnit: "days"
+  refillAmount: 10000        # tokens added every refill cycle
+
+interface:
+  contextCost: true          # show the €/$ cost of each message to the user
+  contextUsage: true         # show token counts (context window usage) too
+  currency:
+    code: EUR
+    rate: 0.92                # static USD->EUR multiplier — update periodically, not live-fetched
