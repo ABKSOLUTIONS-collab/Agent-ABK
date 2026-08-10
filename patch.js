@@ -1069,3 +1069,72 @@ console.log(`ABK branding applied (idempotent)! Logo replaced in ${logoReplaced}
     console.log('  openidStrategy.js patched: Microsoft account picker forced on login.');
   }
 }
+
+// ── Force fresh OAuth on every Agent365 Bridge reconnect ────────────────────
+// The native "Connect" and "Reconnect" MCP card buttons both call the same
+// POST /api/mcp/:serverName/reinitialize endpoint (MCPCardActions.tsx —
+// both wire to onInitialize()). That endpoint silently reuses an existing,
+// still-valid stored OAuth token when one is present, so clicking
+// "Reconnect" on an already-connected server does NOT show a fresh
+// Microsoft SSO prompt — it only appears the first time (or after a real
+// disconnect/expiry). For the shared "Agent365 Bridge" connector we always
+// want an explicit, visible SSO confirmation on every reconnect, so a green
+// "Connected" dot is always backed by the account the user just picked.
+// Clearing the stored token first — using the exact same mechanism the
+// native "Revoke" button calls (MCPTokenStorage.deleteUserTokens +
+// clearing cached OAuth flow state; see UserController.js
+// clearStoredMCPOAuthState) — makes reinitMCPServer() correctly report
+// oauthRequired: true, so the normal OAuth flow already handled by this
+// route runs every time. Scoped to serverName === 'agent365-bridge' only;
+// every other MCP server (including ones users add themselves) is
+// untouched.
+{
+  const routesMcpPath = '/app/api/server/routes/mcp.js';
+  let routesMcp = fs.readFileSync(routesMcpPath, 'utf8');
+  const marker = '// ABK: force fresh OAuth for agent365-bridge on every reconnect';
+  if (routesMcp.includes(marker)) {
+    console.log('  routes/mcp.js already patched for forced re-auth, skipping.');
+  } else {
+    const anchor =
+      '      await mcpManager.disconnectUserConnection(user.id, serverName);\n' +
+      '      logger.info(\n' +
+      '        `[MCP Reinitialize] Disconnected existing user connection for server: ${serverName}`,\n' +
+      '      );\n';
+    const occurrences = routesMcp.split(anchor).length - 1;
+    if (occurrences !== 1) {
+      throw new Error(
+        `routes/mcp.js: expected exactly 1 occurrence of the reinitialize disconnect anchor, found ${occurrences}. ` +
+        'LibreChat likely changed this file — update the forced re-auth patch in patch.js.'
+      );
+    }
+    const injection = anchor +
+      '\n' +
+      '      ' + marker + '\n' +
+      "      if (serverName === 'agent365-bridge') {\n" +
+      '        try {\n' +
+      '          await MCPTokenStorage.deleteUserTokens({\n' +
+      '            userId: user.id,\n' +
+      '            serverName,\n' +
+      '            deleteToken: async (filter) => {\n' +
+      '              await db.deleteTokens(filter);\n' +
+      '            },\n' +
+      '          });\n' +
+      '          const abkFlowsCache = getLogStores(CacheKeys.FLOWS);\n' +
+      '          const abkFlowManager = getFlowStateManager(abkFlowsCache);\n' +
+      '          const abkFlowId = MCPOAuthHandler.generateFlowId(user.id, serverName);\n' +
+      '          await Promise.allSettled([\n' +
+      "            abkFlowManager.deleteFlow(abkFlowId, 'mcp_get_tokens'),\n" +
+      "            abkFlowManager.deleteFlow(abkFlowId, 'mcp_oauth'),\n" +
+      '          ]);\n' +
+      '        } catch (abkError) {\n' +
+      '          logger.warn(\n' +
+      '            `[MCP Reinitialize] ABK: failed to clear stored OAuth state for ${serverName}:`,\n' +
+      '            abkError,\n' +
+      '          );\n' +
+      '        }\n' +
+      '      }\n';
+    routesMcp = routesMcp.replace(anchor, injection);
+    fs.writeFileSync(routesMcpPath, routesMcp);
+    console.log('  routes/mcp.js patched: forced fresh OAuth for agent365-bridge on every reconnect.');
+  }
+}
