@@ -5,10 +5,16 @@ registration:
 
 # Per-user token usage tracking. Every request against a real LLM API key
 # (Claude/OpenAI/etc., not the Agent365 Graph tools) is logged to the
-# Transactions collection and deducted from each user's balance below —
-# no custom code needed, this is a native LibreChat feature.
+# Transactions collection regardless of the setting below — that's what
+# powers both interface.contextCost/contextUsage per-message display and
+# the Organization Settings "Usage" column. `enabled: false` here only
+# turns off the hard per-user quota/blocking (no custom code needed either
+# way, this is a native LibreChat feature) — the org's actual spend is
+# already visible in the Anthropic Console, so a second, separate
+# per-user token wallet that can silently block someone mid-conversation
+# isn't worth the friction for a small trusted team.
 balance:
-  enabled: true
+  enabled: false
   startBalance: 20000        # tokens credited to a user on first login
   autoRefillEnabled: true
   refillIntervalValue: 30

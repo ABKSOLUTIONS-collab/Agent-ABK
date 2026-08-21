@@ -766,37 +766,70 @@ if ('serviceWorker' in navigator) {
         s.setAttribute('data-abk-greet-icon-hidden', '1');
       });
 
-      // The heading's parent is a flex ROW (icon + text side by side), so a
-      // plain sibling <p> would render BESIDE the heading, not under it.
-      // Wrap the heading in its own column stack so the subtitle can sit
-      // directly below "Good afternoon, {name}" as intended.
+      // IMPORTANT: never reparent \`el\` — it's a live React-owned node, and
+      // React keeps its own reference to el's ORIGINAL parent. An earlier
+      // version of this function wrapped el in a new "stack" div via
+      // stack.appendChild(el), which moved it to a different parent than
+      // the one React rendered it under. The next time React tried to
+      // update or remove that node (e.g. leaving the greeting screen once a
+      // chat starts), it called removeChild on the original parent — which
+      // no longer contained it — crashing the whole app with "Failed to
+      // execute 'removeChild' on 'Node': The node to be removed is not a
+      // child of this node." Get the same "logo + bar beside the heading,
+      // subtitle below" layout by only ever adding new SIBLING nodes around
+      // el, using a flex-wrap + flex-basis trick to push the subtitle onto
+      // its own line — el's parent and position in the tree are never
+      // touched.
+      // LibreChat can have more than one of these greeting nodes alive in
+      // the DOM at the same time (e.g. a previous New Chat screen that
+      // hasn't been torn down yet) — el.dataset.abkGreetDone only stops us
+      // from processing the SAME node twice, not from processing several
+      // DISTINCT nodes that all match. Without a single global guard here,
+      // each one independently got its own logo/bar/subtitle, which is what
+      // produced several duplicate "Πώς μπορώ..." lines stacked on screen.
+      // Only the first matching instance gets the branding treatment; the
+      // SVG/avatar hiding above still applies to every instance since that
+      // part is just a style toggle, not an added/duplicated element.
+      if (document.querySelector('[data-abk-greet-sub]')) continue;
+
+      // Force the SAME centered layout regardless of which screen this is
+      // (the plain "Good afternoon, {name}" home greeting and a saved
+      // Agent's own name/description landing reuse this same heading node,
+      // but sit inside different ambient containers/CSS — one already
+      // happened to render centered, the other left-aligned. Setting
+      // justify-content + width explicitly here, instead of relying on
+      // whatever the surrounding LibreChat layout does, makes the row look
+      // identical in both places.)
       var insertParent = el.parentElement || container;
-      var stack = document.createElement('div');
-      stack.setAttribute('data-abk-greet-stack', '1');
-      stack.style.cssText = 'display:flex;flex-direction:column;';
-      insertParent.insertBefore(stack, el);
-      stack.appendChild(el);
+      insertParent.style.display = 'flex';
+      insertParent.style.flexWrap = 'wrap';
+      insertParent.style.alignItems = 'center';
+      insertParent.style.justifyContent = 'center';
+      insertParent.style.width = '100%';
 
-      // Insert ABK logo + vertical accent bar before the stack (same row)
-      if (!document.querySelector('[data-abk-greet-logo]')) {
-        var img = document.createElement('img');
-        img.src = '/assets/abk-logo.png?abk=1';
-        img.setAttribute('data-abk-greet-logo', '1');
-        img.style.cssText = 'height:26px;width:auto;object-fit:contain;vertical-align:middle;margin-right:14px;display:inline-block;';
-        insertParent.insertBefore(img, stack);
+      // Insert ABK logo + vertical accent bar as siblings right before el
+      var img = document.createElement('img');
+      img.src = '/assets/abk-logo.png?abk=1';
+      img.setAttribute('data-abk-greet-logo', '1');
+      img.style.cssText = 'height:26px;width:auto;object-fit:contain;vertical-align:middle;margin-right:14px;display:inline-block;order:-2;';
+      insertParent.insertBefore(img, el);
 
-        var bar = document.createElement('span');
-        bar.setAttribute('data-abk-greet-bar', '1');
-        bar.style.cssText = 'display:inline-block;width:2px;height:42px;background:var(--ring-primary);margin-right:14px;vertical-align:middle;';
-        insertParent.insertBefore(bar, stack);
-      }
+      var bar = document.createElement('span');
+      bar.setAttribute('data-abk-greet-bar', '1');
+      bar.style.cssText = 'display:inline-block;width:2px;height:42px;background:var(--ring-primary);margin-right:14px;vertical-align:middle;order:-1;';
+      insertParent.insertBefore(bar, el);
 
-      // Primary-colored subtitle below the greeting heading
+      // Primary-colored subtitle below the greeting heading, centered under
+      // the whole row (not indented under just the heading text) so it
+      // lines up the same way whether the row above it is short ("ABK
+      // Agent") or long ("Good afternoon, Stavros Nikolaou"). flex-basis:
+      // 100% forces it onto its own line within insertParent's wrapping
+      // flex row; order:99 keeps it after el regardless of insertion order.
       var sub = document.createElement('p');
       sub.setAttribute('data-abk-greet-sub', '1');
       sub.textContent = 'Πώς μπορώ να βοηθήσω σήμερα;';
-      sub.style.cssText = 'margin:4px 0 0;font-size:14px;font-weight:500;';
-      stack.appendChild(sub);
+      sub.style.cssText = 'margin:4px 0 0;font-size:14px;font-weight:500;flex-basis:100%;order:99;text-align:center;';
+      insertParent.appendChild(sub);
       break;
     }
     } catch(e) {}
