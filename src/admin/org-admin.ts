@@ -101,6 +101,31 @@ async function getLcUserByEmail(email: string): Promise<LcUser | null> {
   }
 }
 
+// Real token counts each user has consumed, all-time (native LibreChat
+// Transactions collection — logged for every real LLM call regardless of
+// whether the balance/quota feature is enabled or not; see librechat.yaml).
+// Uses rawAmount (actual prompt+completion token counts), NOT tokenValue
+// (which is rawAmount scaled by a per-model pricing multiplier — the same
+// inflated "credit" unit the balance feature used, confusing to show
+// directly as "tokens used"). rawAmount is stored negative (a deduction),
+// so this flips the sign to a positive total.
+async function getUsageByUser(): Promise<Map<string, number>> {
+  const map = new Map<string, number>();
+  const db = await getDb();
+  if (!db) return map;
+  try {
+    const rows = await db.collection("transactions").aggregate([
+      { $group: { _id: "$user", total: { $sum: "$rawAmount" } } },
+    ]).toArray();
+    for (const r of rows) {
+      if (r._id) map.set(String(r._id), Math.max(0, Math.round(-(r.total as number))));
+    }
+  } catch (e) {
+    log(`getUsageByUser error: ${e}`);
+  }
+  return map;
+}
+
 async function deleteLcUser(email: string): Promise<void> {
   const db = await getDb();
   if (!db) throw new Error("MongoDB unavailable");
@@ -445,9 +470,10 @@ ${sidebarHtml}
         <thead><tr>
           <th>Name</th>
           <th>Role</th>
+          <th>Tokens used</th>
           ${tier !== "USER" ? "<th></th>" : ""}
         </tr></thead>
-        <tbody id="tbody">${[0, 1, 2].map(() => `<tr><td><div class="name-cell"><div class="skeleton" style="width:30px;height:30px;border-radius:50%"></div><div style="flex:1"><div class="skeleton" style="width:120px;height:11px;margin-bottom:6px"></div><div class="skeleton" style="width:160px;height:10px"></div></div></div></td><td><div class="skeleton" style="width:60px;height:11px"></div></td>${tier !== "USER" ? "<td></td>" : ""}</tr>`).join("")}</tbody>
+        <tbody id="tbody">${[0, 1, 2].map(() => `<tr><td><div class="name-cell"><div class="skeleton" style="width:30px;height:30px;border-radius:50%"></div><div style="flex:1"><div class="skeleton" style="width:120px;height:11px;margin-bottom:6px"></div><div class="skeleton" style="width:160px;height:10px"></div></div></div></td><td><div class="skeleton" style="width:60px;height:11px"></div></td><td><div class="skeleton" style="width:50px;height:11px"></div></td>${tier !== "USER" ? "<td></td>" : ""}</tr>`).join("")}</tbody>
       </table>
     </div>
   </div>
@@ -491,7 +517,7 @@ async function load() {
 
 function render(users) {
   const tb = document.getElementById('tbody');
-  if (!users.length) { tb.innerHTML = '<tr><td class="empty-cell" colspan="3"><svg width="32" height="32" viewBox="0 0 16 16" fill="currentColor"><path d="M15 14s1 0 1-1-1-4-5-4-5 3-5 4 1 1 1 1h8zm-9.978-1A.261.261 0 015 13c0-.366.268-1.14 1.004-1.844C6.717 10.48 7.742 10 9 10c.37 0 .724.043 1.05.12C9.5 10.48 9 11.25 9 12c0 .273.04.54.097.8H5.022zM4.5 8a2.5 2.5 0 100-5 2.5 2.5 0 000 5z"/></svg>No members found</td></tr>'; return; }
+  if (!users.length) { tb.innerHTML = '<tr><td class="empty-cell" colspan="4"><svg width="32" height="32" viewBox="0 0 16 16" fill="currentColor"><path d="M15 14s1 0 1-1-1-4-5-4-5 3-5 4 1 1 1 1h8zm-9.978-1A.261.261 0 015 13c0-.366.268-1.14 1.004-1.844C6.717 10.48 7.742 10 9 10c.37 0 .724.043 1.05.12C9.5 10.48 9 11.25 9 12c0 .273.04.54.097.8H5.022zM4.5 8a2.5 2.5 0 100-5 2.5 2.5 0 000 5z"/></svg>No members found</td></tr>'; return; }
   tb.innerHTML = users.map(u => {
     const name = u.name || u.email.split('@')[0];
     const isMe = u.email === MY_EMAIL;
@@ -516,12 +542,15 @@ function render(users) {
       \${canAct ? \`<button class="btn-remove" onclick="delUser('\${esc(u.email)}')">Remove</button>\` : ''}
     </td>\` : '';
 
+    const usageCell = \`<span class="role-text">\${(u.consumed || 0).toLocaleString('en-US')}</span>\`;
+
     return \`<tr>
       <td><div class="name-cell">
         <div class="avatar" style="background:\${color}">\${initials(name)}</div>
         <div><div class="name-primary">\${name}\${youBadge}</div><div class="name-secondary">\${u.email}</div></div>
       </div></td>
       <td>\${roleCell}</td>
+      <td>\${usageCell}</td>
       \${actCell}
     </tr>\`;
   }).join('');
@@ -1075,11 +1104,12 @@ export function registerOrgAdminEndpoints(app: Express): void {
       return;
     }
     try {
-      const lcUsers = await getLcUsers();
+      const [lcUsers, usage] = await Promise.all([getLcUsers(), getUsageByUser()]);
       const users = lcUsers.map((u) => ({
         email: u.email,
         name: u.name || u.username || u.email.split("@")[0],
         tier: getTier(u.email, u.role, u.orgRole),
+        consumed: usage.get(String(u._id)) ?? 0,
       }));
       res.json({ users, tier: info.tier });
     } catch (e) {
