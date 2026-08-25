@@ -101,29 +101,145 @@ async function getLcUserByEmail(email: string): Promise<LcUser | null> {
   }
 }
 
-// Real token counts each user has consumed, all-time (native LibreChat
-// Transactions collection — logged for every real LLM call regardless of
-// whether the balance/quota feature is enabled or not; see librechat.yaml).
-// Uses rawAmount (actual prompt+completion token counts), NOT tokenValue
-// (which is rawAmount scaled by a per-model pricing multiplier — the same
-// inflated "credit" unit the balance feature used, confusing to show
-// directly as "tokens used"). rawAmount is stored negative (a deduction),
-// so this flips the sign to a positive total.
-async function getUsageByUser(): Promise<Map<string, number>> {
+// ── Spend reporting ──────────────────────────────────────────────────────────
+//
+// All figures come from LibreChat's native Transactions collection, which logs
+// every real LLM call regardless of whether the balance/quota feature is
+// enabled (see librechat.yaml). Each row carries `tokenValue` = tokens x the
+// model's price per 1M tokens, so USD = |tokenValue| / 1e6. Using tokenValue
+// rather than the raw token count is what makes this per-model accurate: an
+// Opus token and a Haiku token cost very different amounts, and LibreChat has
+// already applied the right rate (including cache read/write discounts) to
+// each transaction.
+//
+// Figures are in USD — the currency Anthropic actually bills in. Converting to
+// EUR here would mean pinning a static FX rate that silently goes stale, so
+// the number shown is the number on the Anthropic invoice.
+//
+// Nothing is ever reset or deleted: a period is a `createdAt` range, so past
+// months stay queryable and can always be recomputed.
+//
+// IMPORTANT: accuracy depends on LibreChat knowing the model's price. Its
+// bundled table had no entry for the Claude 5 family and silently fell back to
+// a catch-all rate about 4x too low; patch.js now injects the correct rates.
+// Transactions written BEFORE that patch was deployed still carry the old
+// understated tokenValue and cannot be corrected from here.
+
+function usdOf(tokenValue: unknown): number {
+  return Math.abs((tokenValue as number) ?? 0) / 1e6;
+}
+
+// Parses "YYYY-MM" into a UTC [start, end) range. Falls back to the current
+// month on anything malformed, so a hand-edited URL can't produce a range that
+// silently matches nothing.
+function monthRange(month?: string): { start: Date; end: Date; key: string } {
+  const now = new Date();
+  let year = now.getUTCFullYear();
+  let mon = now.getUTCMonth();
+  const m = typeof month === "string" ? month.match(/^(\d{4})-(\d{2})$/) : null;
+  if (m) {
+    const y = Number(m[1]);
+    const mo = Number(m[2]) - 1;
+    if (y >= 2000 && y <= 2999 && mo >= 0 && mo <= 11) {
+      year = y;
+      mon = mo;
+    }
+  }
+  const start = new Date(Date.UTC(year, mon, 1));
+  const end = new Date(Date.UTC(year, mon + 1, 1));
+  return { start, end, key: `${year}-${String(mon + 1).padStart(2, "0")}` };
+}
+
+// Spend per user (keyed by user id) for one month, in USD.
+async function getUsageByUser(range: { start: Date; end: Date }): Promise<Map<string, number>> {
   const map = new Map<string, number>();
   const db = await getDb();
   if (!db) return map;
   try {
     const rows = await db.collection("transactions").aggregate([
-      { $group: { _id: "$user", total: { $sum: "$rawAmount" } } },
+      { $match: { createdAt: { $gte: range.start, $lt: range.end } } },
+      { $group: { _id: "$user", total: { $sum: "$tokenValue" } } },
     ]).toArray();
     for (const r of rows) {
-      if (r._id) map.set(String(r._id), Math.max(0, Math.round(-(r.total as number))));
+      if (r._id) map.set(String(r._id), usdOf(r.total));
     }
   } catch (e) {
     log(`getUsageByUser error: ${e}`);
   }
   return map;
+}
+
+interface DaySpend {
+  date: string;   // YYYY-MM-DD
+  usd: number;
+  tokens: number;
+}
+
+// Day-by-day spend for a single user over one month. Grouped in UTC to match
+// the month boundaries above, so a day's figure can never fall outside the
+// month it is listed under.
+async function getDailyUsage(userId: string, range: { start: Date; end: Date }): Promise<DaySpend[]> {
+  const db = await getDb();
+  if (!db) return [];
+  try {
+    const rows = await db.collection("transactions").aggregate([
+      { $match: { user: new ObjectId(userId), createdAt: { $gte: range.start, $lt: range.end } } },
+      {
+        $group: {
+          _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt", timezone: "UTC" } },
+          total: { $sum: "$tokenValue" },
+          tokens: { $sum: "$rawAmount" },
+        },
+      },
+      { $sort: { _id: 1 } },
+    ]).toArray();
+    return rows.map((r) => ({
+      date: String(r._id),
+      usd: usdOf(r.total),
+      tokens: Math.abs((r.tokens as number) ?? 0),
+    }));
+  } catch (e) {
+    log(`getDailyUsage error: ${e}`);
+    return [];
+  }
+}
+
+// Per-model split for a single user over one month — answers "what is actually
+// driving this person's spend", which the daily view alone can't.
+async function getModelUsage(userId: string, range: { start: Date; end: Date }): Promise<{ model: string; usd: number }[]> {
+  const db = await getDb();
+  if (!db) return [];
+  try {
+    const rows = await db.collection("transactions").aggregate([
+      { $match: { user: new ObjectId(userId), createdAt: { $gte: range.start, $lt: range.end } } },
+      { $group: { _id: "$model", total: { $sum: "$tokenValue" } } },
+      { $sort: { total: 1 } },
+    ]).toArray();
+    return rows.map((r) => ({ model: String(r._id ?? "unknown"), usd: usdOf(r.total) }));
+  } catch (e) {
+    log(`getModelUsage error: ${e}`);
+    return [];
+  }
+}
+
+// The earliest month that has any transaction at all — used to stop the UI's
+// "previous month" arrow at the point where data actually begins, instead of
+// letting someone page back through empty months forever.
+async function getEarliestMonth(): Promise<string | null> {
+  const db = await getDb();
+  if (!db) return null;
+  try {
+    const first = await db.collection("transactions").find({}, {
+      projection: { createdAt: 1 },
+      sort: { createdAt: 1 },
+      limit: 1,
+    }).toArray();
+    const d = first[0]?.createdAt as Date | undefined;
+    if (!d) return null;
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+  } catch {
+    return null;
+  }
 }
 
 async function deleteLcUser(email: string): Promise<void> {
@@ -390,6 +506,23 @@ window.addEventListener('message', function(evt) {
     .ov-sub{font-size:12px;color:var(--accent);margin-top:3px;font-weight:500}
     /* Members header */
     .m-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+    /* Month navigator */
+    .month-nav{display:flex;align-items:center;gap:2px;border:1px solid var(--border);border-radius:8px;padding:2px;background:var(--surface)}
+    .month-nav button{background:none;border:none;cursor:pointer;color:var(--text-secondary-alt);font-size:11px;padding:5px 9px;border-radius:6px;transition:background .15s ease,color .15s ease}
+    .month-nav button:hover:not(:disabled){background:var(--hover-bg);color:var(--text-primary)}
+    .month-nav button:disabled{opacity:.3;cursor:default}
+    .month-nav span{font-size:13px;font-weight:500;color:var(--text-primary);min-width:118px;text-align:center;user-select:none}
+    /* Spend detail */
+    .row-link{cursor:pointer}
+    .spend-val{font-variant-numeric:tabular-nums}
+    .detail-wrap{max-height:calc(88vh - 210px);overflow:auto}
+    .detail-table{width:100%;border-collapse:collapse}
+    .detail-table th{padding:8px 14px;font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--text-tertiary);text-align:left;border-bottom:1px solid var(--border);position:sticky;top:0;background:var(--surface)}
+    .detail-table td{padding:8px 14px;font-size:13px;border-bottom:1px solid var(--border-soft);font-variant-numeric:tabular-nums}
+    .detail-table tr:last-child td{border-bottom:none}
+    .wk-row td{background:var(--hover-bg);font-weight:600;font-size:12px;color:var(--text-secondary-alt)}
+    .model-chip{display:inline-flex;align-items:center;gap:7px;font-size:12.5px;padding:5px 0}
+    .bar{height:5px;border-radius:3px;background:var(--accent);opacity:.75}
     .m-title{font-size:15px;font-weight:600;color:var(--text-primary)}
     .btn-primary{background:var(--accent);color:#fff;border:none;border-radius:8px;padding:7px 15px;font-size:13px;font-weight:500;cursor:pointer;transition:background .15s ease,transform .1s ease,box-shadow .15s ease;box-shadow:0 1px 2px rgba(0,102,204,.25)}
     .btn-primary:hover{background:var(--accent-hover);box-shadow:0 2px 8px rgba(0,102,204,.3)}
@@ -449,6 +582,11 @@ ${sidebarHtml}
         <div class="ov-val" id="totalMembers">—</div>
       </div>
       <div class="ov-item">
+        <div class="ov-label">Spend</div>
+        <div class="ov-val" id="orgTotal">—</div>
+        <div class="ov-sub" id="orgTotalPeriod"></div>
+      </div>
+      <div class="ov-item">
         <div class="ov-label">Signed in as</div>
         <div class="ov-val">${email}</div>
         <div class="ov-sub">${roleLabel(tier)}</div>
@@ -456,7 +594,14 @@ ${sidebarHtml}
     </div>
     <div class="m-header">
       <div class="m-title">Members</div>
-      ${tier !== "USER" ? '<button class="btn-primary" onclick="showAddModal()">+ Add member</button>' : ""}
+      <div style="display:flex;align-items:center;gap:12px">
+        <div class="month-nav">
+          <button type="button" id="mPrev" title="Previous month">&#9664;</button>
+          <span id="mLabel">—</span>
+          <button type="button" id="mNext" title="Next month">&#9654;</button>
+        </div>
+        ${tier !== "USER" ? '<button class="btn-primary" onclick="showAddModal()">+ Add member</button>' : ""}
+      </div>
     </div>
     <div class="table-wrap">
       <div class="table-toolbar">
@@ -470,7 +615,7 @@ ${sidebarHtml}
         <thead><tr>
           <th>Name</th>
           <th>Role</th>
-          <th>Tokens used</th>
+          <th>Spend</th>
           ${tier !== "USER" ? "<th></th>" : ""}
         </tr></thead>
         <tbody id="tbody">${[0, 1, 2].map(() => `<tr><td><div class="name-cell"><div class="skeleton" style="width:30px;height:30px;border-radius:50%"></div><div style="flex:1"><div class="skeleton" style="width:120px;height:11px;margin-bottom:6px"></div><div class="skeleton" style="width:160px;height:10px"></div></div></div></td><td><div class="skeleton" style="width:60px;height:11px"></div></td><td><div class="skeleton" style="width:50px;height:11px"></div></td>${tier !== "USER" ? "<td></td>" : ""}</tr>`).join("")}</tbody>
@@ -489,11 +634,37 @@ ${sidebarHtml}
     <button onclick="hideAddModal()" style="width:100%;padding:8px;background:none;border:none;font-size:13px;color:var(--text-secondary-alt);cursor:pointer;border-radius:8px;transition:background .15s ease" onmouseover="this.style.background='var(--hover-bg)'" onmouseout="this.style.background='none'">Cancel</button>
   </div>
 </div>
+<!-- Spend detail modal -->
+<div id="detailModal" style="display:none;position:fixed;inset:0;z-index:9999;background:var(--overlay-bg);align-items:center;justify-content:center;backdrop-filter:blur(2px);">
+  <div style="background:var(--surface);border-radius:14px;width:620px;max-width:95vw;max-height:88vh;box-shadow:var(--shadow-modal);animation:abkFadeUp .18s ease;display:flex;flex-direction:column;overflow:hidden;">
+    <div style="padding:20px 24px 14px;border-bottom:1px solid var(--border);flex-shrink:0">
+      <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px">
+        <div>
+          <h2 id="dTitle" style="font-size:15px;font-weight:600;color:var(--text-primary);margin:0 0 3px"></h2>
+          <p id="dSub" style="font-size:12.5px;color:var(--text-tertiary);margin:0"></p>
+        </div>
+        <div style="text-align:right;flex-shrink:0">
+          <div id="dTotal" style="font-size:19px;font-weight:600;color:var(--text-primary);font-variant-numeric:tabular-nums"></div>
+          <div style="font-size:11px;color:var(--text-tertiary);text-transform:uppercase;letter-spacing:.05em">Total</div>
+        </div>
+      </div>
+    </div>
+    <div class="detail-wrap" id="dBody"></div>
+    <div style="padding:12px 24px;border-top:1px solid var(--border);flex-shrink:0">
+      <button onclick="hideDetail()" style="width:100%;padding:9px;background:none;border:none;font-size:13px;color:var(--text-secondary-alt);cursor:pointer;border-radius:8px;transition:background .15s ease" onmouseover="this.style.background='var(--hover-bg)'" onmouseout="this.style.background='none'">Close</button>
+    </div>
+  </div>
+</div>
 <script>
 const MY_TIER = '${tier}';
 const MY_EMAIL = '${email}';
 ${authParamJs}
 let allUsers = [];
+// Month currently being viewed, as YYYY-MM. Empty means "whatever the server
+// considers current" — the first load leaves it to the server so the client's
+// clock can't put the panel in a different month than the data.
+let curMonth = '';
+let earliestMonth = null;
 
 const AV_COLORS = [['#8b5cf6','#6d28d9'],['#3b82f6','#1d4ed8'],['#10b981','#047857'],['#f59e0b','#b45309'],['#ef4444','#b91c1c'],['#ec4899','#be185d'],['#06b6d4','#0e7490'],['#84cc16','#4d7c0f'],['#a855f7','#7e22ce'],['#0ea5e9','#0369a1']];
 function avColor(n) { var h=0; for(var i=0;i<n.length;i++) h=(h*31+n.charCodeAt(i))&0x7fffffff; var c=AV_COLORS[h%AV_COLORS.length]; return 'linear-gradient(135deg,'+c[0]+','+c[1]+')'; }
@@ -501,19 +672,63 @@ function initials(n) { var p=n.trim().split(/\\s+/); return (p.length>=2?p[0][0]
 function roleLabel(t) { return t==='OWNER'?'Primary owner':t==='ADMIN'?'Admin':'User'; }
 function canActOn(t) { return (MY_TIER==='OWNER' || MY_TIER==='ADMIN') && t !== 'OWNER'; }
 
+// Amounts are USD — the currency Anthropic bills in. Anything above zero but
+// below a cent shows as "< $0.01" so a member who used the assistant is never
+// displayed identically to one who never touched it.
+function money(v) {
+  v = v || 0;
+  if (v > 0 && v < 0.01) return '< $0.01';
+  return '$' + v.toFixed(2);
+}
+
+const MONTH_NAMES = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+function monthLabel(key) {
+  const p = String(key || '').split('-');
+  if (p.length !== 2) return key || '';
+  return MONTH_NAMES[Number(p[1]) - 1] + ' ' + p[0];
+}
+function shiftMonth(key, delta) {
+  const p = String(key).split('-');
+  let y = Number(p[0]), m = Number(p[1]) - 1 + delta;
+  y += Math.floor(m / 12);
+  m = ((m % 12) + 12) % 12;
+  return y + '-' + String(m + 1).padStart(2, '0');
+}
+function thisMonthKey() {
+  const n = new Date();
+  return n.getUTCFullYear() + '-' + String(n.getUTCMonth() + 1).padStart(2, '0');
+}
+
 async function load() {
   try {
-    const r = await fetch('/org-admin/api/users?' + authParam());
+    const q = authParam() + (curMonth ? '&month=' + encodeURIComponent(curMonth) : '');
+    const r = await fetch('/org-admin/api/users?' + q);
     if (!r.ok) throw new Error(await r.text());
     const d = await r.json();
     allUsers = d.users || [];
+    curMonth = d.month || curMonth;
+    if (d.earliestMonth) earliestMonth = d.earliestMonth;
     render(allUsers);
     document.getElementById('totalMembers').textContent = allUsers.length;
+    document.getElementById('orgTotal').textContent = money(d.orgTotal);
+    document.getElementById('orgTotalPeriod').textContent = monthLabel(curMonth);
+    document.getElementById('mLabel').textContent = monthLabel(curMonth);
+    // Stop the arrows at the real edges of the data: there is nothing before
+    // the first recorded transaction, and nothing after the current month.
+    document.getElementById('mPrev').disabled = !!(earliestMonth && curMonth <= earliestMonth);
+    document.getElementById('mNext').disabled = curMonth >= thisMonthKey();
     document.getElementById('countLbl').textContent = allUsers.length + ' member' + (allUsers.length!==1?'s':'');
     // Tell parent LibreChat page the current user's role (for Account settings display)
     try { window.parent.postMessage({ type: 'abk_org_role', role: MY_TIER }, '*'); } catch(ex) {}
   } catch(e) { showErr('Failed to load: ' + e.message); }
 }
+
+document.getElementById('mPrev').addEventListener('click', function() {
+  curMonth = shiftMonth(curMonth || thisMonthKey(), -1); load();
+});
+document.getElementById('mNext').addEventListener('click', function() {
+  curMonth = shiftMonth(curMonth || thisMonthKey(), 1); load();
+});
 
 function render(users) {
   const tb = document.getElementById('tbody');
@@ -542,9 +757,14 @@ function render(users) {
       \${canAct ? \`<button class="btn-remove" onclick="delUser('\${esc(u.email)}')">Remove</button>\` : ''}
     </td>\` : '';
 
-    const usageCell = \`<span class="role-text">\${(u.consumed || 0).toLocaleString('en-US')}</span>\`;
+    // A plain USER may only drill into their own spend (the API enforces this
+    // too) — so only make the row look clickable when it actually is.
+    const canDrill = MY_TIER !== 'USER' || isMe;
+    const usageCell = canDrill
+      ? \`<a class="spend-val" style="color:var(--accent);text-decoration:none" href="#" onclick="showDetail('\${esc(u.email)}');return false;">\${money(u.consumed)}</a>\`
+      : \`<span class="role-text spend-val">\${money(u.consumed)}</span>\`;
 
-    return \`<tr>
+    return \`<tr class="\${canDrill ? 'row-link' : ''}">
       <td><div class="name-cell">
         <div class="avatar" style="background:\${color}">\${initials(name)}</div>
         <div><div class="name-primary">\${name}\${youBadge}</div><div class="name-secondary">\${u.email}</div></div>
@@ -554,6 +774,88 @@ function render(users) {
       \${actCell}
     </tr>\`;
   }).join('');
+}
+
+// ── Spend detail ─────────────────────────────────────────────────────────────
+
+function hideDetail() { document.getElementById('detailModal').style.display = 'none'; }
+document.getElementById('detailModal').addEventListener('click', function(e) { if (e.target === this) hideDetail(); });
+document.addEventListener('keydown', function(e) { if (e.key === 'Escape') hideDetail(); });
+
+// The Monday starting the week that contains d. Weekly subtotals are keyed and
+// labelled by this date rather than by an ISO week number — "Week of 24 Aug"
+// says which days it covers, "Week 35" does not.
+function weekStart(d) {
+  const t = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+  t.setUTCDate(t.getUTCDate() - ((t.getUTCDay() + 6) % 7));
+  return t;
+}
+
+async function showDetail(email) {
+  const modal = document.getElementById('detailModal');
+  const body = document.getElementById('dBody');
+  const u = allUsers.find(function(x) { return x.email === email; });
+  document.getElementById('dTitle').textContent = (u && u.name) || email;
+  document.getElementById('dSub').textContent = email + ' · ' + monthLabel(curMonth);
+  document.getElementById('dTotal').textContent = '';
+  body.innerHTML = '<div style="padding:28px 24px"><div class="skeleton" style="height:11px;width:70%;margin-bottom:10px"></div><div class="skeleton" style="height:11px;width:50%;margin-bottom:10px"></div><div class="skeleton" style="height:11px;width:60%"></div></div>';
+  modal.style.display = 'flex';
+
+  try {
+    const q = authParam() + (curMonth ? '&month=' + encodeURIComponent(curMonth) : '');
+    const r = await fetch('/org-admin/api/usage/' + encodeURIComponent(email) + '?' + q);
+    if (!r.ok) throw new Error(await r.text());
+    const d = await r.json();
+    document.getElementById('dTotal').textContent = money(d.total);
+    renderDetail(body, d);
+  } catch (e) {
+    body.innerHTML = '<div style="padding:28px 24px;font-size:13px;color:var(--danger)">Failed to load: ' + e.message + '</div>';
+  }
+}
+
+function renderDetail(body, d) {
+  const days = d.days || [];
+  if (!days.length) {
+    body.innerHTML = '<div class="empty-cell" style="padding:44px 20px">No activity in ' + monthLabel(d.month) + '</div>';
+    return;
+  }
+
+  // Scale the inline bars against the busiest day so the shape of the month is
+  // readable at a glance rather than every bar being near-invisible.
+  const peak = days.reduce(function(m, x) { return Math.max(m, x.usd); }, 0) || 1;
+
+  let rows = '', lastWeek = null, lastWeekLabel = '', wkSum = 0, wkTok = 0;
+  function flushWeek() {
+    if (lastWeek === null) return;
+    rows += '<tr class="wk-row"><td>Week of ' + lastWeekLabel + '</td><td>' + wkTok.toLocaleString('en-US') + '</td><td colspan="2">' + money(wkSum) + '</td></tr>';
+    wkSum = 0; wkTok = 0;
+  }
+
+  days.forEach(function(x) {
+    const dt = new Date(x.date + 'T00:00:00Z');
+    const ws = weekStart(dt);
+    const wk = ws.toISOString().slice(0, 10);
+    if (lastWeek !== null && wk !== lastWeek) flushWeek();
+    lastWeek = wk;
+    lastWeekLabel = ws.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', timeZone: 'UTC' });
+    wkSum += x.usd; wkTok += x.tokens;
+    const label = dt.toLocaleDateString('en-GB', { weekday: 'short', day: '2-digit', month: 'short', timeZone: 'UTC' });
+    const pct = Math.max(2, Math.round((x.usd / peak) * 100));
+    rows += '<tr><td>' + label + '</td><td>' + x.tokens.toLocaleString('en-US') + '</td><td>' + money(x.usd) +
+            '</td><td style="width:34%"><div class="bar" style="width:' + pct + '%"></div></td></tr>';
+  });
+  flushWeek();
+
+  let modelRows = '';
+  (d.models || []).forEach(function(m) {
+    modelRows += '<tr><td colspan="2">' + m.model + '</td><td colspan="2">' + money(m.usd) + '</td></tr>';
+  });
+
+  body.innerHTML =
+    '<table class="detail-table"><thead><tr><th>Day</th><th>Tokens</th><th>Spend</th><th></th></tr></thead><tbody>' + rows + '</tbody></table>' +
+    (modelRows
+      ? '<table class="detail-table" style="margin-top:6px"><thead><tr><th colspan="2">By model</th><th colspan="2">Spend</th></tr></thead><tbody>' + modelRows + '</tbody></table>'
+      : '');
 }
 
 function filterUsers() {
@@ -1104,16 +1406,56 @@ export function registerOrgAdminEndpoints(app: Express): void {
       return;
     }
     try {
-      const [lcUsers, usage] = await Promise.all([getLcUsers(), getUsageByUser()]);
+      const range = monthRange(qstr(req.query.month));
+      const [lcUsers, usage, earliestMonth] = await Promise.all([
+        getLcUsers(),
+        getUsageByUser(range),
+        getEarliestMonth(),
+      ]);
       const users = lcUsers.map((u) => ({
         email: u.email,
         name: u.name || u.username || u.email.split("@")[0],
         tier: getTier(u.email, u.role, u.orgRole),
         consumed: usage.get(String(u._id)) ?? 0,
       }));
-      res.json({ users, tier: info.tier });
+      const orgTotal = users.reduce((s, u) => s + u.consumed, 0);
+      res.json({ users, tier: info.tier, month: range.key, orgTotal, earliestMonth });
     } catch (e) {
       log(`/api/users error: ${e}`);
+      res.status(500).json({ error: String(e) });
+    }
+  });
+
+  // Per-user spend detail for one month: day-by-day plus a per-model split.
+  // Any signed-in member may open this; a plain USER can only open their own,
+  // so one colleague can't inspect another's activity.
+  app.get("/org-admin/api/usage/:email", async (req: Request, res: Response) => {
+    const info = await resolveAuth(req);
+    if (!info) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+    const email = String(req.params.email);
+    if (info.tier === "USER" && email.toLowerCase() !== info.email.toLowerCase()) {
+      res.status(403).json({ error: "Forbidden" });
+      return;
+    }
+    try {
+      const target = await getLcUserByEmail(email);
+      if (!target?._id) {
+        res.status(404).json({ error: "No such member" });
+        return;
+      }
+      const range = monthRange(qstr(req.query.month));
+      const userId = String(target._id);
+      const [days, models] = await Promise.all([
+        getDailyUsage(userId, range),
+        getModelUsage(userId, range),
+      ]);
+      const total = days.reduce((s, d) => s + d.usd, 0);
+      res.json({ email: target.email, month: range.key, days, models, total });
+    } catch (e) {
+      log(`/api/usage error: ${e}`);
       res.status(500).json({ error: String(e) });
     }
   });
