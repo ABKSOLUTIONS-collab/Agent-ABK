@@ -1210,3 +1210,91 @@ console.log(`ABK branding applied (idempotent)! Logo replaced in ${logoReplaced}
     console.log('  routes/mcp.js patched: forced fresh OAuth for agent365-bridge on every reconnect.');
   }
 }
+
+// ── Add pricing for current-generation Claude models ────────────────────────
+// LibreChat's token price table (packages/data-schemas .../tx) predates the
+// Claude 5 family. Model lookup falls back to the catch-all
+//   'claude-': { prompt: 0.8, completion: 2.4 }
+// for anything it doesn't recognise, so claude-sonnet-5 was being costed at
+// $0.80/$2.40 per 1M instead of $3/$15 — roughly a quarter of the real spend.
+// That silently understated BOTH LibreChat's own in-chat cost display
+// (interface.contextCost) and the per-user usage figures in Organization
+// Settings, which read the same `tokenValue` the table produces.
+//
+// Rates below are Anthropic's published list prices per 1M tokens. Cache
+// entries follow Anthropic's standard multipliers (write = 1.25x input,
+// read = 0.1x input), matching how the existing 4.x rows are derived.
+//
+// NOTE ON SONNET 5: Anthropic ran an introductory rate of $2/$10 through
+// 2026-08-31, after which it is $3/$15. We deliberately encode the standard
+// $3/$15 rather than date-switching logic that would be dead code within
+// days — this slightly OVER-states cost until 31 Aug and is exact from
+// 1 Sep onward. Over-stating is the safe direction for a budget figure.
+{
+  const path = require('path');
+  const distDir = '/app/packages/data-schemas/dist';
+
+  // Anchor on the newest existing rows; new rows are inserted directly after
+  // so the surrounding key-specificity ordering is preserved.
+  const baseAnchor  = "'claude-sonnet-4-6': { prompt: 3, completion: 15 },";
+  const cacheAnchor = "'claude-sonnet-4-6': { write: 3.75, read: 0.3 },";
+
+  const baseRows = [
+    "'claude-sonnet-5': { prompt: 3, completion: 15 },",
+    "'claude-opus-4-8': { prompt: 5, completion: 25 },",
+    "'claude-opus-5': { prompt: 5, completion: 25 },",
+    "'claude-fable-5': { prompt: 10, completion: 50 },",
+  ].join('\n    ');
+
+  const cacheRows = [
+    "'claude-sonnet-5': { write: 3.75, read: 0.3 },",
+    "'claude-opus-4-8': { write: 6.25, read: 0.5 },",
+    "'claude-opus-5': { write: 6.25, read: 0.5 },",
+    "'claude-fable-5': { write: 12.5, read: 1 },",
+  ].join('\n    ');
+
+  function collectJs(dir, out) {
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { return out; }
+    for (const e of entries) {
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) collectJs(p, out);
+      else if (e.name.endsWith('.js')) out.push(p);
+    }
+    return out;
+  }
+
+  let patchedFiles = 0, alreadyPatched = 0;
+  for (const file of collectJs(distDir, [])) {
+    let src = fs.readFileSync(file, 'utf8');
+    if (!src.includes(baseAnchor) && !src.includes(cacheAnchor)) continue;
+
+    // The price table is duplicated across several bundled entry points, so
+    // every file carrying it has to be patched — but each is patched once.
+    if (src.includes("'claude-sonnet-5'")) { alreadyPatched++; continue; }
+
+    let changed = false;
+    if (src.includes(baseAnchor)) {
+      src = src.split(baseAnchor).join(baseAnchor + '\n    ' + baseRows);
+      changed = true;
+    }
+    if (src.includes(cacheAnchor)) {
+      src = src.split(cacheAnchor).join(cacheAnchor + '\n    ' + cacheRows);
+      changed = true;
+    }
+    if (changed) {
+      fs.writeFileSync(file, src);
+      patchedFiles++;
+      console.log(`  pricing patched in: ${file.replace(distDir + '/', '')}`);
+    }
+  }
+
+  if (patchedFiles === 0 && alreadyPatched === 0) {
+    throw new Error(
+      'Claude pricing patch: no file under ' + distDir + ' contained the ' +
+      'expected claude-sonnet-4-6 price rows. LibreChat likely restructured ' +
+      'its token price table — update the pricing patch in patch.js.'
+    );
+  }
+  console.log(`Claude 5 pricing applied (${patchedFiles} file(s) patched, ${alreadyPatched} already current).`);
+}
