@@ -27,3 +27,14 @@ interface:
   currency:
     code: EUR
     rate: 0.92                # static USD->EUR multiplier — update periodically, not live-fetched
+  # LibreChat's default is share:false, public:false for agents — without this,
+  # the Agent Builder "Share"/"Make public" control never appears at all, for
+  # any role, because the interface-level toggle gates it before the per-agent
+  # ACL system (aclEntry, PrincipalType.PUBLIC) is even reached. Agent Builder
+  # itself stays admin-only via patch.js's role gating on the nav button; this
+  # only turns on the sharing control for whoever already has that button.
+  agents:
+    use: true
+    create: true
+    share: true
+    public: true
