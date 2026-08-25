@@ -31,15 +31,17 @@ const inject = `<!-- ABK_START -->
 
   /* ── Sidebar restrictions ──────────────────────────────────────────
      Prompts / Memories / Bookmarks / Attach Files: removed for everyone.
-     Agent Builder / Skills: hidden by default, unhidden by JS
-     (applyAdminOnlyVisibility) only once the signed-in user is confirmed
-     an org ADMIN/OWNER — CSS-first so there's no flash of a forbidden nav
-     item for plain USERs while the role check is still in flight. */
+     Agent Builder: available to EVERY role — plain USERs may build their own
+     agents; they just can't share them (the Share rule below is owner-only,
+     and it applies to all non-owners including USERs).
+     Skills: still hidden by default, unhidden by JS (applyAdminOnlyVisibility)
+     only once the signed-in user is confirmed an org ADMIN/OWNER — CSS-first
+     so there's no flash of a forbidden nav item for plain USERs while the
+     role check is still in flight. */
   button[aria-label="Prompts"],
   button[aria-label="Memories"],
   button[aria-label="Bookmarks"],
   button[aria-label="Attach Files"] { display: none !important; }
-  button[aria-label="Agent Builder"]:not([data-abk-admin-ok]),
   button[aria-label="Skills"]:not([data-abk-admin-ok]) { display: none !important; }
   /* Agent sharing is primary-owner-only — label is dynamic ("Share {agent name}") */
   button[aria-label^="Share "]:not([data-abk-owner-ok]) { display: none !important; }
@@ -593,14 +595,18 @@ if ('serviceWorker' in navigator) {
         .catch(function() {});
     }, 4000);
   }
-  // "Agent Builder" and "Skills" are hidden by default via CSS
-  // ([data-abk-admin-ok] gate, see the injected <style>) until we know the
-  // signed-in user is an org ADMIN/OWNER — same reasoning as the
-  // Organization Settings rail icon above: a plain USER should never see
-  // these entry points at all.
+  // "Skills" is hidden by default via CSS ([data-abk-admin-ok] gate, see the
+  // injected <style>) until we know the signed-in user is an org ADMIN/OWNER
+  // — same reasoning as the Organization Settings rail icon above: a plain
+  // USER should never see that entry point at all.
+  //
+  // "Agent Builder" used to be gated here too, but agent creation is now open
+  // to every role: a USER can build their own agent, they just can't share it
+  // (applyOwnerOnlyVisibility below keeps Share owner-only for everyone else,
+  // USERs included).
   function applyAdminOnlyVisibility() {
     if (abkIsOrgAdmin !== true) return;
-    document.querySelectorAll('button[aria-label="Agent Builder"], button[aria-label="Skills"]').forEach(function(b) {
+    document.querySelectorAll('button[aria-label="Skills"]').forEach(function(b) {
       b.setAttribute('data-abk-admin-ok', '1');
     });
   }
