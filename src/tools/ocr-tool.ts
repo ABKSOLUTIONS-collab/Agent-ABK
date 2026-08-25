@@ -163,9 +163,9 @@ export class OcrToolHandler {
   async handleToolCall(
     name: string,
     args: Record<string, unknown>
-  ): Promise<{ content: { type: string; text: string }[] }> {
+  ): Promise<{ content: { type: string; text: string }[]; isError?: boolean }> {
     if (name !== "ocr_search_and_read") {
-      return { content: [{ type: "text", text: `Unknown OCR tool: ${name}` }] };
+      return { content: [{ type: "text", text: `Unknown OCR tool: ${name}` }], isError: true };
     }
 
     const query         = args.query         as string | undefined;
@@ -180,6 +180,7 @@ export class OcrToolHandler {
     if (!directDriveId && !directItemId && !query) {
       return {
         content: [{ type: "text", text: "OCR error: provide either (drive_id + item_id) or query." }],
+        isError: true,
       };
     }
 
@@ -306,6 +307,7 @@ export class OcrToolHandler {
     } catch (err: any) {
       return {
         content: [{ type: "text", text: `OCR error: ${err.message ?? err}` }],
+        isError: true,
       };
     }
   }

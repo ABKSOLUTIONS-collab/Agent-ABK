@@ -473,14 +473,15 @@ export class EmailGraphToolHandler {
   async handleToolCall(
     name: string,
     args: Record<string, unknown>
-  ): Promise<{ content: Array<{ type: string; text: string }> }> {
+  ): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
     try {
       const text = await this.dispatch(name, args);
-      return { content: [{ type: "text", text }] };
+      const isError = /^(Error|Unknown)/.test(text);
+      return { content: [{ type: "text", text }], ...(isError ? { isError: true } : {}) };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       log(`${name} error: ${msg}`);
-      return { content: [{ type: "text", text: `Error: ${msg}` }] };
+      return { content: [{ type: "text", text: `Error: ${msg}` }], isError: true };
     }
   }
 

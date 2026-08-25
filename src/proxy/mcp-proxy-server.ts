@@ -9,7 +9,7 @@ import {
 import { ResolvedServer } from "../config/types";
 import { ToolForwarder } from "./tool-forwarder";
 import { CachedTool, loadToolsCache, saveToolsCache } from "../auth/tools-cache";
-import { getUserToken, getGraphToken, getTokenEmail, getStoredEmail, pruneExpiredTokens } from "../auth/user-token-store";
+import { getUserToken, getGraphToken, getStoredEmail, pruneExpiredTokens } from "../auth/user-token-store";
 import { registerOAuthEndpoints } from "../auth/oauth-handler";
 import { SHAREPOINT_TOOLS, SHAREPOINT_TOOL_NAMES, SharePointToolHandler } from "../tools/sharepoint-tools";
 import { OCR_TOOL, OCR_TOOL_NAMES, OcrToolHandler } from "../tools/ocr-tool";
@@ -69,6 +69,11 @@ const HARDCODED_TOOL_NAMES = new Set<string>([
   SET_SIGNATURE_TOOL_NAME,
 ]);
 
+// Discovered (not hardcoded) tools that resolve a SharePoint site by name —
+// these come from the live Agent 365 gateway and do literal/partial matching
+// with no fuzzy fallback. See the site-name search fallback below.
+const SITE_NAME_SEARCH_TOOL_NAMES = new Set<string>(["searchSitesByName"]);
+
 interface ToolRegistryEntry {
   uniqueName: string;
   originalName: string;
@@ -81,6 +86,100 @@ interface UserDiscoveryCache {
   toolRegistry: Map<string, ToolRegistryEntry>;
   forwarder: ToolForwarder;
   discoveredAt: number;
+}
+
+// ── Discoverable tool surface ────────────────────────────────────────────────
+// Rather than listing all ~70 tools (hardcoded + discovered) up front — which
+// means re-sending every schema as input tokens on every single message,
+// whether or not that turn needs SharePoint/Excel/Teams/etc. — only these two
+// meta-tools are advertised. find_tools searches the full catalog by keyword
+// and returns matching schemas; call_tool then invokes one by exact name.
+// Nothing is removed: every real tool is still reachable, just addressed
+// indirectly instead of always being in context.
+const FIND_TOOLS_TOOL: Tool = {
+  name: "find_tools",
+  description:
+    "Search the full Microsoft 365 tool catalog (mail, calendar, Word, Excel, Teams, " +
+    "SharePoint, OneDrive, knowledge search, OCR, email signature, and more) by keyword. " +
+    "Only find_tools and call_tool are listed up front to save context — this is how you " +
+    "discover everything else. Returns matching tools with their full parameter schema. " +
+    "Call this whenever you need a capability that isn't already visible to you, then " +
+    "invoke the result via call_tool.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      query: {
+        type: "string",
+        description:
+          "Keywords describing what you want to do, e.g. 'reply to an email', " +
+          "'list SharePoint folder', 'create calendar event', 'search files'.",
+      },
+    },
+    required: ["query"],
+  },
+};
+
+const CALL_TOOL_TOOL: Tool = {
+  name: "call_tool",
+  description:
+    "Invoke any tool found via find_tools. Pass the exact tool name and arguments " +
+    "matching the schema find_tools returned for it.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      name: { type: "string", description: "Exact tool name, as returned by find_tools." },
+      arguments: { type: "object", description: "Arguments matching that tool's inputSchema." },
+    },
+    required: ["name"],
+  },
+};
+
+// Loose shape for the searchable catalog — OCR_TOOL/SIGNATURE_STYLE_TOOL
+// aren't explicitly typed as Tool in their source files, and these are only
+// ever rendered into a find_tools text listing, never handed back to the SDK,
+// so a strict Tool[] return type here would reject them for no benefit.
+interface ToolLike {
+  name: string;
+  description?: string;
+  inputSchema: unknown;
+}
+
+function allToolDefs(toolRegistry: Map<string, ToolRegistryEntry>): ToolLike[] {
+  return [
+    ...Array.from(toolRegistry.values()).map((e) => e.toolDef),
+    ...SHAREPOINT_TOOLS,
+    ...EMAIL_GRAPH_TOOLS,
+    ...CALENDAR_GRAPH_TOOLS,
+    ...WORD_GRAPH_TOOLS,
+    ...EXCEL_GRAPH_TOOLS,
+    ...TEAMS_GRAPH_TOOLS,
+    ...KNOWLEDGE_GRAPH_TOOLS,
+    OCR_TOOL,
+    SIGNATURE_STYLE_TOOL,
+  ];
+}
+
+function searchTools(toolRegistry: Map<string, ToolRegistryEntry>, query: string, limit = 12): ToolLike[] {
+  const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
+  const all = allToolDefs(toolRegistry);
+  if (terms.length === 0) return all.slice(0, limit);
+  const scored = all
+    .map((t) => {
+      const haystack = `${t.name} ${t.description ?? ""}`.toLowerCase();
+      const score = terms.reduce((s, term) => s + (haystack.includes(term) ? 1 : 0), 0);
+      return { t, score };
+    })
+    .filter((x) => x.score > 0);
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, limit).map((x) => x.t);
+}
+
+interface ToolCallContext {
+  graphToken: string | null;
+  email: string | undefined;
+  toolRegistry: Map<string, ToolRegistryEntry>;
+  forwarder: ToolForwarder | null;
+  userCacheEntry: UserDiscoveryCache | null;
 }
 
 const DISCOVERY_TTL_MS = 25 * 60 * 1000;
@@ -102,7 +201,7 @@ export class McpProxyServer {
     const cached = await loadToolsCache();
     if (cached && cached.length > 0) {
       this.rebuildSharedRegistry(cached);
-      log(`Loaded ${this.sharedToolRegistry.size} tools from Table Storage cache`);
+      log(`Loaded ${this.sharedToolRegistry.size} tools from Blob Storage cache`);
     }
   }
 
@@ -311,299 +410,44 @@ export class McpProxyServer {
         );
 
         sessionServer.setRequestHandler(ListToolsRequestSchema, async () => ({
-          tools: [
-            ...Array.from(toolRegistry.values()).map((e) => e.toolDef),
-            ...SHAREPOINT_TOOLS,
-            ...EMAIL_GRAPH_TOOLS,
-            ...CALENDAR_GRAPH_TOOLS,
-            ...WORD_GRAPH_TOOLS,
-            ...EXCEL_GRAPH_TOOLS,
-            ...TEAMS_GRAPH_TOOLS,
-            ...KNOWLEDGE_GRAPH_TOOLS,
-            OCR_TOOL,
-            SIGNATURE_STYLE_TOOL,
-          ],
+          tools: [FIND_TOOLS_TOOL, CALL_TOOL_TOOL],
         }));
 
         sessionServer.setRequestHandler(CallToolRequestSchema, async (request) => {
           const { name, arguments: args } = request.params;
-          let typedArgs = (args ?? {}) as Record<string, unknown>;
+          const typedArgs = (args ?? {}) as Record<string, unknown>;
+          const ctx: ToolCallContext = { graphToken, email, toolRegistry, forwarder, userCacheEntry };
 
-          if (SHAREPOINT_TOOL_NAMES.has(name)) {
-            if (!graphToken) {
-              return { content: [{ type: "text", text: "Graph token not available. Please re-authenticate at /login." }] };
+          if (name === FIND_TOOLS_TOOL.name) {
+            const query = String(typedArgs.query ?? "");
+            const matches = searchTools(toolRegistry, query);
+            if (matches.length === 0) {
+              return { content: [{ type: "text", text: `No tools matched "${query}". Try broader or different keywords.` }] };
             }
-            const handler = new SharePointToolHandler(graphToken);
-            return handler.handleToolCall(name, typedArgs);
+            const listing = matches
+              .map((t) => `### ${t.name}\n${t.description ?? ""}\nSchema: ${JSON.stringify(t.inputSchema)}`)
+              .join("\n\n");
+            return {
+              content: [{
+                type: "text",
+                text: `Found ${matches.length} matching tool(s). Call each via call_tool with the exact name and arguments matching its schema below:\n\n${listing}`,
+              }],
+            };
           }
 
-          if (OCR_TOOL_NAMES.has(name)) {
-            if (!graphToken) {
-              return { content: [{ type: "text", text: "Graph token not available. Please re-authenticate at /login." }] };
+          if (name === CALL_TOOL_TOOL.name) {
+            const innerName = String(typedArgs.name ?? "");
+            const innerArgs = (typedArgs.arguments ?? {}) as Record<string, unknown>;
+            if (!innerName) {
+              return { content: [{ type: "text", text: "Error: call_tool requires a 'name' field — use find_tools first to get the exact tool name and schema." }], isError: true };
             }
-            const handler = new OcrToolHandler(graphToken);
-            return handler.handleToolCall(name, typedArgs);
+            return executeToolCall(innerName, innerArgs, ctx);
           }
 
-          // ── CreateDraftMessage: inject signature + CID logo before creating ──
-          if (name === "CreateDraftMessage" && graphToken) {
-            let signature: string | null = null;
-            try {
-              signature = await getUserSignatureStrict(graphToken);
-            } catch (e) { log(`Signature check failed: ${e}`); }
-
-            if (!signature) {
-              return { content: [{ type: "text", text: SIGNATURE_REQUIRED_MESSAGE }], isError: true };
-            }
-
-            const rawBody  = String(typedArgs.body ?? typedArgs.emailBody ?? "");
-            const bodyType = String(typedArgs.contentType ?? typedArgs.bodyType ?? "text");
-            typedArgs = { ...typedArgs, body: appendSignature(rawBody, bodyType, signature), contentType: "HTML" };
-            log("Signature injected into CreateDraftMessage");
-
-            const handler = new EmailGraphToolHandler(graphToken);
-            const result   = await handler.handleToolCall(name, typedArgs);
-
-            // Add CID logo attachment to the newly created draft
-            if (LOGO_BASE64) {
-              try {
-                const text  = (result.content?.[0] as { text?: string })?.text ?? "";
-                const match = text.match(/ID:\s*([A-Za-z0-9_\-=]+)/);
-                if (match?.[1]) {
-                  await fetch(`https://graph.microsoft.com/v1.0/me/messages/${match[1]}/attachments`, {
-                    method: "POST",
-                    headers: { Authorization: `Bearer ${graphToken}`, "Content-Type": "application/json" },
-                    body: JSON.stringify({
-                      "@odata.type": "#microsoft.graph.fileAttachment",
-                      name: "abk-logo.png", contentType: "image/png",
-                      contentBytes: LOGO_BASE64, contentId: "abk-logo@abk", isInline: true,
-                    }),
-                  });
-                  log(`CID logo attachment added to draft ${match[1]}`);
-                }
-              } catch (e) { log(`CID attachment failed (non-fatal): ${e}`); }
-            }
-            return result;
-          }
-
-          // ── SendEmailWithAttachments: create draft + CID attachment + send ──
-          // We can't call /me/sendMail directly (needs Mail.Send on graphToken).
-          // Instead: create draft via Graph (Mail.ReadWrite ✓) → add CID attachment
-          // → send via upstream SendDraftMessage tool (has Mail.Send ✓).
-          // NOTE: must run BEFORE the generic EMAIL_GRAPH_TOOL_NAMES check below,
-          // which would otherwise intercept this name first and skip signature/CID injection.
-          if (name === "SendEmailWithAttachments" && graphToken && LOGO_BASE64) {
-            const signature = await getUserSignatureStrict(graphToken).catch(() => null);
-            if (!signature) {
-              return { content: [{ type: "text", text: SIGNATURE_REQUIRED_MESSAGE }], isError: true };
-            }
-            try {
-              const rawBody  = String(typedArgs.body ?? typedArgs.emailBody ?? "");
-              const bodyType = String(typedArgs.contentType ?? typedArgs.bodyType ?? "text");
-              const htmlBody = appendSignature(rawBody, bodyType, signature);
-
-              // Schema allows "to"/"cc"/"bcc" as either a single string or an
-              // array of strings — normalize both before mapping to Graph shape.
-              const buildRecipients = (val: unknown) =>
-                (Array.isArray(val) ? val : val ? [val] : [])
-                  .map((r: unknown) => ({ emailAddress: { address: String(r) } }));
-
-              // 1️⃣ Create draft
-              const draftResp = await fetch("https://graph.microsoft.com/v1.0/me/messages", {
-                method: "POST",
-                headers: { Authorization: `Bearer ${graphToken}`, "Content-Type": "application/json" },
-                body: JSON.stringify({
-                  subject:       String(typedArgs.subject ?? ""),
-                  body:          { contentType: "HTML", content: htmlBody },
-                  toRecipients:  buildRecipients(typedArgs.to),
-                  ccRecipients:  buildRecipients(typedArgs.cc),
-                  bccRecipients: buildRecipients(typedArgs.bcc),
-                }),
-              });
-
-              if (!draftResp.ok) {
-                log(`Create draft failed: ${draftResp.status} — falling back to upstream`);
-              } else {
-                const draft = await draftResp.json() as { id: string };
-                const msgId = draft.id;
-
-                // 2️⃣ Add inline CID attachment
-                await fetch(`https://graph.microsoft.com/v1.0/me/messages/${msgId}/attachments`, {
-                  method: "POST",
-                  headers: { Authorization: `Bearer ${graphToken}`, "Content-Type": "application/json" },
-                  body: JSON.stringify({
-                    "@odata.type": "#microsoft.graph.fileAttachment",
-                    name:         "abk-logo.png",
-                    contentType:  "image/png",
-                    contentBytes: LOGO_BASE64,
-                    contentId:    "abk-logo@abk",
-                    isInline:     true,
-                  }),
-                });
-
-                // 3️⃣ Send directly via Graph API (no Copilot license needed)
-                const sendRes = await fetch(`https://graph.microsoft.com/v1.0/me/messages/${msgId}/send`, {
-                  method: "POST",
-                  headers: { Authorization: `Bearer ${graphToken}` },
-                });
-                if (sendRes.ok || sendRes.status === 202) {
-                  log(`Email sent via Graph API direct send (msg: ${msgId})`);
-                  return { content: [{ type: "text", text: "Email sent successfully." }] };
-                }
-                const sendErr = await sendRes.text().catch(() => "");
-                log(`Graph direct send failed (${sendRes.status}): ${sendErr} — trying upstream`);
-
-                // Fallback: upstream SendDraftMessage. Look this up directly on the
-                // discovered servers (not the deduped toolRegistry, which excludes
-                // this name since it also has a hardcoded handler) so forwarding
-                // still works when the direct Graph send above fails for some
-                // reason other than the bug this was fixed for.
-                if (forwarder && userCacheEntry) {
-                  for (const s of userCacheEntry.servers) {
-                    const dynTool = s.tools.find(t => t.name === "SendDraftMessage");
-                    if (dynTool) {
-                      const result = await forwarder.callTool("SendDraftMessage", { messageId: msgId }, s);
-                      log(`Email sent via draft+CID+upstream-send (msg: ${msgId})`);
-                      return result;
-                    }
-                  }
-                }
-
-                log(`Email draft created with CID logo (msg: ${msgId}) — could not auto-send`);
-                return { content: [{ type: "text", text: `Draft created with your signature, but could not send automatically (${sendErr || sendRes.status}). Please send it from Outlook (id: ${msgId})` }] };
-              }
-            } catch (sigErr) {
-              log(`Draft+CID send failed (non-fatal): ${sigErr} — falling back to upstream`);
-            }
-          }
-
-          // ── SendDraftMessage: add CID attachment then send directly via Graph ──
-          // NOTE: must also run BEFORE the generic EMAIL_GRAPH_TOOL_NAMES check below.
-          if (name === "SendDraftMessage" && graphToken) {
-            try {
-              const msgId = String(typedArgs.messageId ?? typedArgs.draftId ?? typedArgs.id ?? "");
-              if (msgId) {
-                if (LOGO_BASE64) {
-                  await fetch(`https://graph.microsoft.com/v1.0/me/messages/${msgId}/attachments`, {
-                    method: "POST",
-                    headers: { Authorization: `Bearer ${graphToken}`, "Content-Type": "application/json" },
-                    body: JSON.stringify({
-                      "@odata.type": "#microsoft.graph.fileAttachment",
-                      name: "abk-logo.png", contentType: "image/png",
-                      contentBytes: LOGO_BASE64, contentId: "abk-logo@abk", isInline: true,
-                    }),
-                  });
-                  log(`CID attachment added to draft ${msgId} before send`);
-                }
-                const sendRes = await fetch(`https://graph.microsoft.com/v1.0/me/messages/${msgId}/send`, {
-                  method: "POST",
-                  headers: { Authorization: `Bearer ${graphToken}` },
-                });
-                if (sendRes.ok || sendRes.status === 202) {
-                  log(`Draft sent directly via Graph API (msg: ${msgId})`);
-                  return { content: [{ type: "text", text: "Email sent successfully." }] };
-                }
-                const sendErr = await sendRes.text().catch(() => "");
-                log(`Graph direct send failed (${sendRes.status}): ${sendErr} — falling back to upstream`);
-              }
-            } catch (e) {
-              log(`Graph send attempt failed (non-fatal): ${e} — falling back to upstream`);
-            }
-          }
-
-          // ── Email tools: Graph API directly (no Copilot license required) ──
-          if (EMAIL_GRAPH_TOOL_NAMES.has(name)) {
-            if (!graphToken) {
-              return { content: [{ type: "text", text: "Graph token not available. Please re-authenticate at /login." }] };
-            }
-            const handler = new EmailGraphToolHandler(graphToken);
-            return handler.handleToolCall(name, typedArgs);
-          }
-
-          // ── Calendar tools: Graph API directly (no Copilot license required) ──
-          if (CALENDAR_GRAPH_TOOL_NAMES.has(name)) {
-            if (!graphToken) {
-              return { content: [{ type: "text", text: "Graph token not available. Please re-authenticate at /login." }] };
-            }
-            const handler = new CalendarGraphToolHandler(graphToken);
-            return handler.handleToolCall(name, typedArgs);
-          }
-
-          // ── Word document tools: Graph API + DOCX (no Copilot license required) ──
-          if (WORD_GRAPH_TOOL_NAMES.has(name)) {
-            if (!graphToken) {
-              return { content: [{ type: "text", text: "Graph token not available. Please re-authenticate at /login." }] };
-            }
-            const handler = new WordGraphToolHandler(graphToken);
-            return handler.handleToolCall(name, typedArgs);
-          }
-
-          // ── Excel workbook tools: Graph Excel API (no Copilot license required) ──
-          if (EXCEL_GRAPH_TOOL_NAMES.has(name)) {
-            if (!graphToken) {
-              return { content: [{ type: "text", text: "Graph token not available. Please re-authenticate at /login." }] };
-            }
-            const handler = new ExcelGraphToolHandler(graphToken);
-            return handler.handleToolCall(name, typedArgs);
-          }
-
-          // ── Teams meeting tools: Graph API (no Copilot license required) ──
-          if (TEAMS_GRAPH_TOOL_NAMES.has(name)) {
-            if (!graphToken) {
-              return { content: [{ type: "text", text: "Graph token not available. Please re-authenticate at /login." }] };
-            }
-            const handler = new TeamsGraphToolHandler(graphToken);
-            return handler.handleToolCall(name, typedArgs);
-          }
-
-          // ── Knowledge / Search tools: Graph Search API ──────────────────
-          if (KNOWLEDGE_GRAPH_TOOL_NAMES.has(name)) {
-            if (!graphToken) {
-              return { content: [{ type: "text", text: "Graph token not available. Please re-authenticate at /login." }] };
-            }
-            const handler = new KnowledgeGraphToolHandler(graphToken);
-            return handler.handleToolCall(name, typedArgs);
-          }
-
-          // ── Signature tool (dual-purpose: save if name given, read otherwise) ──
-          if (name === SIGNATURE_STYLE_TOOL_NAME || name === SET_SIGNATURE_TOOL_NAME) {
-            if (!graphToken) {
-              return { content: [{ type: "text", text: "Graph token not available. Please re-authenticate." }] };
-            }
-            // Guard against saving someone else's details (e.g. a person the
-            // caller has emailed before) as THIS account's signature — the
-            // provided email, if any, must belong to the signed-in user.
-            const providedEmail = typeof typedArgs.email === "string" ? typedArgs.email.trim().toLowerCase() : "";
-            if (providedEmail && email && providedEmail !== email.toLowerCase()) {
-              return { content: [{ type: "text", text: `This account is signed in as ${email}, but the email provided (${providedEmail}) belongs to someone else. A signature must be the signed-in user's own details, not another person's (e.g. an email recipient). Ask the user to confirm their own name/title/contact info and call this tool again with those — or omit the email field.` }] };
-            }
-            const result = await handleGetSignatureStyle(graphToken, typedArgs);
-            return { content: [{ type: "text", text: result }] };
-          }
-
-          const entry = toolRegistry.get(name);
-          if (!entry) return { content: [{ type: "text", text: `Error: Tool '${name}' not found.` }] };
-          if (!forwarder) return { content: [{ type: "text", text: "Tools still loading. Please try again in a moment." }] };
-
-          const targetServer = userCacheEntry!.servers.find((s) => s.config.mcpServerName === entry.serverName);
-          if (!targetServer) return { content: [{ type: "text", text: `Error: Server '${entry.serverName}' not found.` }] };
-
-          // ── Other email tools: require + inject signature into body ─────────
-          if (EMAIL_TOOLS_REQUIRING_SIGNATURE.has(name) && graphToken && name !== "SendEmailWithAttachments") {
-            const signature = await getUserSignatureStrict(graphToken).catch(() => null);
-            if (!signature) {
-              return { content: [{ type: "text", text: SIGNATURE_REQUIRED_MESSAGE }], isError: true };
-            }
-            const bodyKey = "body" in typedArgs ? "body" : "emailBody" in typedArgs ? "emailBody" : null;
-            const bodyTypeKey = "bodyType" in typedArgs ? "bodyType" : "contentType" in typedArgs ? "contentType" : null;
-            if (bodyKey && typeof typedArgs[bodyKey] === "string") {
-              const bodyType = bodyTypeKey ? (typedArgs[bodyTypeKey] as string ?? "text") : "text";
-              typedArgs = { ...typedArgs, [bodyKey]: appendSignature(typedArgs[bodyKey] as string, bodyType, signature), contentType: "HTML" };
-              log(`Signature auto-injected into ${name}`);
-            }
-          }
-
-          return await forwarder.callTool(entry.originalName, typedArgs, targetServer);
+          // Backward-compat: a caller that already knows a real tool name
+          // (e.g. remembered from earlier in the conversation) can still
+          // invoke it directly without going through call_tool.
+          return executeToolCall(name, typedArgs, ctx);
         });
 
         res.on("close", () => { transport.close(); sessionServer.close(); });
@@ -672,6 +516,322 @@ export class McpProxyServer {
     });
   }
 
+}
+
+// The actual per-tool dispatch logic, reached either directly (backward-compat
+// path for a caller that already knows a real tool name) or via call_tool.
+async function executeToolCall(
+  name: string,
+  argsIn: Record<string, unknown>,
+  ctx: ToolCallContext
+): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
+  const { graphToken, email, toolRegistry, forwarder, userCacheEntry } = ctx;
+  let typedArgs = argsIn;
+
+  if (SHAREPOINT_TOOL_NAMES.has(name)) {
+    if (!graphToken) {
+      return { content: [{ type: "text", text: "Graph token not available. Please re-authenticate at /login." }], isError: true };
+    }
+    const handler = new SharePointToolHandler(graphToken);
+    return handler.handleToolCall(name, typedArgs);
+  }
+
+  if (OCR_TOOL_NAMES.has(name)) {
+    if (!graphToken) {
+      return { content: [{ type: "text", text: "Graph token not available. Please re-authenticate at /login." }], isError: true };
+    }
+    const handler = new OcrToolHandler(graphToken);
+    return handler.handleToolCall(name, typedArgs);
+  }
+
+  // ── CreateDraftMessage: inject signature + CID logo before creating ──
+  if (name === "CreateDraftMessage" && graphToken) {
+    let signature: string | null = null;
+    try {
+      signature = await getUserSignatureStrict(graphToken);
+    } catch (e) { log(`Signature check failed: ${e}`); }
+
+    if (!signature) {
+      return { content: [{ type: "text", text: SIGNATURE_REQUIRED_MESSAGE }], isError: true };
+    }
+
+    const rawBody  = String(typedArgs.body ?? typedArgs.emailBody ?? "");
+    const bodyType = String(typedArgs.contentType ?? typedArgs.bodyType ?? "text");
+    typedArgs = { ...typedArgs, body: appendSignature(rawBody, bodyType, signature), contentType: "HTML" };
+    log("Signature injected into CreateDraftMessage");
+
+    const handler = new EmailGraphToolHandler(graphToken);
+    const result   = await handler.handleToolCall(name, typedArgs);
+
+    // Add CID logo attachment to the newly created draft
+    if (LOGO_BASE64) {
+      try {
+        const text  = (result.content?.[0] as { text?: string })?.text ?? "";
+        const match = text.match(/ID:\s*([A-Za-z0-9_\-=]+)/);
+        if (match?.[1]) {
+          await fetch(`https://graph.microsoft.com/v1.0/me/messages/${match[1]}/attachments`, {
+            method: "POST",
+            headers: { Authorization: `Bearer ${graphToken}`, "Content-Type": "application/json" },
+            body: JSON.stringify({
+              "@odata.type": "#microsoft.graph.fileAttachment",
+              name: "abk-logo.png", contentType: "image/png",
+              contentBytes: LOGO_BASE64, contentId: "abk-logo@abk", isInline: true,
+            }),
+          });
+          log(`CID logo attachment added to draft ${match[1]}`);
+        }
+      } catch (e) { log(`CID attachment failed (non-fatal): ${e}`); }
+    }
+    return result;
+  }
+
+  // ── SendEmailWithAttachments: create draft + CID attachment + send ──
+  // We can't call /me/sendMail directly (needs Mail.Send on graphToken).
+  // Instead: create draft via Graph (Mail.ReadWrite ✓) → add CID attachment
+  // → send via upstream SendDraftMessage tool (has Mail.Send ✓).
+  // NOTE: must run BEFORE the generic EMAIL_GRAPH_TOOL_NAMES check below,
+  // which would otherwise intercept this name first and skip signature/CID injection.
+  if (name === "SendEmailWithAttachments" && graphToken && LOGO_BASE64) {
+    const signature = await getUserSignatureStrict(graphToken).catch(() => null);
+    if (!signature) {
+      return { content: [{ type: "text", text: SIGNATURE_REQUIRED_MESSAGE }], isError: true };
+    }
+    try {
+      const rawBody  = String(typedArgs.body ?? typedArgs.emailBody ?? "");
+      const bodyType = String(typedArgs.contentType ?? typedArgs.bodyType ?? "text");
+      const htmlBody = appendSignature(rawBody, bodyType, signature);
+
+      // Schema allows "to"/"cc"/"bcc" as either a single string or an
+      // array of strings — normalize both before mapping to Graph shape.
+      const buildRecipients = (val: unknown) =>
+        (Array.isArray(val) ? val : val ? [val] : [])
+          .map((r: unknown) => ({ emailAddress: { address: String(r) } }));
+
+      // 1️⃣ Create draft
+      const draftResp = await fetch("https://graph.microsoft.com/v1.0/me/messages", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${graphToken}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          subject:       String(typedArgs.subject ?? ""),
+          body:          { contentType: "HTML", content: htmlBody },
+          toRecipients:  buildRecipients(typedArgs.to),
+          ccRecipients:  buildRecipients(typedArgs.cc),
+          bccRecipients: buildRecipients(typedArgs.bcc),
+        }),
+      });
+
+      if (!draftResp.ok) {
+        log(`Create draft failed: ${draftResp.status} — falling back to upstream`);
+      } else {
+        const draft = await draftResp.json() as { id: string };
+        const msgId = draft.id;
+
+        // 2️⃣ Add inline CID attachment
+        await fetch(`https://graph.microsoft.com/v1.0/me/messages/${msgId}/attachments`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${graphToken}`, "Content-Type": "application/json" },
+          body: JSON.stringify({
+            "@odata.type": "#microsoft.graph.fileAttachment",
+            name:         "abk-logo.png",
+            contentType:  "image/png",
+            contentBytes: LOGO_BASE64,
+            contentId:    "abk-logo@abk",
+            isInline:     true,
+          }),
+        });
+
+        // 3️⃣ Send directly via Graph API (no Copilot license needed)
+        const sendRes = await fetch(`https://graph.microsoft.com/v1.0/me/messages/${msgId}/send`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${graphToken}` },
+        });
+        if (sendRes.ok || sendRes.status === 202) {
+          log(`Email sent via Graph API direct send (msg: ${msgId})`);
+          return { content: [{ type: "text", text: "Email sent successfully." }] };
+        }
+        const sendErr = await sendRes.text().catch(() => "");
+        log(`Graph direct send failed (${sendRes.status}): ${sendErr} — trying upstream`);
+
+        // Fallback: upstream SendDraftMessage. Look this up directly on the
+        // discovered servers (not the deduped toolRegistry, which excludes
+        // this name since it also has a hardcoded handler) so forwarding
+        // still works when the direct Graph send above fails for some
+        // reason other than the bug this was fixed for.
+        if (forwarder && userCacheEntry) {
+          for (const s of userCacheEntry.servers) {
+            const dynTool = s.tools.find(t => t.name === "SendDraftMessage");
+            if (dynTool) {
+              const result = await forwarder.callTool("SendDraftMessage", { messageId: msgId }, s);
+              log(`Email sent via draft+CID+upstream-send (msg: ${msgId})`);
+              return result;
+            }
+          }
+        }
+
+        log(`Email draft created with CID logo (msg: ${msgId}) — could not auto-send`);
+        return { content: [{ type: "text", text: `Draft created with your signature, but could not send automatically (${sendErr || sendRes.status}). Please send it from Outlook (id: ${msgId})` }] };
+      }
+    } catch (sigErr) {
+      log(`Draft+CID send failed (non-fatal): ${sigErr} — falling back to upstream`);
+    }
+  }
+
+  // ── SendDraftMessage: add CID attachment then send directly via Graph ──
+  // NOTE: must also run BEFORE the generic EMAIL_GRAPH_TOOL_NAMES check below.
+  if (name === "SendDraftMessage" && graphToken) {
+    try {
+      const msgId = String(typedArgs.messageId ?? typedArgs.draftId ?? typedArgs.id ?? "");
+      if (msgId) {
+        if (LOGO_BASE64) {
+          await fetch(`https://graph.microsoft.com/v1.0/me/messages/${msgId}/attachments`, {
+            method: "POST",
+            headers: { Authorization: `Bearer ${graphToken}`, "Content-Type": "application/json" },
+            body: JSON.stringify({
+              "@odata.type": "#microsoft.graph.fileAttachment",
+              name: "abk-logo.png", contentType: "image/png",
+              contentBytes: LOGO_BASE64, contentId: "abk-logo@abk", isInline: true,
+            }),
+          });
+          log(`CID attachment added to draft ${msgId} before send`);
+        }
+        const sendRes = await fetch(`https://graph.microsoft.com/v1.0/me/messages/${msgId}/send`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${graphToken}` },
+        });
+        if (sendRes.ok || sendRes.status === 202) {
+          log(`Draft sent directly via Graph API (msg: ${msgId})`);
+          return { content: [{ type: "text", text: "Email sent successfully." }] };
+        }
+        const sendErr = await sendRes.text().catch(() => "");
+        log(`Graph direct send failed (${sendRes.status}): ${sendErr} — falling back to upstream`);
+      }
+    } catch (e) {
+      log(`Graph send attempt failed (non-fatal): ${e} — falling back to upstream`);
+    }
+  }
+
+  // ── Email tools: Graph API directly (no Copilot license required) ──
+  if (EMAIL_GRAPH_TOOL_NAMES.has(name)) {
+    if (!graphToken) {
+      return { content: [{ type: "text", text: "Graph token not available. Please re-authenticate at /login." }], isError: true };
+    }
+    const handler = new EmailGraphToolHandler(graphToken);
+    return handler.handleToolCall(name, typedArgs);
+  }
+
+  // ── Calendar tools: Graph API directly (no Copilot license required) ──
+  if (CALENDAR_GRAPH_TOOL_NAMES.has(name)) {
+    if (!graphToken) {
+      return { content: [{ type: "text", text: "Graph token not available. Please re-authenticate at /login." }], isError: true };
+    }
+    const handler = new CalendarGraphToolHandler(graphToken);
+    return handler.handleToolCall(name, typedArgs);
+  }
+
+  // ── Word document tools: Graph API + DOCX (no Copilot license required) ──
+  if (WORD_GRAPH_TOOL_NAMES.has(name)) {
+    if (!graphToken) {
+      return { content: [{ type: "text", text: "Graph token not available. Please re-authenticate at /login." }], isError: true };
+    }
+    const handler = new WordGraphToolHandler(graphToken);
+    return handler.handleToolCall(name, typedArgs);
+  }
+
+  // ── Excel workbook tools: Graph Excel API (no Copilot license required) ──
+  if (EXCEL_GRAPH_TOOL_NAMES.has(name)) {
+    if (!graphToken) {
+      return { content: [{ type: "text", text: "Graph token not available. Please re-authenticate at /login." }], isError: true };
+    }
+    const handler = new ExcelGraphToolHandler(graphToken);
+    return handler.handleToolCall(name, typedArgs);
+  }
+
+  // ── Teams meeting tools: Graph API (no Copilot license required) ──
+  if (TEAMS_GRAPH_TOOL_NAMES.has(name)) {
+    if (!graphToken) {
+      return { content: [{ type: "text", text: "Graph token not available. Please re-authenticate at /login." }], isError: true };
+    }
+    const handler = new TeamsGraphToolHandler(graphToken);
+    return handler.handleToolCall(name, typedArgs);
+  }
+
+  // ── Knowledge / Search tools: Graph Search API ──────────────────
+  if (KNOWLEDGE_GRAPH_TOOL_NAMES.has(name)) {
+    if (!graphToken) {
+      return { content: [{ type: "text", text: "Graph token not available. Please re-authenticate at /login." }], isError: true };
+    }
+    const handler = new KnowledgeGraphToolHandler(graphToken);
+    return handler.handleToolCall(name, typedArgs);
+  }
+
+  // ── Signature tool (dual-purpose: save if name given, read otherwise) ──
+  if (name === SIGNATURE_STYLE_TOOL_NAME || name === SET_SIGNATURE_TOOL_NAME) {
+    if (!graphToken) {
+      return { content: [{ type: "text", text: "Graph token not available. Please re-authenticate." }], isError: true };
+    }
+    // Guard against saving someone else's details (e.g. a person the
+    // caller has emailed before) as THIS account's signature — the
+    // provided email, if any, must belong to the signed-in user.
+    const providedEmail = typeof typedArgs.email === "string" ? typedArgs.email.trim().toLowerCase() : "";
+    if (providedEmail && email && providedEmail !== email.toLowerCase()) {
+      return { content: [{ type: "text", text: `This account is signed in as ${email}, but the email provided (${providedEmail}) belongs to someone else. A signature must be the signed-in user's own details, not another person's (e.g. an email recipient). Ask the user to confirm their own name/title/contact info and call this tool again with those — or omit the email field.` }], isError: true };
+    }
+    const result = await handleGetSignatureStyle(graphToken, typedArgs);
+    return { content: [{ type: "text", text: result }] };
+  }
+
+  const entry = toolRegistry.get(name);
+  if (!entry) return { content: [{ type: "text", text: `Error: Tool '${name}' not found. Use find_tools to look up the exact name.` }], isError: true };
+  if (!forwarder) return { content: [{ type: "text", text: "Tools still loading. Please try again in a moment." }], isError: true };
+
+  const targetServer = userCacheEntry!.servers.find((s) => s.config.mcpServerName === entry.serverName);
+  if (!targetServer) return { content: [{ type: "text", text: `Error: Server '${entry.serverName}' not found.` }], isError: true };
+
+  // ── Other email tools: require + inject signature into body ─────────
+  if (EMAIL_TOOLS_REQUIRING_SIGNATURE.has(name) && graphToken && name !== "SendEmailWithAttachments") {
+    const signature = await getUserSignatureStrict(graphToken).catch(() => null);
+    if (!signature) {
+      return { content: [{ type: "text", text: SIGNATURE_REQUIRED_MESSAGE }], isError: true };
+    }
+    const bodyKey = "body" in typedArgs ? "body" : "emailBody" in typedArgs ? "emailBody" : null;
+    const bodyTypeKey = "bodyType" in typedArgs ? "bodyType" : "contentType" in typedArgs ? "contentType" : null;
+    if (bodyKey && typeof typedArgs[bodyKey] === "string") {
+      const bodyType = bodyTypeKey ? (typedArgs[bodyTypeKey] as string ?? "text") : "text";
+      typedArgs = { ...typedArgs, [bodyKey]: appendSignature(typedArgs[bodyKey] as string, bodyType, signature), contentType: "HTML" };
+      log(`Signature auto-injected into ${name}`);
+    }
+  }
+
+  // ── Site-name search fallback: Microsoft's site-name search is a
+  // literal/partial match with no spell-correction, so one typo in a
+  // site name ("Exeperia" vs "Experia") returns zero results and dead-
+  // ends the conversation. Microsoft Graph Search (query_federated_
+  // knowledge) does relevance-ranked, typo-tolerant matching, so when
+  // the exact-name lookup comes back empty, retry through it before
+  // telling the user the site doesn't exist / they lack access.
+  if (SITE_NAME_SEARCH_TOOL_NAMES.has(entry.originalName)) {
+    const primary = await forwarder.callTool(entry.originalName, typedArgs, targetServer);
+    const primaryText = (primary.content?.[0] as { text?: string })?.text ?? "";
+    const cameBackEmpty = /"value"\s*:\s*\[\s*\]/.test(primaryText) || !primaryText.trim();
+    if (cameBackEmpty && graphToken) {
+      const query = String(typedArgs.search ?? typedArgs.query ?? typedArgs.name ?? "");
+      log(`${entry.originalName} returned no results for "${query}" — falling back to query_federated_knowledge`);
+      const fallback = await new KnowledgeGraphToolHandler(graphToken).handleToolCall(
+        "query_federated_knowledge",
+        { query, entityTypes: ["site"] }
+      );
+      const fallbackText = (fallback.content?.[0] as { text?: string })?.text ?? "";
+      return {
+        content: [{
+          type: "text",
+          text: `No exact site name match for "${query}". Falling back to Microsoft Search, which tolerates typos and partial names:\n\n${fallbackText}`,
+        }],
+      };
+    }
+    return primary;
+  }
+
+  return await forwarder.callTool(entry.originalName, typedArgs, targetServer);
 }
 
 function sanitizeSchema(schema: Record<string, unknown>): Record<string, unknown> {

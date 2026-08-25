@@ -369,7 +369,7 @@ export class SharePointToolHandler {
   async handleToolCall(
     toolName: string,
     args: Record<string, unknown>
-  ): Promise<{ content: Array<{ type: string; text: string }> }> {
+  ): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
     try {
       let result: string;
 
@@ -430,11 +430,12 @@ export class SharePointToolHandler {
           result = `Unknown tool: ${toolName}`;
       }
 
-      return { content: [{ type: "text", text: result }] };
+      const isError = /^(Error|Unknown)/.test(result);
+      return { content: [{ type: "text", text: result }], ...(isError ? { isError: true } : {}) };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       log(`SharePoint tool error (${toolName}): ${message}`);
-      return { content: [{ type: "text", text: `Error: ${message}` }] };
+      return { content: [{ type: "text", text: `Error: ${message}` }], isError: true };
     }
   }
 }

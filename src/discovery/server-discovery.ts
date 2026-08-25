@@ -29,18 +29,30 @@ export class ServerDiscovery {
    */
   async discoverAll(userToken: string): Promise<ResolvedServer[]> {
     const serverConfigs = await this.getServerConfigs(userToken);
-    const resolved: ResolvedServer[] = [];
 
-    for (const serverConfig of serverConfigs) {
-      try {
+    // Discover all servers concurrently — each is an independent network
+    // round-trip (connect + listTools), and there were 14 of them run one
+    // at a time, which meant every cold session paid the sum of all 14
+    // round-trip latencies before the first response. Promise.allSettled
+    // keeps the existing per-server error isolation while cutting that to
+    // the single slowest round-trip.
+    const settled = await Promise.allSettled(
+      serverConfigs.map(async (serverConfig) => {
         const url = this.buildServerUrl(serverConfig);
         const tools = await this.discoverTools(serverConfig.mcpServerName, url, userToken);
-        resolved.push({ config: serverConfig, url, tools });
         log(`Discovered ${tools.length} tools from ${serverConfig.mcpServerName}`);
-      } catch (err) {
-        log(`Failed to discover tools from ${serverConfig.mcpServerName}: ${err}`);
+        return { config: serverConfig, url, tools };
+      })
+    );
+
+    const resolved: ResolvedServer[] = [];
+    settled.forEach((result, i) => {
+      if (result.status === "fulfilled") {
+        resolved.push(result.value);
+      } else {
+        log(`Failed to discover tools from ${serverConfigs[i].mcpServerName}: ${result.reason}`);
       }
-    }
+    });
 
     return resolved;
   }
