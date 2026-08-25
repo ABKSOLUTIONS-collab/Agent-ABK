@@ -41,6 +41,10 @@ const inject = `<!-- ABK_START -->
   button[aria-label="Attach Files"] { display: none !important; }
   button[aria-label="Agent Builder"]:not([data-abk-admin-ok]),
   button[aria-label="Skills"]:not([data-abk-admin-ok]) { display: none !important; }
+  /* Agent sharing is primary-owner-only — label is dynamic ("Share {agent name}") */
+  button[aria-label^="Share "]:not([data-abk-owner-ok]) { display: none !important; }
+  /* Remote Access (next to Delete in the Agent panel) is hidden for everyone */
+  button[title="Remote Access"] { display: none !important; }
 
   /* ══════════════════════════════════════════════════════════════
      ABK Solutions design tokens — mapped directly onto LibreChat's
@@ -557,7 +561,20 @@ if ('serviceWorker' in navigator) {
   // token rotation). Delaying our call gives LibreChat's own bootstrap
   // refresh a head start so we rotate the token only after it's done with
   // it, not concurrently.
+  // Keep in sync with the PRIMARY_OWNER_EMAIL env var on the agent365-bridge
+  // container. LibreChat's own role only distinguishes ADMIN/USER — it has
+  // no concept of our org's single PRIMARY OWNER (org-admin.ts syncs both
+  // ADMIN and OWNER org tiers down to the same native 'ADMIN' role so the
+  // native Admin Settings link stays visible for both) — and org-admin's own
+  // API no longer accepts a bare, unauthenticated email to resolve a tier
+  // (that "trust whatever email the client claims" mechanism was removed in
+  // a security hardening pass; it now requires a real signed-in session).
+  // A direct email match against the one fixed owner address is simpler and
+  // more reliable than trying to reach an authenticated endpoint from here.
+  var ABK_PRIMARY_OWNER_EMAIL = 'snikolaou@abk.gr';
+
   var abkIsOrgAdmin = null; // null = not checked yet, else boolean
+  var abkIsPrimaryOwner = false;
   var abkRoleCheckScheduled = false;
   function checkOrgAdminRole() {
     if (abkIsOrgAdmin !== null || abkRoleCheckScheduled) return;
@@ -569,6 +586,9 @@ if ('serviceWorker' in navigator) {
         .then(function(d) {
           abkIsOrgAdmin = !!(d && d.user && d.user.role === 'ADMIN');
           if (abkIsOrgAdmin) { moveOrgSettingsToRail(); applyAdminOnlyVisibility(); }
+          var lcEmail = d && d.user && d.user.email;
+          abkIsPrimaryOwner = !!(lcEmail && lcEmail.toLowerCase() === ABK_PRIMARY_OWNER_EMAIL);
+          if (abkIsPrimaryOwner) applyOwnerOnlyVisibility();
         })
         .catch(function() {});
     }, 4000);
@@ -582,6 +602,18 @@ if ('serviceWorker' in navigator) {
     if (abkIsOrgAdmin !== true) return;
     document.querySelectorAll('button[aria-label="Agent Builder"], button[aria-label="Skills"]').forEach(function(b) {
       b.setAttribute('data-abk-admin-ok', '1');
+    });
+  }
+
+  // Agent sharing ("Share {agent name}" — the label is dynamic, hence the
+  // prefix match) is restricted to the primary owner only: they build the
+  // canonical ABK Agent and distribute it to everyone else, so other org
+  // ADMINs shouldn't be able to spin off their own shared copies. Hidden by
+  // default via CSS ([data-abk-owner-ok] gate) until confirmed.
+  function applyOwnerOnlyVisibility() {
+    if (!abkIsPrimaryOwner) return;
+    document.querySelectorAll('button[aria-label^="Share "]').forEach(function(b) {
+      b.setAttribute('data-abk-owner-ok', '1');
     });
   }
 
@@ -1018,6 +1050,7 @@ if ('serviceWorker' in navigator) {
     try { hideNativeAdminLink(); } catch(e) {}
     try { moveOrgSettingsToRail(); } catch(e) {}
     try { applyAdminOnlyVisibility(); } catch(e) {}
+    try { applyOwnerOnlyVisibility(); } catch(e) {}
     try { hideAgent365BridgeRevoke(); } catch(e) {}
     try { injectConnectorsTab(); } catch(e) {}
     try { hideConnectorsPanelIfClickedElsewhere(); } catch(e) {}
