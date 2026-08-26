@@ -19,6 +19,7 @@ import { WORD_GRAPH_TOOLS, WORD_GRAPH_TOOL_NAMES, WordGraphToolHandler } from ".
 import { EXCEL_GRAPH_TOOLS, EXCEL_GRAPH_TOOL_NAMES, ExcelGraphToolHandler } from "../tools/excel-graph-tools";
 import { TEAMS_GRAPH_TOOLS, TEAMS_GRAPH_TOOL_NAMES, TeamsGraphToolHandler } from "../tools/teams-graph-tools";
 import { KNOWLEDGE_GRAPH_TOOLS, KNOWLEDGE_GRAPH_TOOL_NAMES, KnowledgeGraphToolHandler } from "../tools/knowledge-graph-tools";
+import { POWERPOINT_TOOLS, POWERPOINT_TOOL_NAMES, PowerPointToolHandler } from "../tools/powerpoint-tools";
 import {
   SIGNATURE_STYLE_TOOL,
   SIGNATURE_STYLE_TOOL_NAME,
@@ -65,6 +66,7 @@ const HARDCODED_TOOL_NAMES = new Set<string>([
   ...EXCEL_GRAPH_TOOL_NAMES,
   ...TEAMS_GRAPH_TOOL_NAMES,
   ...KNOWLEDGE_GRAPH_TOOL_NAMES,
+  ...POWERPOINT_TOOL_NAMES,
   SIGNATURE_STYLE_TOOL_NAME,
   SET_SIGNATURE_TOOL_NAME,
 ]);
@@ -154,6 +156,7 @@ function allToolDefs(toolRegistry: Map<string, ToolRegistryEntry>): ToolLike[] {
     ...EXCEL_GRAPH_TOOLS,
     ...TEAMS_GRAPH_TOOLS,
     ...KNOWLEDGE_GRAPH_TOOLS,
+    ...POWERPOINT_TOOLS,
     OCR_TOOL,
     SIGNATURE_STYLE_TOOL,
   ];
@@ -846,6 +849,15 @@ async function executeToolCall(
       return { content: [{ type: "text", text: "Graph token not available. Please re-authenticate at /login." }], isError: true };
     }
     const handler = new KnowledgeGraphToolHandler(graphToken);
+    return handler.handleToolCall(name, typedArgs);
+  }
+
+  // ── PowerPoint: read deck text straight from the .pptx package ──
+  if (POWERPOINT_TOOL_NAMES.has(name)) {
+    if (!graphToken) {
+      return { content: [{ type: "text", text: "Graph token not available. Please re-authenticate at /login." }], isError: true };
+    }
+    const handler = new PowerPointToolHandler(graphToken);
     return handler.handleToolCall(name, typedArgs);
   }
 

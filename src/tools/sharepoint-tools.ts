@@ -4,6 +4,33 @@ function log(msg: string) {
   process.stderr.write(`[agent365-bridge] ${msg}\n`);
 }
 
+// Graph stores whatever Content-Type we send, and Office/Outlook rely on it to
+// decide how to open a file — an .xlsx saved as text/plain downloads as a
+// broken blob. Mapping by extension keeps callers from having to know MIME
+// strings while still letting them override explicitly.
+const MIME_TYPES: Record<string, string> = {
+  pdf:  "application/pdf",
+  docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  doc:  "application/msword",
+  xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  xls:  "application/vnd.ms-excel",
+  pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  ppt:  "application/vnd.ms-powerpoint",
+  png:  "image/png",
+  jpg:  "image/jpeg",
+  jpeg: "image/jpeg",
+  gif:  "image/gif",
+  csv:  "text/csv",
+  txt:  "text/plain",
+  json: "application/json",
+  zip:  "application/zip",
+};
+
+function guessMimeType(fileName: string): string {
+  const ext = fileName.split(".").pop()?.toLowerCase() ?? "";
+  return MIME_TYPES[ext] ?? "application/octet-stream";
+}
+
 // ── Tool Definitions ──────────────────────────────────────────────────────────
 
 export const SHAREPOINT_TOOLS: Tool[] = [
@@ -57,7 +84,10 @@ export const SHAREPOINT_TOOLS: Tool[] = [
   },
   {
     name: "upload_file_to_sharepoint",
-    description: "Uploads a text file to a SharePoint folder by item ID.",
+    description:
+      "Uploads a file to a SharePoint folder. Supply 'content' for plain text, or 'contentBase64' " +
+      "for any other format (PDF, Word, Excel, PowerPoint, images). Uploading to a name that " +
+      "already exists replaces that file's contents.",
     inputSchema: {
       type: "object",
       properties: {
@@ -71,18 +101,26 @@ export const SHAREPOINT_TOOLS: Tool[] = [
         },
         fileName: {
           type: "string",
-          description: "File name including extension e.g. 'report.txt'.",
+          description: "File name including extension e.g. 'report.pdf'.",
         },
         content: {
           type: "string",
-          description: "Text content of the file.",
+          description: "Text content, for plain-text files. Ignored when contentBase64 is supplied.",
+        },
+        contentBase64: {
+          type: "string",
+          description: "Base64-encoded file bytes, for any non-text format. Takes precedence over 'content'.",
+        },
+        contentType: {
+          type: "string",
+          description: "Optional MIME type. Inferred from the file extension when omitted.",
         },
         driveId: {
           type: "string",
           description: "Optional. Drive ID for a specific document library.",
         },
       },
-      required: ["siteId", "parentItemId", "fileName", "content"],
+      required: ["siteId", "parentItemId", "fileName"],
     },
   },
   {
@@ -153,7 +191,10 @@ export const SHAREPOINT_TOOLS: Tool[] = [
   },
   {
     name: "upload_file_to_onedrive",
-    description: "Uploads a text file to the user's OneDrive.",
+    description:
+      "Uploads a file to the user's OneDrive. Supply 'content' for plain text, or 'contentBase64' " +
+      "for any other format (PDF, Word, Excel, PowerPoint, images). Uploading to a name that " +
+      "already exists replaces that file's contents.",
     inputSchema: {
       type: "object",
       properties: {
@@ -163,14 +204,64 @@ export const SHAREPOINT_TOOLS: Tool[] = [
         },
         fileName: {
           type: "string",
-          description: "File name including extension e.g. 'notes.txt'.",
+          description: "File name including extension e.g. 'notes.txt' or 'deck.pptx'.",
         },
         content: {
           type: "string",
-          description: "Text content of the file.",
+          description: "Text content, for plain-text files. Ignored when contentBase64 is supplied.",
+        },
+        contentBase64: {
+          type: "string",
+          description: "Base64-encoded file bytes, for any non-text format. Takes precedence over 'content'.",
+        },
+        contentType: {
+          type: "string",
+          description: "Optional MIME type. Inferred from the file extension when omitted.",
         },
       },
-      required: ["parentItemId", "fileName", "content"],
+      required: ["parentItemId", "fileName"],
+    },
+  },
+  {
+    name: "transfer_drive_item",
+    description:
+      "Copy or move a file or folder between ANY two locations the user can reach: OneDrive to " +
+      "SharePoint, SharePoint to OneDrive, between two different SharePoint sites, or within the " +
+      "same drive. This is the only tool that can cross between drives — move_onedrive_file and " +
+      "move_sharepoint_file only work inside one drive. Locations are given as paths (e.g. " +
+      "'/Reports/Q3.pptx') or item IDs; omit the site ID for the user's personal OneDrive and " +
+      "supply it to address a SharePoint site. Set operation to 'move' to remove the original " +
+      "after a successful copy — confirm with the user first, as that deletes from the source.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        source: {
+          type: "string",
+          description: "The file or folder to transfer: a path relative to its drive root, or its item ID.",
+        },
+        sourceSiteId: {
+          type: "string",
+          description: "Optional. SharePoint site ID holding the source. Omit for the user's OneDrive.",
+        },
+        destinationFolder: {
+          type: "string",
+          description: "Destination FOLDER (not file): a path or item ID. Defaults to the destination drive's root.",
+        },
+        destinationSiteId: {
+          type: "string",
+          description: "Optional. SharePoint site ID to transfer into. Omit for the user's OneDrive.",
+        },
+        newName: {
+          type: "string",
+          description: "Optional. Name for the copy at the destination. Defaults to the original name.",
+        },
+        operation: {
+          type: "string",
+          enum: ["copy", "move"],
+          description: "'copy' (default) leaves the original in place. 'move' deletes it once the copy succeeds.",
+        },
+      },
+      required: ["source"],
     },
   },
   {
@@ -270,21 +361,49 @@ export class SharePointToolHandler {
     return JSON.parse(text);
   }
 
-  private async graphUpload(path: string, content: string): Promise<unknown> {
+  // Accepts a Buffer as well as a string so any file type can be written, not
+  // just text. Graph's simple PUT upload covers files up to 250 MB, so no
+  // resumable session is needed here (unlike mail attachments, which cut off
+  // at 3 MB).
+  private async graphUpload(
+    path: string,
+    content: string | Buffer,
+    contentType = "text/plain"
+  ): Promise<unknown> {
     const url = `https://graph.microsoft.com/v1.0${path}`;
     const res = await fetch(url, {
       method: "PUT",
       headers: {
         Authorization: `Bearer ${this.token}`,
-        "Content-Type": "text/plain",
+        "Content-Type": contentType,
       },
-      body: content,
+      body: typeof content === "string" ? content : new Uint8Array(content),
     });
     const text = await res.text();
     if (!res.ok) {
       throw new Error(`Graph API upload ${res.status}: ${text}`);
     }
     return JSON.parse(text);
+  }
+
+  // Resolves the two ways a caller can supply file bytes. Text stays the easy
+  // path; contentBase64 is what makes binary formats (pptx, pdf, docx, images)
+  // possible at all, and it wins when both are given.
+  private resolveUploadBody(
+    args: { content?: unknown; contentBase64?: unknown; contentType?: unknown },
+    fileName: string
+  ): { body: string | Buffer; contentType: string } {
+    const b64 = typeof args.contentBase64 === "string" ? args.contentBase64.trim() : "";
+    if (b64) {
+      return {
+        body: Buffer.from(b64, "base64"),
+        contentType: String(args.contentType || guessMimeType(fileName)),
+      };
+    }
+    return {
+      body: String(args.content ?? ""),
+      contentType: String(args.contentType || "text/plain"),
+    };
   }
 
   // ── Resolve the drive base path ───────────────────────────────────────────
@@ -361,16 +480,17 @@ export class SharePointToolHandler {
     siteId: string,
     parentItemId: string,
     fileName: string,
-    content: string,
+    args: Record<string, unknown>,
     driveId?: string
   ): Promise<string> {
     const base = this.siteDrivePath(siteId, driveId);
     const path = parentItemId === "root"
-      ? `${base}/root:/${fileName}:/content`
-      : `${base}/items/${parentItemId}:/${fileName}:/content`;
+      ? `${base}/root:/${encodeURI(fileName)}:/content`
+      : `${base}/items/${parentItemId}:/${encodeURI(fileName)}:/content`;
 
-    const data = await this.graphUpload(path, content) as { webUrl: string };
-    log(`Uploaded file to SharePoint: ${fileName}`);
+    const { body, contentType } = this.resolveUploadBody(args, fileName);
+    const data = await this.graphUpload(path, body, contentType) as { webUrl: string };
+    log(`Uploaded file to SharePoint: ${fileName} (${contentType})`);
     return `✅ File '${fileName}' uploaded successfully.\nURL: ${data.webUrl}`;
   }
 
@@ -424,14 +544,15 @@ export class SharePointToolHandler {
   async uploadFileToOneDrive(
     parentItemId: string,
     fileName: string,
-    content: string
+    args: Record<string, unknown>
   ): Promise<string> {
     const path = parentItemId === "root"
-      ? `/me/drive/root:/${fileName}:/content`
-      : `/me/drive/items/${parentItemId}:/${fileName}:/content`;
+      ? `/me/drive/root:/${encodeURI(fileName)}:/content`
+      : `/me/drive/items/${parentItemId}:/${encodeURI(fileName)}:/content`;
 
-    const data = await this.graphUpload(path, content) as { webUrl: string };
-    log(`Uploaded file to OneDrive: ${fileName}`);
+    const { body, contentType } = this.resolveUploadBody(args, fileName);
+    const data = await this.graphUpload(path, body, contentType) as { webUrl: string };
+    log(`Uploaded file to OneDrive: ${fileName} (${contentType})`);
     return `✅ File '${fileName}' uploaded to OneDrive.\nURL: ${data.webUrl}`;
   }
 
@@ -487,6 +608,92 @@ export class SharePointToolHandler {
     return `✅ Item moved successfully.`;
   }
 
+  // ── Cross-drive transfer ──────────────────────────────────────────────────
+
+  // Both OneDrive and a SharePoint site are just "drives" to Graph, and the
+  // /drives/{id} form is the only one that can name two different drives in a
+  // single request — which is what makes OneDrive <-> SharePoint possible.
+  private async resolveDriveId(siteId?: string): Promise<string> {
+    const drive = await this.graphRequest(siteId ? `/sites/${siteId}/drive` : `/me/drive`) as { id: string };
+    return drive.id;
+  }
+
+  // Accepts a path, an item ID, or 'root', because the model has IDs from a
+  // listing but the user speaks in paths.
+  private async resolveItem(driveId: string, ref: string): Promise<{ id: string; name: string }> {
+    const clean = ref.replace(/^\/+|\/+$/g, "");
+    const path =
+      !clean || clean === "root"
+        ? `/drives/${driveId}/root`
+        : clean.includes("/") || clean.includes(".")
+          ? `/drives/${driveId}/root:/${encodeURI(clean)}`
+          : `/drives/${driveId}/items/${clean}`;
+    return await this.graphRequest(path) as { id: string; name: string };
+  }
+
+  // Graph's copy is asynchronous: it returns 202 plus a monitor URL rather than
+  // the finished item. Waiting for that monitor matters here because a "move"
+  // must not delete the source until the copy has genuinely landed.
+  private async awaitCopy(monitorUrl: string): Promise<void> {
+    const DEADLINE = Date.now() + 120_000;
+    while (Date.now() < DEADLINE) {
+      await new Promise((r) => setTimeout(r, 1500));
+      // The monitor URL is pre-authorised; sending our bearer token is rejected.
+      const res = await fetch(monitorUrl);
+      if (!res.ok) throw new Error(`copy monitor failed (${res.status})`);
+      const body = await res.json() as { status?: string; errorCode?: string };
+      if (body.status === "completed") return;
+      if (body.status === "failed") throw new Error(`copy failed: ${body.errorCode ?? "unknown error"}`);
+    }
+    throw new Error("copy did not finish within 2 minutes — it may still complete in the background");
+  }
+
+  async transferDriveItem(args: Record<string, unknown>): Promise<string> {
+    const source = String(args.source ?? "").trim();
+    if (!source) return "Error: 'source' is required.";
+    const operation = String(args.operation ?? "copy").toLowerCase() === "move" ? "move" : "copy";
+    const newName = args.newName ? String(args.newName) : undefined;
+
+    const srcDriveId = await this.resolveDriveId(args.sourceSiteId as string | undefined);
+    const dstDriveId = await this.resolveDriveId(args.destinationSiteId as string | undefined);
+    const srcItem = await this.resolveItem(srcDriveId, source);
+    const dstFolder = await this.resolveItem(dstDriveId, String(args.destinationFolder ?? "root"));
+
+    // Within one drive a move is a simple synchronous PATCH — no copy, no
+    // delete, no window where the file exists twice.
+    if (operation === "move" && srcDriveId === dstDriveId) {
+      const body: Record<string, unknown> = { parentReference: { id: dstFolder.id } };
+      if (newName) body.name = newName;
+      await this.graphRequest(`/drives/${srcDriveId}/items/${srcItem.id}`, "PATCH", body);
+      log(`Moved '${srcItem.name}' within drive ${srcDriveId}`);
+      return `✅ Moved '${newName ?? srcItem.name}' to '${dstFolder.name}'.`;
+    }
+
+    const res = await fetch(`https://graph.microsoft.com/v1.0/drives/${srcDriveId}/items/${srcItem.id}/copy`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${this.token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        parentReference: { driveId: dstDriveId, id: dstFolder.id },
+        ...(newName ? { name: newName } : {}),
+      }),
+    });
+    if (!res.ok && res.status !== 202) {
+      throw new Error(`copy request failed (${res.status}): ${await res.text()}`);
+    }
+
+    const monitor = res.headers.get("location");
+    if (monitor) await this.awaitCopy(monitor);
+
+    if (operation === "move") {
+      await this.graphRequest(`/drives/${srcDriveId}/items/${srcItem.id}`, "DELETE");
+      log(`Moved '${srcItem.name}' across drives ${srcDriveId} → ${dstDriveId}`);
+      return `✅ Moved '${newName ?? srcItem.name}' to '${dstFolder.name}'. The original was deleted from the source.`;
+    }
+
+    log(`Copied '${srcItem.name}' to drive ${dstDriveId}`);
+    return `✅ Copied '${newName ?? srcItem.name}' to '${dstFolder.name}'. The original is unchanged.`;
+  }
+
   // ── OneDrive: Delete ──────────────────────────────────────────────────────
   async deleteOneDriveFile(itemId: string): Promise<string> {
     await this.graphRequest(`/me/drive/items/${itemId}`, "DELETE");
@@ -523,7 +730,7 @@ export class SharePointToolHandler {
             args.siteId as string,
             args.parentItemId as string,
             args.fileName as string,
-            args.content as string,
+            args,
             args.driveId as string | undefined
           );
           break;
@@ -552,7 +759,7 @@ export class SharePointToolHandler {
           result = await this.uploadFileToOneDrive(
             args.parentItemId as string,
             args.fileName as string,
-            args.content as string
+            args
           );
           break;
         case "list_onedrive_folder":
@@ -570,6 +777,9 @@ export class SharePointToolHandler {
           break;
         case "delete_onedrive_file":
           result = await this.deleteOneDriveFile(args.itemId as string);
+          break;
+        case "transfer_drive_item":
+          result = await this.transferDriveItem(args);
           break;
         default:
           result = `Unknown tool: ${toolName}`;

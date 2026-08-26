@@ -98,8 +98,11 @@ async function saveOcrCache(accessToken: string, cacheFilename: string, text: st
 export const OCR_TOOL = {
   name: "ocr_search_and_read",
   description:
-    "OCR a scanned PDF or image-based document from SharePoint/OneDrive and return its full text. " +
-    "PREFERRED: pass drive_id + item_id directly (from list_sharepoint_folder) to skip search. " +
+    "Read the full text of ANY PDF or image from SharePoint/OneDrive. This is the tool for reading " +
+    "a PDF — it is not limited to scanned documents: it handles ordinary text-based PDFs, scanned " +
+    "ones, and images (PNG/JPG/TIFF) alike, so use it whenever the user asks about the contents of " +
+    "a PDF. " +
+    "PREFERRED: pass drive_id + item_id directly (from list_sharepoint_folder or list_onedrive_folder) to skip search. " +
     "FALLBACK: pass query to search by filename/keywords. " +
     "Returns ALL pages by default. Use page_from/page_to only if you need a specific range. " +
     "After the first OCR run the full text is cached in OneDrive — subsequent calls are instant. " +
