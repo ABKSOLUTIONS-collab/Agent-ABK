@@ -16,7 +16,47 @@ function log(msg: string): void {
   process.stderr.write(`[agent365-bridge] [powerpoint] ${msg}\n`);
 }
 
-export const POWERPOINT_TOOL_NAMES = new Set(["GetPresentationContent", "CreatePresentation"]);
+export const POWERPOINT_TOOL_NAMES = new Set([
+  "GetPresentationContent",
+  "CreatePresentation",
+  "EditPresentation",
+]);
+
+// ── Reading an existing package ───────────────────────────────────────────────
+
+type Parts = Record<string, Uint8Array>;
+
+/**
+ * The slides of a deck in the order PowerPoint displays them.
+ *
+ * That order lives in <p:sldIdLst> inside presentation.xml, NOT in the part
+ * file names — a deck that has had slides reordered or deleted routinely has
+ * slide3.xml appearing second. Anything that edits by slide number has to
+ * resolve through this list, or it will silently modify the wrong slide.
+ */
+function orderedSlides(files: Parts): Array<{ sldId: string; rId: string; part: string }> {
+  const pres = strFromU8(files["ppt/presentation.xml"] ?? new Uint8Array());
+  const rels = strFromU8(files["ppt/_rels/presentation.xml.rels"] ?? new Uint8Array());
+
+  const targets = new Map<string, string>();
+  for (const m of rels.matchAll(/<Relationship\b[^>]*Id="([^"]+)"[^>]*Target="([^"]+)"[^>]*\/>/g)) {
+    targets.set(m[1], m[2]);
+  }
+
+  const out: Array<{ sldId: string; rId: string; part: string }> = [];
+  const listMatch = pres.match(/<p:sldIdLst>([\s\S]*?)<\/p:sldIdLst>/);
+  if (!listMatch) return out;
+  for (const m of listMatch[1].matchAll(/<p:sldId\b[^>]*id="(\d+)"[^>]*r:id="([^"]+)"[^>]*\/>/g)) {
+    const target = targets.get(m[2]);
+    if (!target) continue;
+    out.push({ sldId: m[1], rId: m[2], part: `ppt/${target.replace(/^\.\//, "")}` });
+  }
+  return out;
+}
+
+function nextNumericId(values: number[], floor: number): number {
+  return Math.max(floor - 1, ...values) + 1;
+}
 
 // ── .pptx package builder ─────────────────────────────────────────────────────
 //
@@ -270,6 +310,37 @@ export const POWERPOINT_TOOLS: Tool[] = [
       required: ["name", "slides"],
     },
   },
+  {
+    name: "EditPresentation",
+    description:
+      "Modify an EXISTING PowerPoint presentation in place: add a slide, delete a slide, or " +
+      "replace text throughout the deck. A new slide reuses the deck's own layout so it matches " +
+      "the existing design. Read the deck first with GetPresentationContent to see the slide " +
+      "numbers and exact wording, and confirm with the user before deleting — the file is " +
+      "overwritten and a removed slide cannot be recovered from here.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        file: { type: "string", description: "The presentation: a path relative to the drive root, or its item ID." },
+        siteId: { type: "string", description: "Optional. SharePoint site ID, when the deck lives in a site." },
+        action: {
+          type: "string",
+          enum: ["add_slide", "delete_slide", "replace_text"],
+          description: "Which edit to perform.",
+        },
+        title: { type: "string", description: "add_slide: the new slide's title." },
+        bullets: { type: "array", items: { type: "string" }, description: "add_slide: bullet points for the body." },
+        notes: { type: "string", description: "add_slide: optional speaker notes." },
+        position: {
+          type: "number",
+          description: "add_slide: 1-based position to insert at. Appended to the end when omitted. delete_slide: which slide to remove.",
+        },
+        find: { type: "string", description: "replace_text: exact text to look for (case-sensitive)." },
+        replace: { type: "string", description: "replace_text: text to put in its place." },
+      },
+      required: ["file", "action"],
+    },
+  },
 ];
 
 // Slide parts are named slide1.xml, slide2.xml, ... slide10.xml — plain string
@@ -298,6 +369,139 @@ function decodeXmlEntities(s: string): string {
     .replace(/&quot;/g, '"')
     .replace(/&apos;/g, "'")
     .replace(/&amp;/g, "&");
+}
+
+// ── Editing an existing package ───────────────────────────────────────────────
+
+/** Adds a slide, reusing the deck's OWN layout so it matches the existing design. */
+function addSlideToPackage(files: Parts, spec: SlideSpec, position?: number): number {
+  const existing = orderedSlides(files);
+
+  // Part names, relationship IDs and slide IDs must each be unique across the
+  // package; derive every one from what is already there rather than assuming
+  // a count, since a deck with deletions has gaps.
+  const slideNums = Object.keys(files)
+    .map((n) => n.match(/^ppt\/slides\/slide(\d+)\.xml$/))
+    .filter(Boolean)
+    .map((m) => Number(m![1]));
+  const num = nextNumericId(slideNums, 1);
+
+  const relsXml = strFromU8(files["ppt/_rels/presentation.xml.rels"]);
+  const rIdNums = [...relsXml.matchAll(/Id="rId(\d+)"/g)].map((m) => Number(m[1]));
+  const rId = `rId${nextNumericId(rIdNums, 1)}`;
+
+  const presXml = strFromU8(files["ppt/presentation.xml"]);
+  const sldIds = [...presXml.matchAll(/<p:sldId\b[^>]*id="(\d+)"/g)].map((m) => Number(m[1]));
+  const sldId = nextNumericId(sldIds, 256);
+
+  // Inherit the layout an existing slide points at; a freshly invented layout
+  // would look nothing like the rest of the deck.
+  let layoutTarget = "../slideLayouts/slideLayout1.xml";
+  if (existing.length) {
+    const firstRels = files[`ppt/slides/_rels/${existing[0].part.split("/").pop()}.rels`];
+    if (firstRels) {
+      const m = strFromU8(firstRels).match(/Target="([^"]*slideLayouts\/[^"]+)"/);
+      if (m) layoutTarget = m[1];
+    }
+  }
+
+  files[`ppt/slides/slide${num}.xml`] = strToU8(slideXml(spec));
+  const rels = [`<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="${layoutTarget}"/>`];
+  if (spec.notes) {
+    rels.push(`<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide" Target="../notesSlides/notesSlide${num}.xml"/>`);
+    files[`ppt/notesSlides/notesSlide${num}.xml`] = strToU8(notesXml(spec.notes));
+    files[`ppt/notesSlides/_rels/notesSlide${num}.xml.rels`] = strToU8(`${XML_DECL}
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="../slides/slide${num}.xml"/>
+</Relationships>`);
+  }
+  files[`ppt/slides/_rels/slide${num}.xml.rels`] = strToU8(`${XML_DECL}
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${rels.join("")}</Relationships>`);
+
+  files["ppt/_rels/presentation.xml.rels"] = strToU8(relsXml.replace(
+    "</Relationships>",
+    `<Relationship Id="${rId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide${num}.xml"/></Relationships>`
+  ));
+
+  const entry = `<p:sldId id="${sldId}" r:id="${rId}"/>`;
+  const at = position && position >= 1 && position <= existing.length ? position - 1 : existing.length;
+  const updatedList = existing.length === 0
+    ? entry
+    : (() => {
+        const items = [...existing.map((s) => `<p:sldId id="${s.sldId}" r:id="${s.rId}"/>`)];
+        items.splice(at, 0, entry);
+        return items.join("");
+      })();
+  files["ppt/presentation.xml"] = strToU8(
+    presXml.includes("<p:sldIdLst>")
+      ? presXml.replace(/<p:sldIdLst>[\s\S]*?<\/p:sldIdLst>/, `<p:sldIdLst>${updatedList}</p:sldIdLst>`)
+      : presXml.replace("</p:sldMasterIdLst>", `</p:sldMasterIdLst><p:sldIdLst>${updatedList}</p:sldIdLst>`)
+  );
+
+  let ct = strFromU8(files["[Content_Types].xml"]);
+  ct = ct.replace("</Types>",
+    `<Override PartName="/ppt/slides/slide${num}.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>` +
+    (spec.notes ? `<Override PartName="/ppt/notesSlides/notesSlide${num}.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.notesSlide+xml"/>` : "") +
+    "</Types>");
+  files["[Content_Types].xml"] = strToU8(ct);
+
+  return at + 1;
+}
+
+/** Removes a slide by its displayed position. */
+function deleteSlideFromPackage(files: Parts, position: number): string {
+  const slides = orderedSlides(files);
+  const target = slides[position - 1];
+  if (!target) throw new Error(`Slide ${position} does not exist — the deck has ${slides.length} slide(s).`);
+
+  const presXml = strFromU8(files["ppt/presentation.xml"]);
+  files["ppt/presentation.xml"] = strToU8(
+    presXml.replace(new RegExp(`<p:sldId\\b[^>]*r:id="${target.rId}"[^>]*/>`), "")
+  );
+
+  const relsXml = strFromU8(files["ppt/_rels/presentation.xml.rels"]);
+  files["ppt/_rels/presentation.xml.rels"] = strToU8(
+    relsXml.replace(new RegExp(`<Relationship\\b[^>]*Id="${target.rId}"[^>]*/>`), "")
+  );
+
+  const base = target.part.split("/").pop()!;
+  const slideRels = files[`ppt/slides/_rels/${base}.rels`];
+  // Any notes part belongs to this slide alone, so it goes with it.
+  const notesTarget = slideRels
+    ? strFromU8(slideRels).match(/Target="\.\.\/(notesSlides\/[^"]+)"/)?.[1]
+    : undefined;
+
+  const drop = [target.part, `ppt/slides/_rels/${base}.rels`];
+  if (notesTarget) drop.push(`ppt/${notesTarget}`, `ppt/notesSlides/_rels/${notesTarget.split("/").pop()}.rels`);
+  for (const p of drop) delete files[p];
+
+  // A dangling Override for a part that no longer exists makes the file
+  // unopenable, so the content types must be pruned too.
+  let ct = strFromU8(files["[Content_Types].xml"]);
+  for (const p of drop.filter((x) => x.endsWith(".xml"))) {
+    ct = ct.replace(new RegExp(`<Override\\b[^>]*PartName="/${p.replace(/\//g, "\\/")}"[^>]*/>`), "");
+  }
+  files["[Content_Types].xml"] = strToU8(ct);
+
+  return base;
+}
+
+/** Literal find/replace across every slide's visible text and speaker notes. */
+function replaceTextInPackage(files: Parts, find: string, replace: string): number {
+  const needle = esc(find);
+  const replacement = esc(replace);
+  let count = 0;
+  for (const name of Object.keys(files)) {
+    if (!/^ppt\/(slides|notesSlides)\/[^/]+\.xml$/.test(name)) continue;
+    const xml = strFromU8(files[name]);
+    const updated = xml.replace(/(<a:t(?:\s[^>]*)?>)([^<]*)(<\/a:t>)/g, (whole, open, text, close) => {
+      if (!text.includes(needle)) return whole;
+      count += text.split(needle).length - 1;
+      return open + text.split(needle).join(replacement) + close;
+    });
+    if (updated !== xml) files[name] = strToU8(updated);
+  }
+  return count;
 }
 
 export class PowerPointToolHandler {
@@ -352,6 +556,70 @@ export class PowerPointToolHandler {
     };
   }
 
+  private async editPresentation(
+    args: Record<string, unknown>
+  ): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
+    const err = (text: string) => ({ content: [{ type: "text", text }], isError: true });
+
+    const ref = String(args.file ?? "").trim();
+    if (!ref) return err("Error: 'file' is required.");
+    const action = String(args.action ?? "");
+    const siteId = args.siteId as string | undefined;
+
+    const item = await fetchDriveItem(this.token, ref, siteId);
+    if (!/\.pptx$/i.test(item.name)) {
+      return err(`'${item.name}' is not a .pptx file.`);
+    }
+    const files = unzipSync(item.buffer) as Parts;
+    const before = orderedSlides(files).length;
+
+    let summary: string;
+    if (action === "add_slide") {
+      const spec: SlideSpec = {
+        title: args.title ? String(args.title) : "",
+        bullets: Array.isArray(args.bullets) ? args.bullets.map(String) : [],
+        notes: args.notes ? String(args.notes) : undefined,
+      };
+      const at = addSlideToPackage(files, spec, args.position ? Number(args.position) : undefined);
+      summary = `✅ Added slide at position ${at} of ${before + 1}.`;
+    } else if (action === "delete_slide") {
+      const pos = Number(args.position);
+      if (!pos || pos < 1) return err("Error: 'position' (the slide number to delete) is required.");
+      if (before <= 1) return err("Error: a presentation must keep at least one slide.");
+      deleteSlideFromPackage(files, pos);
+      summary = `✅ Deleted slide ${pos}. The deck now has ${before - 1} slide(s).`;
+    } else if (action === "replace_text") {
+      const find = String(args.find ?? "");
+      if (!find) return err("Error: 'find' is required for replace_text.");
+      const n = replaceTextInPackage(files, find, String(args.replace ?? ""));
+      if (n === 0) {
+        return err(`No occurrences of "${find}" were found — the deck was not modified. Matching is case-sensitive.`);
+      }
+      summary = `✅ Replaced ${n} occurrence(s) of "${find}".`;
+    } else {
+      return err(`Error: unknown action '${action}'. Use add_slide, delete_slide or replace_text.`);
+    }
+
+    const rebuilt = Buffer.from(zipSync(files, { level: 6 }));
+    const base = siteId ? `/sites/${siteId}/drive` : "/me/drive";
+    const looksLikePath = ref.includes("/") || ref.includes(".");
+    const clean = ref.replace(/^\/+|\/+$/g, "");
+    const itemPath = looksLikePath ? `${base}/root:/${encodeURI(clean)}` : `${base}/items/${ref}`;
+
+    const up = await fetch(`https://graph.microsoft.com/v1.0${itemPath}/content`, {
+      method: "PUT",
+      headers: {
+        Authorization: `Bearer ${this.token}`,
+        "Content-Type": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+      },
+      body: new Uint8Array(rebuilt),
+    });
+    if (!up.ok) return err(`Error saving '${item.name}' (${up.status}): ${await up.text()}`);
+
+    log(`Edited '${item.name}': ${action}`);
+    return { content: [{ type: "text", text: `${summary} Saved to '${item.name}'.` }] };
+  }
+
   async handleToolCall(
     toolName: string,
     args: Record<string, unknown>
@@ -359,6 +627,9 @@ export class PowerPointToolHandler {
     try {
       if (toolName === "CreatePresentation") {
         return this.createPresentation(args);
+      }
+      if (toolName === "EditPresentation") {
+        return this.editPresentation(args);
       }
       if (toolName !== "GetPresentationContent") {
         return { content: [{ type: "text", text: `Unknown tool: ${toolName}` }], isError: true };
@@ -379,23 +650,43 @@ export class PowerPointToolHandler {
       }
 
       const files = unzipSync(item.buffer);
-      const slideNames = Object.keys(files)
-        .filter((n) => /^ppt\/slides\/slide\d+\.xml$/.test(n))
-        .sort((a, b) => slideNumber(a) - slideNumber(b));
+      // Read the order from <p:sldIdLst>, falling back to file names only if
+      // that is unreadable. Sorting by file name is wrong for any deck whose
+      // slides have been inserted, reordered or deleted — and the numbers
+      // reported here are what EditPresentation is then asked to act on, so
+      // getting this wrong would edit the wrong slide.
+      const ordered = orderedSlides(files).map((s) => s.part).filter((p) => files[p]);
+      const slideNames = ordered.length
+        ? ordered
+        : Object.keys(files)
+            .filter((n) => /^ppt\/slides\/slide\d+\.xml$/.test(n))
+            .sort((a, b) => slideNumber(a) - slideNumber(b));
 
       if (slideNames.length === 0) {
         return { content: [{ type: "text", text: `'${item.name}' contains no slides.` }], isError: true };
       }
 
       const sections: string[] = [];
-      for (const name of slideNames) {
-        const n = slideNumber(name);
+      for (let i = 0; i < slideNames.length; i++) {
+        const name = slideNames[i];
+        // Position in the deck, which is what the user and EditPresentation
+        // both mean by "slide 3" — not the number embedded in the file name.
+        const n = i + 1;
         const body = decodeXmlEntities(extractPartText(strFromU8(files[name])));
 
         let notes = "";
         if (includeNotes) {
-          // Notes live in a parallel part sharing the slide's number.
-          const notesPart = files[`ppt/notesSlides/notesSlide${n}.xml`];
+          // The notes part is found through the slide's own relationships, not
+          // by number: after an insert, slide 2 of the deck may be slide5.xml
+          // and its notes notesSlide5.xml.
+          const baseName = name.split("/").pop();
+          const relPart = files[`ppt/slides/_rels/${baseName}.rels`];
+          const notesTarget = relPart
+            ? strFromU8(relPart).match(/Target="\.\.\/(notesSlides\/[^"]+)"/)?.[1]
+            : undefined;
+          const notesPart = notesTarget
+            ? files[`ppt/${notesTarget}`]
+            : files[`ppt/notesSlides/notesSlide${slideNumber(name)}.xml`];
           if (notesPart) {
             const raw = decodeXmlEntities(extractPartText(strFromU8(notesPart)));
             // The notes part repeats the slide number as a standalone run;

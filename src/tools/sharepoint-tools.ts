@@ -847,7 +847,7 @@ export async function fetchDriveItem(
   }
   const buffer = Buffer.from(await contentRes.arrayBuffer());
 
-  log(`Fetched drive item '${meta.name}' (${Math.round(buffer.length / 1024)}KB) for attachment`);
+  log(`Fetched drive item '${meta.name}' (${Math.round(buffer.length / 1024)}KB)`);
   return {
     name: meta.name,
     contentType: meta.file?.mimeType || "application/octet-stream",
