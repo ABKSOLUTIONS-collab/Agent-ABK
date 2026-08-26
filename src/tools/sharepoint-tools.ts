@@ -173,6 +173,69 @@ export const SHAREPOINT_TOOLS: Tool[] = [
       required: ["parentItemId", "fileName", "content"],
     },
   },
+  {
+    name: "list_onedrive_folder",
+    description:
+      "Lists the folders and files in the user's own OneDrive. This is the tool for questions like " +
+      "'what is in my OneDrive'. Call it with no arguments to list the OneDrive root. To look inside " +
+      "a specific folder, pass either its itemId (returned by a previous listing) or its path — the " +
+      "path form avoids having to walk the tree folder by folder. Note this is the personal OneDrive, " +
+      "not a SharePoint site: use list_sharepoint_folder for those.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        itemId: {
+          type: "string",
+          description: "Item ID of the folder to list. Use 'root' or omit for the OneDrive root. Ignored when 'path' is supplied.",
+        },
+        path: {
+          type: "string",
+          description: "Optional. Folder path relative to the OneDrive root, e.g. '/Documents/Reports'. Use this when you know the folder name but not its item ID.",
+        },
+      },
+    },
+  },
+  {
+    name: "move_onedrive_file",
+    description:
+      "Moves and/or renames a file or folder in the user's OneDrive. Supply destinationItemId to move it, " +
+      "newName to rename it, or both at once. Get item IDs from list_onedrive_folder.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        itemId: {
+          type: "string",
+          description: "Item ID of the file or folder to move or rename.",
+        },
+        destinationItemId: {
+          type: "string",
+          description: "Optional. Item ID of the destination folder ('root' for the OneDrive root). Omit to rename in place.",
+        },
+        newName: {
+          type: "string",
+          description: "Optional. New name for the item, including extension for files. Omit to keep the current name.",
+        },
+      },
+      required: ["itemId"],
+    },
+  },
+  {
+    name: "delete_onedrive_file",
+    description:
+      "Deletes a file or folder from the user's OneDrive by item ID. The item goes to the OneDrive recycle bin " +
+      "rather than being destroyed outright, but treat this as destructive and confirm with the user first. " +
+      "Deleting a folder also removes everything inside it. Get item IDs from list_onedrive_folder.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        itemId: {
+          type: "string",
+          description: "Item ID of the file or folder to delete.",
+        },
+      },
+      required: ["itemId"],
+    },
+  },
 ];
 
 // ── Tool Implementations ──────────────────────────────────────────────────────
@@ -253,17 +316,11 @@ export class SharePointToolHandler {
     return `✅ Folder '${folderName}' created successfully.`;
   }
 
-  // ── SharePoint: List folder ───────────────────────────────────────────────
-  async listSharePointFolder(
-    siteId: string,
-    itemId: string,
-    driveId?: string
-  ): Promise<string> {
-    const base = this.siteDrivePath(siteId, driveId);
-    const path = itemId === "root"
-      ? `${base}/root/children`
-      : `${base}/items/${itemId}/children`;
-
+  // ── Shared: render a /children listing ────────────────────────────────────
+  // Item IDs are included because every follow-up operation (list a subfolder,
+  // move, delete, upload into) addresses items by ID, so omitting them would
+  // force a second lookup for anything beyond just reading the names.
+  private async listChildren(path: string): Promise<string> {
     const data = await this.graphRequest(path) as {
       value: Array<{
         id: string;
@@ -284,6 +341,19 @@ export class SharePointToolHandler {
     });
 
     return `Contents:\n${items.join("\n")}`;
+  }
+
+  // ── SharePoint: List folder ───────────────────────────────────────────────
+  async listSharePointFolder(
+    siteId: string,
+    itemId: string,
+    driveId?: string
+  ): Promise<string> {
+    const base = this.siteDrivePath(siteId, driveId);
+    const path = itemId === "root"
+      ? `${base}/root/children`
+      : `${base}/items/${itemId}/children`;
+    return this.listChildren(path);
   }
 
   // ── SharePoint: Upload file ───────────────────────────────────────────────
@@ -365,6 +435,65 @@ export class SharePointToolHandler {
     return `✅ File '${fileName}' uploaded to OneDrive.\nURL: ${data.webUrl}`;
   }
 
+  // ── OneDrive: List folder ─────────────────────────────────────────────────
+  // Addressable three ways, cheapest first: nothing at all (root), a path, or
+  // an item ID. The path form matters because users name folders, not IDs —
+  // without it the model has to list the root and then re-list, one level per
+  // round trip, just to reach a folder it was already told the name of.
+  async listOneDriveFolder(itemId?: string, folderPath?: string): Promise<string> {
+    let path: string;
+    const cleanPath = (folderPath ?? "").replace(/^\/+|\/+$/g, "");
+    if (cleanPath) {
+      // encodeURI (not encodeURIComponent) so '/' separators survive.
+      path = `/me/drive/root:/${encodeURI(cleanPath)}:/children`;
+    } else if (itemId && itemId !== "root") {
+      path = `/me/drive/items/${itemId}/children`;
+    } else {
+      path = `/me/drive/root/children`;
+    }
+    return this.listChildren(path);
+  }
+
+  // ── OneDrive: Move / rename ───────────────────────────────────────────────
+  // Graph expresses both as a PATCH on the item, so one tool covers them and
+  // can do both in a single call.
+  async moveOneDriveFile(
+    itemId: string,
+    destinationItemId?: string,
+    newName?: string
+  ): Promise<string> {
+    const body: Record<string, unknown> = {};
+    if (destinationItemId) {
+      // Graph's move expects the parent's real item ID. "root" is a routing
+      // alias in URLs, not an ID, so resolve it to the drive root's actual ID
+      // rather than sending a path reference the API accepts inconsistently.
+      let parentId = destinationItemId;
+      if (destinationItemId === "root") {
+        const root = await this.graphRequest(`/me/drive/root`) as { id: string };
+        parentId = root.id;
+      }
+      body.parentReference = { id: parentId };
+    }
+    if (newName) body.name = newName;
+
+    if (Object.keys(body).length === 0) {
+      return "Error: supply destinationItemId to move the item, newName to rename it, or both.";
+    }
+
+    await this.graphRequest(`/me/drive/items/${itemId}`, "PATCH", body);
+    log(`Updated OneDrive item ${itemId}${destinationItemId ? ` → ${destinationItemId}` : ""}${newName ? ` (renamed to ${newName})` : ""}`);
+    if (destinationItemId && newName) return `✅ Item moved and renamed to '${newName}'.`;
+    if (newName) return `✅ Item renamed to '${newName}'.`;
+    return `✅ Item moved successfully.`;
+  }
+
+  // ── OneDrive: Delete ──────────────────────────────────────────────────────
+  async deleteOneDriveFile(itemId: string): Promise<string> {
+    await this.graphRequest(`/me/drive/items/${itemId}`, "DELETE");
+    log(`Deleted OneDrive item: ${itemId}`);
+    return `✅ Item deleted from OneDrive (moved to the recycle bin).`;
+  }
+
   // ── Route tool calls ──────────────────────────────────────────────────────
   async handleToolCall(
     toolName: string,
@@ -426,6 +555,22 @@ export class SharePointToolHandler {
             args.content as string
           );
           break;
+        case "list_onedrive_folder":
+          result = await this.listOneDriveFolder(
+            args.itemId as string | undefined,
+            args.path as string | undefined
+          );
+          break;
+        case "move_onedrive_file":
+          result = await this.moveOneDriveFile(
+            args.itemId as string,
+            args.destinationItemId as string | undefined,
+            args.newName as string | undefined
+          );
+          break;
+        case "delete_onedrive_file":
+          result = await this.deleteOneDriveFile(args.itemId as string);
+          break;
         default:
           result = `Unknown tool: ${toolName}`;
       }
@@ -441,3 +586,61 @@ export class SharePointToolHandler {
 }
 
 export const SHAREPOINT_TOOL_NAMES = new Set(SHAREPOINT_TOOLS.map((t) => t.name));
+
+// ── Drive item fetch (for email attachments) ─────────────────────────────────
+
+export interface FetchedDriveItem {
+  name: string;
+  contentType: string;
+  buffer: Buffer;
+}
+
+/**
+ * Downloads a OneDrive (or SharePoint) item's raw bytes so it can be attached
+ * to an email. `ref` is either an item ID or a path relative to the drive root
+ * ("/Documents/report.pptx") — the model gets IDs from list_onedrive_folder but
+ * users speak in paths, so both are accepted.
+ *
+ * Metadata is fetched separately from content because the attachment needs the
+ * real file name and MIME type; deriving those from the ref would produce
+ * "root:" garbage for path refs and nothing at all for ID refs.
+ */
+export async function fetchDriveItem(
+  token: string,
+  ref: string,
+  siteId?: string
+): Promise<FetchedDriveItem> {
+  const base = siteId ? `/sites/${siteId}/drive` : "/me/drive";
+  const looksLikePath = ref.includes("/") || ref.includes(".");
+  const clean = ref.replace(/^\/+|\/+$/g, "");
+  const itemPath = looksLikePath
+    ? `${base}/root:/${encodeURI(clean)}`
+    : `${base}/items/${ref}`;
+
+  const headers = { Authorization: `Bearer ${token}` };
+
+  const metaRes = await fetch(`https://graph.microsoft.com/v1.0${itemPath}`, { headers });
+  if (!metaRes.ok) {
+    throw new Error(`Could not find '${ref}' (${metaRes.status}): ${await metaRes.text()}`);
+  }
+  const meta = await metaRes.json() as {
+    name: string;
+    size?: number;
+    file?: { mimeType?: string };
+    folder?: unknown;
+  };
+  if (meta.folder) throw new Error(`'${meta.name}' is a folder — only files can be attached.`);
+
+  const contentRes = await fetch(`https://graph.microsoft.com/v1.0${itemPath}/content`, { headers });
+  if (!contentRes.ok) {
+    throw new Error(`Could not download '${meta.name}' (${contentRes.status}): ${await contentRes.text()}`);
+  }
+  const buffer = Buffer.from(await contentRes.arrayBuffer());
+
+  log(`Fetched drive item '${meta.name}' (${Math.round(buffer.length / 1024)}KB) for attachment`);
+  return {
+    name: meta.name,
+    contentType: meta.file?.mimeType || "application/octet-stream",
+    buffer,
+  };
+}

@@ -423,7 +423,11 @@ export const EMAIL_GRAPH_TOOLS: Tool[] = [
   },
   {
     name: "SendEmailWithAttachments",
-    description: "Create and immediately send an email with optional attachments.",
+    description:
+      "Create and immediately send an email, optionally attaching files straight from the user's " +
+      "OneDrive or a SharePoint site. To attach a file, pass its path or item ID in `attachments` — " +
+      "the file's bytes are fetched and attached for you, so there is no need to download or " +
+      "base64-encode anything first. The user's signature is appended automatically.",
     inputSchema: {
       type: "object",
       properties: {
@@ -441,6 +445,22 @@ export const EMAIL_GRAPH_TOOLS: Tool[] = [
         bcc: {
           description: "BCC recipients",
           oneOf: [{ type: "string" }, { type: "array", items: { type: "string" } }],
+        },
+        attachments: {
+          type: "array",
+          description:
+            "Optional. Files to attach, each identified by its OneDrive path (e.g. " +
+            "'/Reports/Q3.pptx' or just 'Q3.pptx' for a file in the root) or by the item ID " +
+            "returned from list_onedrive_folder. Use siteId on an entry to pull the file from a " +
+            "SharePoint site instead of the personal OneDrive.",
+          items: {
+            type: "object",
+            properties: {
+              ref: { type: "string", description: "File path relative to the drive root, or the file's item ID." },
+              siteId: { type: "string", description: "Optional. SharePoint site ID, when the file lives in a site rather than the user's OneDrive." },
+            },
+            required: ["ref"],
+          },
         },
       },
     },

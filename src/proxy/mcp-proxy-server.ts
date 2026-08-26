@@ -11,7 +11,7 @@ import { ToolForwarder } from "./tool-forwarder";
 import { CachedTool, loadToolsCache, saveToolsCache } from "../auth/tools-cache";
 import { getUserToken, getGraphToken, getStoredEmail, pruneExpiredTokens } from "../auth/user-token-store";
 import { registerOAuthEndpoints } from "../auth/oauth-handler";
-import { SHAREPOINT_TOOLS, SHAREPOINT_TOOL_NAMES, SharePointToolHandler } from "../tools/sharepoint-tools";
+import { SHAREPOINT_TOOLS, SHAREPOINT_TOOL_NAMES, SharePointToolHandler, fetchDriveItem, FetchedDriveItem } from "../tools/sharepoint-tools";
 import { OCR_TOOL, OCR_TOOL_NAMES, OcrToolHandler } from "../tools/ocr-tool";
 import { EMAIL_GRAPH_TOOLS, EMAIL_GRAPH_TOOL_NAMES, EmailGraphToolHandler } from "../tools/email-graph-tools";
 import { CALENDAR_GRAPH_TOOLS, CALENDAR_GRAPH_TOOL_NAMES, CalendarGraphToolHandler } from "../tools/calendar-graph-tools";
@@ -180,6 +180,64 @@ interface ToolCallContext {
   toolRegistry: Map<string, ToolRegistryEntry>;
   forwarder: ToolForwarder | null;
   userCacheEntry: UserDiscoveryCache | null;
+}
+
+// Graph rejects a plain fileAttachment POST above ~3 MB, so anything larger has
+// to go through a resumable upload session. 3 MB is the documented boundary;
+// staying just under it keeps the simple path for the common case.
+const DIRECT_ATTACH_LIMIT = 3 * 1024 * 1024;
+const UPLOAD_CHUNK = 4 * 1024 * 1024;
+
+async function attachFileToMessage(
+  graphToken: string,
+  msgId: string,
+  file: FetchedDriveItem
+): Promise<void> {
+  const auth = { Authorization: `Bearer ${graphToken}` };
+
+  if (file.buffer.length <= DIRECT_ATTACH_LIMIT) {
+    const res = await fetch(`https://graph.microsoft.com/v1.0/me/messages/${msgId}/attachments`, {
+      method: "POST",
+      headers: { ...auth, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        "@odata.type": "#microsoft.graph.fileAttachment",
+        name: file.name,
+        contentType: file.contentType,
+        contentBytes: file.buffer.toString("base64"),
+      }),
+    });
+    if (!res.ok) throw new Error(`attach failed (${res.status}): ${await res.text()}`);
+    return;
+  }
+
+  const sessRes = await fetch(`https://graph.microsoft.com/v1.0/me/messages/${msgId}/attachments/createUploadSession`, {
+    method: "POST",
+    headers: { ...auth, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      AttachmentItem: { attachmentType: "file", name: file.name, size: file.buffer.length },
+    }),
+  });
+  if (!sessRes.ok) throw new Error(`upload session failed (${sessRes.status}): ${await sessRes.text()}`);
+  const { uploadUrl } = await sessRes.json() as { uploadUrl: string };
+
+  // The upload URL is pre-authorised, so these PUTs deliberately carry no
+  // Authorization header — Graph rejects the request if one is sent.
+  const total = file.buffer.length;
+  for (let start = 0; start < total; start += UPLOAD_CHUNK) {
+    const end = Math.min(start + UPLOAD_CHUNK, total) - 1;
+    const chunk = file.buffer.subarray(start, end + 1);
+    const put = await fetch(uploadUrl, {
+      method: "PUT",
+      headers: {
+        "Content-Length": String(chunk.length),
+        "Content-Range": `bytes ${start}-${end}/${total}`,
+      },
+      body: new Uint8Array(chunk),
+    });
+    if (!put.ok && put.status !== 201 && put.status !== 202) {
+      throw new Error(`chunk ${start}-${end} failed (${put.status}): ${await put.text()}`);
+    }
+  }
 }
 
 const DISCOVERY_TTL_MS = 25 * 60 * 1000;
@@ -640,14 +698,41 @@ async function executeToolCall(
           }),
         });
 
+        // 2️⃣b Attach any requested OneDrive / SharePoint files.
+        // Done here, on the draft, rather than through /me/sendMail: sendMail
+        // takes the whole message in one request, so a large file would have to
+        // be inlined into that payload, while a draft accepts attachments one
+        // at a time and supports resumable upload for anything over 3 MB.
+        const attachRefs = Array.isArray(typedArgs.attachments) ? typedArgs.attachments : [];
+        const attachedNames: string[] = [];
+        for (const raw of attachRefs) {
+          const spec = (typeof raw === "string" ? { ref: raw } : raw) as { ref?: string; siteId?: string };
+          if (!spec?.ref) continue;
+          try {
+            const file = await fetchDriveItem(graphToken, spec.ref, spec.siteId);
+            await attachFileToMessage(graphToken, msgId, file);
+            attachedNames.push(file.name);
+          } catch (attErr) {
+            // Abort rather than send a mail that silently lacks the very file
+            // it was about. The draft is left in place so nothing is lost.
+            const m = attErr instanceof Error ? attErr.message : String(attErr);
+            log(`Attachment failed for '${spec.ref}': ${m}`);
+            return {
+              content: [{ type: "text", text: `Could not attach '${spec.ref}': ${m}\nThe email was NOT sent; a draft remains in the mailbox (id: ${msgId}).` }],
+              isError: true,
+            };
+          }
+        }
+
         // 3️⃣ Send directly via Graph API (no Copilot license needed)
         const sendRes = await fetch(`https://graph.microsoft.com/v1.0/me/messages/${msgId}/send`, {
           method: "POST",
           headers: { Authorization: `Bearer ${graphToken}` },
         });
         if (sendRes.ok || sendRes.status === 202) {
-          log(`Email sent via Graph API direct send (msg: ${msgId})`);
-          return { content: [{ type: "text", text: "Email sent successfully." }] };
+          log(`Email sent via Graph API direct send (msg: ${msgId})${attachedNames.length ? ` with ${attachedNames.length} attachment(s)` : ""}`);
+          const suffix = attachedNames.length ? ` Attached: ${attachedNames.join(", ")}.` : "";
+          return { content: [{ type: "text", text: `Email sent successfully.${suffix}` }] };
         }
         const sendErr = await sendRes.text().catch(() => "");
         log(`Graph direct send failed (${sendRes.status}): ${sendErr} — trying upstream`);
