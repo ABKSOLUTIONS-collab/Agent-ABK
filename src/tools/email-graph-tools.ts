@@ -104,6 +104,7 @@ export const EMAIL_GRAPH_TOOL_NAMES = new Set([
   "UploadAttachment",
   "AddDraftAttachments",
   "DeleteAttachment",
+  "FindPersonEmail",
 ]);
 
 // ── Tool definitions ──────────────────────────────────────────────────────────
@@ -466,6 +467,26 @@ export const EMAIL_GRAPH_TOOLS: Tool[] = [
     },
   },
   {
+    name: "FindPersonEmail",
+    description:
+      "Look up a colleague's email address from the user's own mail history when you are given a " +
+      "name but no address — e.g. 'send this to Stavros Nikolaou'. Searches messages the user has " +
+      "exchanged and returns matching people ranked by how often they appear. ALWAYS try this " +
+      "before asking the user to type an address. Limitation: it can only find people the user has " +
+      "already corresponded with, since it reads the mailbox rather than the company directory; if " +
+      "it returns nothing, say so and ask the user for the address.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: {
+          type: "string",
+          description: "Full or partial name to look for, e.g. 'Stavros Nikolaou' or just 'Nikolaou'.",
+        },
+      },
+      required: ["name"],
+    },
+  },
+  {
     name: "UploadLargeAttachment",
     description: "Upload a large file attachment (3 MB – 150 MB) to a message or draft using a resumable upload session.",
     inputSchema: {
@@ -508,6 +529,7 @@ export class EmailGraphToolHandler {
   private async dispatch(name: string, args: Record<string, unknown>): Promise<string> {
     switch (name) {
       case "SearchMessages":               return this.search(args);
+      case "FindPersonEmail":              return this.findPerson(args);
       case "SearchMessagesQueryParameters": return this.searchQuery(args);
       case "GetMessage":                   return this.get(args);
       case "CreateDraftMessage":           return this.createDraft(args);
@@ -553,6 +575,75 @@ export class EmailGraphToolHandler {
     const msgs = data.value ?? [];
     if (msgs.length === 0) return "No messages found.";
     return msgs.map((m) => fmtMsg(m as Record<string, unknown>)).join("\n\n---\n\n");
+  }
+
+  // Resolve a person's name to an email address using the user's own mail
+  // history. This exists because the bridge has no directory access: looking
+  // someone up in Entra ID needs User.ReadBasic.All, a tenant-wide permission
+  // requiring admin consent. Mail.ReadWrite is already granted, so the mailbox
+  // is the one place a name-to-address mapping can be read today.
+  //
+  // The trade-off is inherent and must stay visible to the caller: only people
+  // the user has actually corresponded with can be found. The tool description
+  // tells the model to say so rather than guess an address.
+  private async findPerson(args: Record<string, unknown>): Promise<string> {
+    const query = String(args.name ?? "").trim();
+    if (!query) return "Error: a name to search for is required.";
+    const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
+
+    // Searched against /me/messages (not a single folder) so both sent and
+    // received mail count — the recipient side is usually where a colleague
+    // you write to but rarely hear from shows up. $orderby is deliberately
+    // omitted: Graph rejects combining it with $search on messages.
+    const params = new URLSearchParams({
+      $top: "50",
+      $select: "from,toRecipients,ccRecipients",
+      $search: `"participants:${query}"`,
+    });
+
+    const res = await gf(this.token, `/me/messages?${params}`);
+    if (!res.ok) return `Error searching for '${query}' (${res.status}): ${JSON.stringify(res.body)}`;
+
+    const msgs = (res.body as { value?: Record<string, unknown>[] }).value ?? [];
+
+    interface Candidate { name: string; address: string; hits: number; }
+    const found = new Map<string, Candidate>();
+
+    const consider = (entry: unknown) => {
+      const ea = (entry as { emailAddress?: { name?: string; address?: string } })?.emailAddress;
+      const address = ea?.address?.trim();
+      if (!address) return;
+      const name = ea?.name?.trim() || address;
+      // Require every term to appear somewhere in the name or the address, so
+      // "Stavros Nikolaou" doesn't match every unrelated Stavros in the mailbox.
+      const haystack = `${name} ${address}`.toLowerCase();
+      if (!terms.every((t) => haystack.includes(t))) return;
+      const key = address.toLowerCase();
+      const existing = found.get(key);
+      if (existing) existing.hits++;
+      else found.set(key, { name, address, hits: 1 });
+    };
+
+    for (const m of msgs) {
+      consider(m.from);
+      for (const r of (m.toRecipients as unknown[]) ?? []) consider(r);
+      for (const r of (m.ccRecipients as unknown[]) ?? []) consider(r);
+    }
+
+    if (found.size === 0) {
+      return `No one matching '${query}' was found in your mail history. This search only covers ` +
+             `people you have already exchanged email with — it cannot read the company directory. ` +
+             `Ask the user for the address.`;
+    }
+
+    const ranked = Array.from(found.values()).sort((a, b) => b.hits - a.hits);
+    const lines = ranked.slice(0, 8).map((c, i) =>
+      `${i + 1}. ${c.name} — ${c.address} (seen in ${c.hits} message${c.hits === 1 ? "" : "s"})`
+    );
+    const note = ranked.length > 1
+      ? `\n\nMore than one match — confirm with the user which person is meant before sending anything.`
+      : "";
+    return `Matches for '${query}':\n${lines.join("\n")}${note}`;
   }
 
   private async searchQuery(args: Record<string, unknown>): Promise<string> {
