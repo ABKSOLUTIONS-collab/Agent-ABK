@@ -128,7 +128,23 @@ export const EXCEL_GRAPH_TOOL_NAMES = new Set([
   "GetDocumentContent_mcp_ExcelServer",
   "CreateComment",
   "ReplyToComment_mcp_ExcelServer",
+  "UpdateWorkbookRange",
+  "AppendRowsToWorksheet",
+  "ManageWorksheets",
 ]);
+
+// A1 column letters: 1 -> A, 26 -> Z, 27 -> AA. Needed to build the target
+// address when appending, since the row is computed rather than given.
+function columnLetter(n: number): string {
+  let s = "";
+  let i = Math.max(1, n);
+  while (i > 0) {
+    const rem = (i - 1) % 26;
+    s = String.fromCharCode(65 + rem) + s;
+    i = Math.floor((i - 1) / 26);
+  }
+  return s;
+}
 
 // ── Tool definitions ──────────────────────────────────────────────────────────
 
@@ -200,6 +216,74 @@ export const EXCEL_GRAPH_TOOLS: Tool[] = [
       required: ["driveItemId", "commentId", "content"],
     },
   },
+  {
+    name: "UpdateWorkbookRange",
+    description:
+      "Write values into a specific range of cells in an existing Excel workbook — this is real " +
+      "in-place editing: only the cells you name change, the rest of the sheet is untouched. " +
+      "Give the range in A1 notation ('B2:D5') and a matching grid of values. Use this to correct " +
+      "a figure, fill in a column, or update a table. To add rows at the end of existing data use " +
+      "AppendRowsToWorksheet instead, which finds the first free row for you.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        driveItemId: { type: "string", description: "OneDrive item ID of the Excel file" },
+        siteId: { type: "string", description: "SharePoint site ID (if the file is in SharePoint)" },
+        worksheet: { type: "string", description: "Worksheet name, e.g. 'Sheet1'." },
+        range: { type: "string", description: "Target range in A1 notation, e.g. 'A1' or 'B2:D5'." },
+        values: {
+          type: "array",
+          description:
+            "Rows of cell values; each inner array is one row and must match the range's width " +
+            "and height exactly. Numbers stay numeric, strings starting with '=' are treated as " +
+            "formulas by Excel.",
+          items: { type: "array", items: {} },
+        },
+      },
+      required: ["driveItemId", "worksheet", "range", "values"],
+    },
+  },
+  {
+    name: "AppendRowsToWorksheet",
+    description:
+      "Append rows to the end of the data already in a worksheet, without needing to know where " +
+      "that data ends — the first empty row is located automatically. Use this for adding entries " +
+      "to a list or log. To overwrite specific cells instead, use UpdateWorkbookRange.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        driveItemId: { type: "string", description: "OneDrive item ID of the Excel file" },
+        siteId: { type: "string", description: "SharePoint site ID (if the file is in SharePoint)" },
+        worksheet: { type: "string", description: "Worksheet name, e.g. 'Sheet1'." },
+        values: {
+          type: "array",
+          description: "Rows to append; each inner array is one row of cell values.",
+          items: { type: "array", items: {} },
+        },
+      },
+      required: ["driveItemId", "worksheet", "values"],
+    },
+  },
+  {
+    name: "ManageWorksheets",
+    description:
+      "List, add or delete worksheets (tabs) in an existing Excel workbook. Deleting a worksheet " +
+      "removes all of its data — confirm with the user first.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        driveItemId: { type: "string", description: "OneDrive item ID of the Excel file" },
+        siteId: { type: "string", description: "SharePoint site ID (if the file is in SharePoint)" },
+        action: {
+          type: "string",
+          enum: ["list", "add", "delete"],
+          description: "'list' (default) returns the worksheet names; 'add' creates one; 'delete' removes one.",
+        },
+        worksheet: { type: "string", description: "Worksheet name — required for 'add' and 'delete'." },
+      },
+      required: ["driveItemId"],
+    },
+  },
 ];
 
 // ── Handler ───────────────────────────────────────────────────────────────────
@@ -232,9 +316,122 @@ export class ExcelGraphToolHandler {
         return this.createComment(args);
       case "ReplyToComment_mcp_ExcelServer":
         return this.replyToComment(args);
+      case "UpdateWorkbookRange":
+        return this.updateRange(args);
+      case "AppendRowsToWorksheet":
+        return this.appendRows(args);
+      case "ManageWorksheets":
+        return this.manageWorksheets(args);
       default:
         return `Unknown Excel tool: ${name}`;
     }
+  }
+
+  // ── In-place editing ────────────────────────────────────────────────────────
+  //
+  // Excel is the one Office format the bridge can edit surgically. Graph exposes
+  // a live workbook API addressed by cell range, so a single figure can be
+  // changed without touching anything else. Word and PowerPoint have no
+  // equivalent — there, "editing" means rewriting the whole file.
+
+  private static asGrid(raw: unknown): unknown[][] | null {
+    if (!Array.isArray(raw) || raw.length === 0) return null;
+    // Tolerate a single flat row (["a","b"]) as well as a proper grid, since
+    // that is the shape a model most often produces for one-row writes.
+    const rows = Array.isArray(raw[0]) ? raw as unknown[][] : [raw as unknown[]];
+    return rows.every((r) => Array.isArray(r)) ? rows : null;
+  }
+
+  private async updateRange(args: Record<string, unknown>): Promise<string> {
+    const base = excelBase(args);
+    const sheet = String(args.worksheet ?? "");
+    const range = String(args.range ?? "");
+    if (!sheet || !range) return "Error: 'worksheet' and 'range' are required.";
+    const values = ExcelGraphToolHandler.asGrid(args.values);
+    if (!values) return "Error: 'values' must be an array of rows, e.g. [[1,2],[3,4]].";
+
+    const path = `${base}/worksheets/${encodeURIComponent(sheet)}/range(address='${range}')`;
+    const res = await gf(this.token, path, {
+      method: "PATCH",
+      body: JSON.stringify({ values }),
+    });
+    if (!res.ok) {
+      // A shape mismatch is by far the most common failure and Graph's own
+      // message for it is opaque, so name the likely cause explicitly.
+      const hint = res.status === 400
+        ? " The grid must match the range exactly — a 2x3 range needs 2 rows of 3 values."
+        : "";
+      return `Error updating ${sheet}!${range} (${res.status}): ${JSON.stringify(res.body)}${hint}`;
+    }
+    const cells = values.reduce((n, r) => n + r.length, 0);
+    log(`Updated ${sheet}!${range} (${cells} cells)`);
+    return `✅ Updated ${cells} cell(s) in ${sheet}!${range}.`;
+  }
+
+  private async appendRows(args: Record<string, unknown>): Promise<string> {
+    const base = excelBase(args);
+    const sheet = String(args.worksheet ?? "");
+    if (!sheet) return "Error: 'worksheet' is required.";
+    const values = ExcelGraphToolHandler.asGrid(args.values);
+    if (!values) return "Error: 'values' must be an array of rows, e.g. [[\"Jan\", 100]].";
+
+    // usedRange tells us where the existing data stops; appending below it is
+    // what makes this safe to call without first reading the sheet.
+    const usedRes = await gf(this.token, `${base}/worksheets/${encodeURIComponent(sheet)}/usedRange`);
+    let startRow = 1;
+    let width = values[0].length;
+    if (usedRes.ok) {
+      const used = usedRes.body as { rowIndex?: number; rowCount?: number; columnCount?: number; address?: string };
+      // rowIndex is 0-based; +rowCount lands on the first free row, +1 converts to A1's 1-based numbering.
+      startRow = (used.rowIndex ?? 0) + (used.rowCount ?? 0) + 1;
+      width = Math.max(width, used.columnCount ?? width);
+    }
+
+    const endRow = startRow + values.length - 1;
+    const endCol = columnLetter(values[0].length);
+    const address = `A${startRow}:${endCol}${endRow}`;
+
+    const res = await gf(this.token, `${base}/worksheets/${encodeURIComponent(sheet)}/range(address='${address}')`, {
+      method: "PATCH",
+      body: JSON.stringify({ values }),
+    });
+    if (!res.ok) return `Error appending to ${sheet} (${res.status}): ${JSON.stringify(res.body)}`;
+    log(`Appended ${values.length} row(s) to ${sheet} at ${address}`);
+    return `✅ Appended ${values.length} row(s) to ${sheet}, starting at row ${startRow}.`;
+  }
+
+  private async manageWorksheets(args: Record<string, unknown>): Promise<string> {
+    const base = excelBase(args);
+    const action = String(args.action ?? "list").toLowerCase();
+    const sheet = String(args.worksheet ?? "");
+
+    if (action === "list") {
+      const res = await gf(this.token, `${base}/worksheets`);
+      if (!res.ok) return `Error listing worksheets (${res.status}): ${JSON.stringify(res.body)}`;
+      const sheets = ((res.body as { value?: Array<{ name: string }> }).value ?? []).map((s) => s.name);
+      return sheets.length ? `Worksheets: ${sheets.join(", ")}` : "Workbook has no worksheets.";
+    }
+
+    if (!sheet) return `Error: 'worksheet' is required for action '${action}'.`;
+
+    if (action === "add") {
+      const res = await gf(this.token, `${base}/worksheets`, {
+        method: "POST",
+        body: JSON.stringify({ name: sheet }),
+      });
+      if (!res.ok) return `Error adding worksheet '${sheet}' (${res.status}): ${JSON.stringify(res.body)}`;
+      log(`Added worksheet ${sheet}`);
+      return `✅ Worksheet '${sheet}' added.`;
+    }
+
+    if (action === "delete") {
+      const res = await gf(this.token, `${base}/worksheets/${encodeURIComponent(sheet)}`, { method: "DELETE" });
+      if (!res.ok) return `Error deleting worksheet '${sheet}' (${res.status}): ${JSON.stringify(res.body)}`;
+      log(`Deleted worksheet ${sheet}`);
+      return `✅ Worksheet '${sheet}' deleted, along with its data.`;
+    }
+
+    return `Error: unknown action '${action}'. Use 'list', 'add' or 'delete'.`;
   }
 
   // ── Create workbook ─────────────────────────────────────────────────────────

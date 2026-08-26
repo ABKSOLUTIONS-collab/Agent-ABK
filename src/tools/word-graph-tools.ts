@@ -169,6 +169,81 @@ function extractDocxText(buffer: Buffer): string {
   }
 }
 
+// ── DOCX find & replace ───────────────────────────────────────────────────────
+
+function xmlEscapeText(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+/**
+ * Replaces occurrences of `find` with `replace` inside a DOCX package.
+ *
+ * Word splits a paragraph into runs whenever formatting, spell-check state or
+ * an edit boundary changes, so the phrase the user is looking for is often
+ * scattered across several <w:t> elements and a naive per-element replace
+ * silently finds nothing. Two passes handle that:
+ *
+ *  1. Per-run: replace within individual <w:t> elements. This is exact and
+ *     preserves every run's own formatting, and covers the common case.
+ *  2. Per-paragraph fallback, only for paragraphs where pass 1 found nothing:
+ *     join the paragraph's runs, replace, then put the whole result in the
+ *     first run and blank the others. This catches split phrases at the cost
+ *     of flattening formatting *within that one paragraph* — which is why it
+ *     is a fallback and not the default.
+ */
+function replaceTextInDocx(
+  buffer: Buffer,
+  find: string,
+  replace: string
+): { buffer: Buffer; count: number; flattened: number } {
+  const files = unzipSync(buffer);
+  const docXml = files["word/document.xml"];
+  if (!docXml) throw new Error("Could not find document.xml inside the DOCX");
+
+  let xml = strFromU8(docXml);
+  const needle = xmlEscapeText(find);
+  const replacement = xmlEscapeText(replace);
+  let count = 0;
+  let flattened = 0;
+
+  // Pass 1 — within single runs.
+  xml = xml.replace(/(<w:t(?:\s[^>]*)?>)([^<]*)(<\/w:t>)/g, (whole, open, text, close) => {
+    if (!text.includes(needle)) return whole;
+    count += text.split(needle).length - 1;
+    return open + text.split(needle).join(replacement) + close;
+  });
+
+  // Pass 2 — paragraphs whose combined text contains the phrase but whose
+  // individual runs did not.
+  xml = xml.replace(/<w:p(?:\s[^>]*)?>[\s\S]*?<\/w:p>/g, (para) => {
+    const runs = Array.from(para.matchAll(/(<w:t(?:\s[^>]*)?>)([^<]*)(<\/w:t>)/g));
+    if (runs.length < 2) return para;
+    const joined = runs.map((r) => r[2]).join("");
+    if (!joined.includes(needle)) return para;
+
+    const updated = joined.split(needle).join(replacement);
+    count += joined.split(needle).length - 1;
+    flattened++;
+
+    let first = true;
+    return para.replace(/(<w:t(?:\s[^>]*)?>)([^<]*)(<\/w:t>)/g, (_w, open, _t, close) => {
+      if (first) {
+        first = false;
+        // xml:space="preserve" stops Word trimming leading/trailing spaces once
+        // the whole paragraph lives in one run.
+        const openTag = open.includes("xml:space") ? open : open.replace(/>$/, ' xml:space="preserve">');
+        return openTag + updated + close;
+      }
+      return open + close;
+    });
+  });
+
+  if (count === 0) return { buffer, count: 0, flattened: 0 };
+
+  files["word/document.xml"] = strToU8(xml);
+  return { buffer: Buffer.from(zipSync(files, { level: 6 })), count, flattened };
+}
+
 // ── DOCX comment adder ────────────────────────────────────────────────────────
 
 function addCommentToDocx(buffer: Buffer, author: string, commentText: string): Buffer {
@@ -245,6 +320,7 @@ export const WORD_GRAPH_TOOL_NAMES = new Set([
   "GetDocumentContent_mcp_WordServer",
   "AddComment",
   "ReplyToComment_mcp_WordServer",
+  "ReplaceTextInDocument",
 ]);
 
 // ── Tool definitions ──────────────────────────────────────────────────────────
@@ -268,6 +344,26 @@ export const WORD_GRAPH_TOOLS: Tool[] = [
         title: { type: "string", description: "Document title (metadata). Defaults to file name." },
       },
       required: ["name"],
+    },
+  },
+  {
+    name: "ReplaceTextInDocument",
+    description:
+      "Edit an existing Word document (.docx) in place by replacing text. Use this to correct a " +
+      "name, date, figure or phrase without rewriting the whole document. Matching is " +
+      "case-sensitive and literal (not a regular expression), and every occurrence is replaced. " +
+      "Read the document first with GetDocumentContent_mcp_WordServer to get the wording exactly " +
+      "right, and confirm the change with the user — the file is overwritten in place.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        driveItemId: { type: "string", description: "OneDrive item ID of the Word document" },
+        filePath: { type: "string", description: "OneDrive file path (e.g. '/Documents/Report.docx'). Alternative to driveItemId." },
+        siteId: { type: "string", description: "SharePoint site ID (if the file is in SharePoint)" },
+        find: { type: "string", description: "Exact text to search for." },
+        replace: { type: "string", description: "Text to put in its place. Use an empty string to delete the text." },
+      },
+      required: ["find"],
     },
   },
   {
@@ -354,6 +450,8 @@ export class WordGraphToolHandler {
         return this.createDocument(args);
       case "GetDocumentContent_mcp_WordServer":
         return this.getContent(args);
+      case "ReplaceTextInDocument":
+        return this.replaceText(args);
       case "AddComment":
       case "ReplyToComment_mcp_WordServer":
         return this.addComment(args);
@@ -404,6 +502,41 @@ export class WordGraphToolHandler {
     log(`Downloaded DOCX: ${res.rawBuffer.length} bytes (itemId=${itemId})`);
     const text = extractDocxText(res.rawBuffer);
     return `Document content:\n\n${text}`;
+  }
+
+  // ── Find & replace ──────────────────────────────────────────────────────────
+
+  private async replaceText(args: Record<string, unknown>): Promise<string> {
+    const { path: drivePath } = this.resolveItem(args);
+    const find = String(args.find ?? "");
+    const replace = String(args.replace ?? "");
+    if (!find) return "Error: 'find' text is required.";
+
+    const dlRes = await gf(this.token, drivePath + "/content");
+    if (!dlRes.ok) return `Error downloading document (${dlRes.status}): ${JSON.stringify(dlRes.body)}`;
+    if (!dlRes.rawBuffer) return "Error: empty response from Graph";
+
+    const { buffer, count, flattened } = replaceTextInDocx(dlRes.rawBuffer, find, replace);
+    if (count === 0) {
+      return `No occurrences of "${find}" were found — the document was not modified. ` +
+             `Check the exact wording, including capitalisation (the match is case-sensitive).`;
+    }
+
+    const upRes = await gf(this.token, drivePath + "/content", {
+      method: "PUT",
+      headers: { "Content-Type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document" },
+      body: buffer,
+    });
+    if (!upRes.ok) return `Error uploading document (${upRes.status}): ${JSON.stringify(upRes.body)}`;
+
+    log(`Replaced ${count} occurrence(s) of "${find}"`);
+    // Formatting loss is reported rather than hidden — the user may want to
+    // check those paragraphs.
+    const note = flattened > 0
+      ? ` Note: in ${flattened} paragraph(s) the phrase spanned several formatting runs, so that ` +
+        `paragraph now carries a single uniform format — worth a quick look if it was styled.`
+      : "";
+    return `✅ Replaced ${count} occurrence(s) of "${find}" with "${replace}".${note}`;
   }
 
   // ── Add comment ─────────────────────────────────────────────────────────────
