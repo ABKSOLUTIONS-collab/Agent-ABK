@@ -31,6 +31,38 @@ function guessMimeType(fileName: string): string {
   return MIME_TYPES[ext] ?? "application/octet-stream";
 }
 
+/**
+ * Builds the Graph path for writing a file by name into a folder.
+ *
+ * Every document-creating tool (Word, Excel, PowerPoint) needs exactly this,
+ * and each had its own copy hardcoded to `/me/drive` — which is why none of
+ * them could create anything in SharePoint. Keeping the OneDrive/SharePoint
+ * decision in one place means adding a format later cannot silently
+ * reintroduce that gap.
+ *
+ * @param folderPath Folder relative to the drive root ('/Reports'); root if omitted.
+ * @param siteId     SharePoint site; omit for the user's own OneDrive.
+ * @param driveId    A specific document library; otherwise the site's default.
+ */
+export function buildUploadPath(
+  fileName: string,
+  folderPath?: string,
+  siteId?: string,
+  driveId?: string
+): string {
+  const base = driveId
+    ? `/drives/${driveId}`
+    : siteId
+      ? `/sites/${siteId}/drive`
+      : "/me/drive";
+
+  const folder = (folderPath ?? "").replace(/^\/+|\/+$/g, "");
+  const encodedName = encodeURIComponent(fileName);
+  return folder
+    ? `${base}/root:/${encodeURI(folder)}/${encodedName}:/content`
+    : `${base}/root:/${encodedName}:/content`;
+}
+
 // ── Tool Definitions ──────────────────────────────────────────────────────────
 
 export const SHAREPOINT_TOOLS: Tool[] = [

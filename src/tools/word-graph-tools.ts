@@ -8,6 +8,7 @@
  */
 import { Tool } from "@modelcontextprotocol/sdk/types.js";
 import { strToU8, strFromU8, zipSync, unzipSync } from "fflate";
+import { buildUploadPath } from "./sharepoint-tools";
 
 function log(msg: string): void {
   process.stderr.write(`[agent365-bridge] [word-graph] ${msg}\n`);
@@ -328,14 +329,25 @@ export const WORD_GRAPH_TOOL_NAMES = new Set([
 export const WORD_GRAPH_TOOLS: Tool[] = [
   {
     name: "CreateDocument",
-    description: "Create a new Word document (.docx) in the user's OneDrive and optionally populate it with text content.",
+    description:
+      "Create a new Word document (.docx), optionally populated with text. Creates it in the " +
+      "user's OneDrive by default, or directly in a SharePoint site when siteId is given — there " +
+      "is no need to create it in OneDrive and then move it.",
     inputSchema: {
       type: "object",
       properties: {
         name: { type: "string", description: "Document file name (e.g. 'Meeting Notes.docx')" },
         path: {
           type: "string",
-          description: "OneDrive folder path to create the document in (e.g. '/Documents'). Default: root",
+          description: "Folder path within the drive to create the document in (e.g. '/Documents'). Default: root",
+        },
+        siteId: {
+          type: "string",
+          description: "Optional. SharePoint site ID to create the document in. Omit for the user's OneDrive.",
+        },
+        driveId: {
+          type: "string",
+          description: "Optional. Specific document library, when a SharePoint site has more than one. Defaults to the site's default library.",
         },
         content: {
           type: "string",
@@ -470,10 +482,15 @@ export class WordGraphToolHandler {
     const content = String(args.content ?? "");
     const docxBuffer = buildDocx(title, content);
 
-    // Upload to OneDrive at the given path
-    const uploadPath = folder
-      ? `/me/drive/root:${folder}/${encodeURIComponent(fileName)}:/content`
-      : `/me/drive/root:/${encodeURIComponent(fileName)}:/content`;
+    // Writes to the user's OneDrive, or to a SharePoint site when siteId is
+    // given — the shared helper is what keeps that choice consistent across
+    // the Word, Excel and PowerPoint creators.
+    const uploadPath = buildUploadPath(
+      fileName,
+      folder,
+      args.siteId as string | undefined,
+      args.driveId as string | undefined
+    );
 
     const res = await gf(this.token, uploadPath, {
       method: "PUT",

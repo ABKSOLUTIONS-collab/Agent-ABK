@@ -6,6 +6,7 @@
  */
 import { Tool } from "@modelcontextprotocol/sdk/types.js";
 import { strToU8, zipSync } from "fflate";
+import { buildUploadPath } from "./sharepoint-tools";
 
 function log(msg: string): void {
   process.stderr.write(`[agent365-bridge] [excel-graph] ${msg}\n`);
@@ -151,14 +152,25 @@ function columnLetter(n: number): string {
 export const EXCEL_GRAPH_TOOLS: Tool[] = [
   {
     name: "CreateWorkbook",
-    description: "Create a new Excel workbook (.xlsx) in the user's OneDrive.",
+    description:
+      "Create a new Excel workbook (.xlsx). Creates it in the user's OneDrive by default, or " +
+      "directly in a SharePoint site when siteId is given — there is no need to create it in " +
+      "OneDrive and then move it.",
     inputSchema: {
       type: "object",
       properties: {
         name: { type: "string", description: "File name (e.g. 'Budget.xlsx')" },
         path: {
           type: "string",
-          description: "OneDrive folder path (e.g. '/Documents'). Default: root",
+          description: "Folder path within the drive (e.g. '/Documents'). Default: root",
+        },
+        siteId: {
+          type: "string",
+          description: "Optional. SharePoint site ID to create the workbook in. Omit for the user's OneDrive.",
+        },
+        driveId: {
+          type: "string",
+          description: "Optional. Specific document library, when a SharePoint site has more than one. Defaults to the site's default library.",
         },
         sheetName: { type: "string", description: "Name for the first worksheet (default: Sheet1)" },
       },
@@ -443,9 +455,12 @@ export class ExcelGraphToolHandler {
     const sheetName = String(args.sheetName ?? "Sheet1");
     const xlsxBuffer = buildEmptyXlsx(sheetName);
 
-    const uploadPath = folder
-      ? `/me/drive/root:${folder}/${encodeURIComponent(fileName)}:/content`
-      : `/me/drive/root:/${encodeURIComponent(fileName)}:/content`;
+    const uploadPath = buildUploadPath(
+      fileName,
+      folder,
+      args.siteId as string | undefined,
+      args.driveId as string | undefined
+    );
 
     const res = await gf(this.token, uploadPath, {
       method: "PUT",

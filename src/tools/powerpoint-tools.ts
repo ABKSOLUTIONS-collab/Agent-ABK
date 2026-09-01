@@ -10,7 +10,7 @@
  */
 import { Tool } from "@modelcontextprotocol/sdk/types.js";
 import { strFromU8, strToU8, unzipSync, zipSync } from "fflate";
-import { fetchDriveItem } from "./sharepoint-tools";
+import { fetchDriveItem, buildUploadPath } from "./sharepoint-tools";
 
 function log(msg: string): void {
   process.stderr.write(`[agent365-bridge] [powerpoint] ${msg}\n`);
@@ -285,15 +285,19 @@ export const POWERPOINT_TOOLS: Tool[] = [
   {
     name: "CreatePresentation",
     description:
-      "Create a new PowerPoint presentation (.pptx) in the user's OneDrive from a list of slides. " +
-      "Each slide takes a title, optional bullet points and optional speaker notes. Use this to " +
-      "turn an outline, a summary or meeting notes into a deck. The result is a plain 16:9 deck " +
-      "using the default Office theme — content, not visual design.",
+      "Create a new PowerPoint presentation (.pptx) from a list of slides. Each slide takes a " +
+      "title, optional bullet points and optional speaker notes. Use this to turn an outline, a " +
+      "summary or meeting notes into a deck. Creates it in the user's OneDrive by default, or " +
+      "directly in a SharePoint site when siteId is given — there is no need to create it in " +
+      "OneDrive and then move it. The result is a plain 16:9 deck using the default Office " +
+      "theme — content, not visual design.",
     inputSchema: {
       type: "object",
       properties: {
         name: { type: "string", description: "File name, e.g. 'Q3 Review.pptx' ('.pptx' is added if missing)." },
-        path: { type: "string", description: "OneDrive folder path, e.g. '/Decks'. Defaults to the root." },
+        path: { type: "string", description: "Folder path within the drive, e.g. '/Decks'. Defaults to the root." },
+        siteId: { type: "string", description: "Optional. SharePoint site ID to create the deck in. Omit for the user's OneDrive." },
+        driveId: { type: "string", description: "Optional. Specific document library, when a SharePoint site has more than one." },
         slides: {
           type: "array",
           description: "The slides, in order.",
@@ -533,10 +537,12 @@ export class PowerPointToolHandler {
 
     const buffer = buildPptx(slides, fileName.replace(/\.pptx$/i, ""));
 
-    const folder = String(args.path ?? "").replace(/\/+$/, "");
-    const uploadPath = folder
-      ? `/me/drive/root:${folder.startsWith("/") ? folder : "/" + folder}/${encodeURIComponent(fileName)}:/content`
-      : `/me/drive/root:/${encodeURIComponent(fileName)}:/content`;
+    const uploadPath = buildUploadPath(
+      fileName,
+      String(args.path ?? ""),
+      args.siteId as string | undefined,
+      args.driveId as string | undefined
+    );
 
     const res = await fetch(`https://graph.microsoft.com/v1.0${uploadPath}`, {
       method: "PUT",
