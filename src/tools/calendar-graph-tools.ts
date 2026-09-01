@@ -5,6 +5,7 @@
  * Works with any standard M365 subscription — no Copilot license required.
  */
 import { Tool } from "@modelcontextprotocol/sdk/types.js";
+import { fmtDateTime } from "./format";
 
 function log(msg: string): void {
   process.stderr.write(`[agent365-bridge] [calendar-graph] ${msg}\n`);
@@ -25,6 +26,10 @@ async function gf(token: string, path: string, options: RequestInit = {}): Promi
     headers: {
       Authorization: `Bearer ${token}`,
       "Content-Type": "application/json",
+      // Ask Graph for UTC and convert once, at display time, via fmtDateTime.
+      // Do NOT change this to a local zone: the formatter treats a naive
+      // timestamp as UTC, so returning Athens times here would shift them a
+      // second time and put every event three hours out.
       Prefer: `outlook.timezone="UTC"`,
       ...(options.headers ?? {}),
     },
@@ -84,8 +89,11 @@ function fmtEvent(ev: any): string {
   return [
     `ID: ${ev.id}`,
     `Subject: ${ev.subject ?? "(no subject)"}`,
-    `Start: ${start?.dateTime ?? ""}${start?.timeZone ? ` (${start.timeZone})` : ""}`,
-    `End: ${end?.dateTime ?? ""}`,
+    // Graph reports event times in UTC with the original zone alongside; both
+    // are shown here in the organisation's timezone so the agent never quotes
+    // a start time three hours off what the user sees in Outlook.
+    `Start: ${fmtDateTime(start?.dateTime)}`,
+    `End: ${fmtDateTime(end?.dateTime)}`,
     loc?.displayName ? `Location: ${loc.displayName}` : "",
     org?.emailAddress ? `Organizer: ${org.emailAddress.name ?? org.emailAddress.address ?? ""}` : "",
     attendees.length > 0
@@ -580,8 +588,8 @@ export class CalendarGraphToolHandler {
     return suggestions
       .map(
         (s: any, i: number) =>
-          `Option ${i + 1}:\n  Start: ${s.meetingTimeSlot?.start?.dateTime ?? ""}\n  End:   ${
-            s.meetingTimeSlot?.end?.dateTime ?? ""
+          `Option ${i + 1}:\n  Start: ${fmtDateTime(s.meetingTimeSlot?.start?.dateTime)}\n  End:   ${
+            fmtDateTime(s.meetingTimeSlot?.end?.dateTime)
           }\n  Confidence: ${Math.round((s.confidence ?? 0) * 100)}%`
       )
       .join("\n\n");

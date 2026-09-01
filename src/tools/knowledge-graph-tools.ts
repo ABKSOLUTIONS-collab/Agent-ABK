@@ -12,6 +12,7 @@
  *   Stubs below explain what they do and return a clear message.
  */
 import { Tool } from "@modelcontextprotocol/sdk/types.js";
+import { fmtDate } from "./format";
 
 function log(msg: string): void {
   process.stderr.write(`[agent365-bridge] [knowledge-graph] ${msg}\n`);
@@ -188,7 +189,7 @@ export class KnowledgeGraphToolHandler {
       const type = (r["@odata.type"] ?? "").replace("#microsoft.graph.", "");
       const title = r.subject ?? r.name ?? r.displayName ?? hit.hitId;
       const url = r.webUrl ?? "";
-      const modified = r.lastModifiedDateTime ? new Date(r.lastModifiedDateTime).toLocaleDateString() : "";
+      const modified = fmtDate(r.lastModifiedDateTime);
       const from = r.from?.emailAddress
         ? ` | From: ${r.from.emailAddress.name ?? r.from.emailAddress.address}`
         : "";

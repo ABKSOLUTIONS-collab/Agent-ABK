@@ -1,4 +1,5 @@
 import { Tool } from "@modelcontextprotocol/sdk/types.js";
+import { fmtDate } from "./format";
 
 function log(msg: string) {
   process.stderr.write(`[agent365-bridge] ${msg}\n`);
@@ -487,7 +488,7 @@ export class SharePointToolHandler {
     const items = data.value.map((item) => {
       const type = item.folder ? "📁" : "📄";
       const size = item.folder ? "" : ` (${Math.round((item.size ?? 0) / 1024)}KB)`;
-      const date = new Date(item.lastModifiedDateTime).toLocaleDateString();
+      const date = fmtDate(item.lastModifiedDateTime);
       return `${type} ${item.name}${size} — ${date} [ID: ${item.id}]`;
     });
 

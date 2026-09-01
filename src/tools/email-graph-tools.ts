@@ -6,6 +6,7 @@
  */
 
 import { Tool } from "@modelcontextprotocol/sdk/types.js";
+import { fmtDateTime } from "./format";
 
 function log(msg: string) {
   process.stderr.write(`[agent365-bridge] [email-graph] ${msg}\n`);
@@ -70,7 +71,7 @@ function fmtMsg(m: Record<string, unknown>): string {
     `Subject: ${m.subject ?? "(no subject)"}`,
     `From: ${from?.name ? `${from.name} <${from.address ?? ""}>` : (from?.address ?? "")}`,
     `To: ${to}`,
-    `Date: ${m.receivedDateTime ?? m.sentDateTime ?? ""}`,
+    `Date: ${fmtDateTime(m.receivedDateTime ?? m.sentDateTime)}`,
     `Read: ${m.isRead ? "Yes" : "No"}`,
     `Has Attachments: ${m.hasAttachments ? "Yes" : "No"}`,
     bodyContent ? `\nBody:\n${bodyContent}` : (m.bodyPreview ? `\nPreview: ${m.bodyPreview}` : ""),

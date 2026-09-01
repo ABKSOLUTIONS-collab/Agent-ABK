@@ -6,6 +6,7 @@
  * except GetOnlineMeetingAiInsights which is a Copilot-only feature.
  */
 import { Tool } from "@modelcontextprotocol/sdk/types.js";
+import { fmtDateTime } from "./format";
 
 function log(msg: string): void {
   process.stderr.write(`[agent365-bridge] [teams-graph] ${msg}\n`);
@@ -179,13 +180,13 @@ export class TeamsGraphToolHandler {
         `/me/onlineMeetings/${meetingId}/transcripts/${transcripts[0].id}/content`,
         { headers: { Accept: "text/vtt, application/json" } }
       );
-      if (contentRes.ok) return `Transcript (${transcripts[0].createdDateTime ?? ""}):\n\n${contentRes.body}`;
+      if (contentRes.ok) return `Transcript (${fmtDateTime(transcripts[0].createdDateTime)}):\n\n${contentRes.body}`;
     }
 
     return [
       `Found ${transcripts.length} transcript(s):`,
       ...transcripts.map(
-        (t: any, i: number) => `${i + 1}. ID: ${t.id}\n   Created: ${t.createdDateTime ?? ""}`
+        (t: any, i: number) => `${i + 1}. ID: ${t.id}\n   Created: ${fmtDateTime(t.createdDateTime)}`
       ),
       "\nUse transcriptId parameter to retrieve a specific transcript's content.",
     ].join("\n");
@@ -215,8 +216,8 @@ export class TeamsGraphToolHandler {
 
     const lines = [
       `Attendance Report`,
-      `Meeting Start: ${report.meetingStartDateTime ?? ""}`,
-      `Meeting End:   ${report.meetingEndDateTime ?? ""}`,
+      `Meeting Start: ${fmtDateTime(report.meetingStartDateTime)}`,
+      `Meeting End:   ${fmtDateTime(report.meetingEndDateTime)}`,
       `Total Participants: ${report.totalParticipantCount ?? records.length}`,
       "",
       "Attendees:",
@@ -226,7 +227,7 @@ export class TeamsGraphToolHandler {
       lines.push(`  ${record.displayName ?? record.emailAddress ?? record.id} — ${mins} min (${record.role ?? "attendee"})`);
       if (record.attendanceIntervals?.length) {
         for (const interval of record.attendanceIntervals) {
-          lines.push(`    Joined: ${interval.joinDateTime ?? ""} | Left: ${interval.leaveDateTime ?? ""}`);
+          lines.push(`    Joined: ${fmtDateTime(interval.joinDateTime)} | Left: ${fmtDateTime(interval.leaveDateTime)}`);
         }
       }
     }
