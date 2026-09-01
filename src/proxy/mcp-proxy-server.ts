@@ -11,7 +11,7 @@ import { ToolForwarder } from "./tool-forwarder";
 import { CachedTool, loadToolsCache, saveToolsCache } from "../auth/tools-cache";
 import { getUserToken, getGraphToken, getStoredEmail, pruneExpiredTokens } from "../auth/user-token-store";
 import { registerOAuthEndpoints } from "../auth/oauth-handler";
-import { SHAREPOINT_TOOLS, SHAREPOINT_TOOL_NAMES, SharePointToolHandler, fetchDriveItem, FetchedDriveItem } from "../tools/sharepoint-tools";
+import { SHAREPOINT_TOOLS, SHAREPOINT_TOOL_NAMES, SharePointToolHandler, fetchDriveItem, createDriveItemLink, FetchedDriveItem } from "../tools/sharepoint-tools";
 import { OCR_TOOL, OCR_TOOL_NAMES, OcrToolHandler } from "../tools/ocr-tool";
 import { EMAIL_GRAPH_TOOLS, EMAIL_GRAPH_TOOL_NAMES, EmailGraphToolHandler } from "../tools/email-graph-tools";
 import { CALENDAR_GRAPH_TOOLS, CALENDAR_GRAPH_TOOL_NAMES, CalendarGraphToolHandler } from "../tools/calendar-graph-tools";
@@ -194,12 +194,16 @@ const UPLOAD_CHUNK = 4 * 1024 * 1024;
 async function attachFileToMessage(
   graphToken: string,
   msgId: string,
-  file: FetchedDriveItem
+  file: FetchedDriveItem,
+  // Which mailbox the draft lives in — the signed-in user's own, or a shared
+  // one being sent as. Attachments must be posted to the same mailbox as the
+  // draft, or Graph cannot find the message.
+  mailboxBase = "https://graph.microsoft.com/v1.0/me"
 ): Promise<void> {
   const auth = { Authorization: `Bearer ${graphToken}` };
 
   if (file.buffer.length <= DIRECT_ATTACH_LIMIT) {
-    const res = await fetch(`https://graph.microsoft.com/v1.0/me/messages/${msgId}/attachments`, {
+    const res = await fetch(`${mailboxBase}/messages/${msgId}/attachments`, {
       method: "POST",
       headers: { ...auth, "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -213,7 +217,7 @@ async function attachFileToMessage(
     return;
   }
 
-  const sessRes = await fetch(`https://graph.microsoft.com/v1.0/me/messages/${msgId}/attachments/createUploadSession`, {
+  const sessRes = await fetch(`${mailboxBase}/messages/${msgId}/attachments/createUploadSession`, {
     method: "POST",
     headers: { ...auth, "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -660,7 +664,45 @@ async function executeToolCall(
     try {
       const rawBody  = String(typedArgs.body ?? typedArgs.emailBody ?? "");
       const bodyType = String(typedArgs.contentType ?? typedArgs.bodyType ?? "text");
-      const htmlBody = appendSignature(rawBody, bodyType, signature);
+
+      // Sharing links are resolved into the body BEFORE the signature is
+      // appended, so they read as part of the message rather than trailing
+      // after the sign-off.
+      let bodyWithLinks = rawBody;
+      const linkRefs = Array.isArray(typedArgs.links) ? typedArgs.links : [];
+      const linkedNames: string[] = [];
+      if (linkRefs.length) {
+        const rendered: string[] = [];
+        for (const raw of linkRefs) {
+          const spec = (typeof raw === "string" ? { ref: raw } : raw) as { ref?: string; siteId?: string; type?: string };
+          if (!spec?.ref) continue;
+          try {
+            const link = await createDriveItemLink(
+              graphToken, spec.ref, spec.siteId,
+              spec.type === "edit" ? "edit" : "view"
+            );
+            rendered.push(`<li><a href="${link.url}">${link.name}</a></li>`);
+            linkedNames.push(link.name);
+          } catch (linkErr) {
+            const m = linkErr instanceof Error ? linkErr.message : String(linkErr);
+            log(`Link failed for '${spec.ref}': ${m}`);
+            return {
+              content: [{ type: "text", text: `Could not create a sharing link for '${spec.ref}': ${m}\nThe email was NOT sent.` }],
+              isError: true,
+            };
+          }
+        }
+        if (rendered.length) {
+          // Plain-text bodies are wrapped first; the message is sent as HTML
+          // either way, so a bare newline would otherwise collapse.
+          const bodyHtml = bodyType.toLowerCase() === "html"
+            ? bodyWithLinks
+            : bodyWithLinks.replace(/\n/g, "<br>");
+          bodyWithLinks = `${bodyHtml}<ul>${rendered.join("")}</ul>`;
+        }
+      }
+
+      const htmlBody = appendSignature(bodyWithLinks, linkRefs.length ? "html" : bodyType, signature);
 
       // Schema allows "to"/"cc"/"bcc" as either a single string or an
       // array of strings — normalize both before mapping to Graph shape.
@@ -668,8 +710,103 @@ async function executeToolCall(
         (Array.isArray(val) ? val : val ? [val] : [])
           .map((r: unknown) => ({ emailAddress: { address: String(r) } }));
 
+      // Sending as a shared mailbox (e.g. info@) is a normal, admin-granted
+      // arrangement, not spoofing: Exchange independently enforces whether
+      // this user actually holds Send As rights on that mailbox.
+      const fromAddress = String(typedArgs.from ?? "").trim();
+      const sendAsShared = !!fromAddress && fromAddress.toLowerCase() !== (email ?? "").toLowerCase();
+
+      // The shared-mailbox path deliberately does NOT create a draft first.
+      // Graph splits these permissions:
+      //   POST /users/{x}/messages  (create a draft there) -> Mail.ReadWrite.Shared
+      //   POST /users/{x}/sendMail  (send as it)           -> Mail.Send.Shared
+      // Our tokens carry Mail.Send.Shared but not Mail.ReadWrite.Shared, so
+      // building a draft in the shared mailbox returns 403 even for a user who
+      // genuinely has Send As. sendMail takes the entire message in one
+      // request instead, which is why attachments are inlined below.
+      if (sendAsShared) {
+        const inline: Record<string, unknown>[] = [];
+        if (LOGO_BASE64) {
+          inline.push({
+            "@odata.type": "#microsoft.graph.fileAttachment",
+            name: "abk-logo.png", contentType: "image/png",
+            contentBytes: LOGO_BASE64, contentId: "abk-logo@abk", isInline: true,
+          });
+        }
+
+        const attachRefsShared = Array.isArray(typedArgs.attachments) ? typedArgs.attachments : [];
+        const attachedShared: string[] = [];
+        let inlineBytes = 0;
+        for (const raw of attachRefsShared) {
+          const spec = (typeof raw === "string" ? { ref: raw } : raw) as { ref?: string; siteId?: string };
+          if (!spec?.ref) continue;
+          try {
+            const file = await fetchDriveItem(graphToken, spec.ref, spec.siteId);
+            inlineBytes += file.buffer.length;
+            // sendMail carries everything in a single request, which Graph caps
+            // at roughly 4 MB. The resumable upload used for normal sends is
+            // not available here because there is no draft to upload into.
+            if (inlineBytes > DIRECT_ATTACH_LIMIT) {
+              return {
+                content: [{ type: "text", text: `'${file.name}' makes the attachments too large to send from a shared mailbox (limit is about 3 MB in total). Send it from your own mailbox instead, or share a link to the file.` }],
+                isError: true,
+              };
+            }
+            inline.push({
+              "@odata.type": "#microsoft.graph.fileAttachment",
+              name: file.name,
+              contentType: file.contentType,
+              contentBytes: file.buffer.toString("base64"),
+            });
+            attachedShared.push(file.name);
+          } catch (attErr) {
+            const m = attErr instanceof Error ? attErr.message : String(attErr);
+            return { content: [{ type: "text", text: `Could not attach '${spec.ref}': ${m}. The email was NOT sent.` }], isError: true };
+          }
+        }
+
+        const sharedRes = await fetch(`https://graph.microsoft.com/v1.0/users/${encodeURIComponent(fromAddress)}/sendMail`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${graphToken}`, "Content-Type": "application/json" },
+          body: JSON.stringify({
+            message: {
+              subject:       String(typedArgs.subject ?? ""),
+              body:          { contentType: "HTML", content: htmlBody },
+              toRecipients:  buildRecipients(typedArgs.to),
+              ccRecipients:  buildRecipients(typedArgs.cc),
+              bccRecipients: buildRecipients(typedArgs.bcc),
+              ...(inline.length ? { attachments: inline } : {}),
+            },
+            // Keeps a copy in the shared mailbox's Sent Items, where the
+            // colleagues who share it expect to find what was sent.
+            saveToSentItems: true,
+          }),
+        });
+
+        if (sharedRes.ok || sharedRes.status === 202) {
+          log(`Email sent as ${fromAddress}${attachedShared.length ? ` with ${attachedShared.length} attachment(s)` : ""}${linkedNames.length ? ` and ${linkedNames.length} link(s)` : ""}`);
+          const suffix = attachedShared.length ? ` Attached: ${attachedShared.join(", ")}.` : "";
+          const links = linkedNames.length ? ` Linked: ${linkedNames.join(", ")}.` : "";
+          return { content: [{ type: "text", text: `Email sent successfully from '${fromAddress}'.${suffix}${links}` }] };
+        }
+
+        const detail = await sharedRes.text().catch(() => "");
+        const denied = sharedRes.status === 403 || sharedRes.status === 404;
+        return {
+          content: [{
+            type: "text",
+            text: denied
+              ? `Could not send as '${fromAddress}': Exchange refused it, which means the signed-in account does not hold Send As rights on that mailbox, or the mailbox does not exist. An Exchange administrator can grant Send As on '${fromAddress}'. (Graph ${sharedRes.status})`
+              : `Could not send as '${fromAddress}' (${sharedRes.status}): ${detail}`,
+          }],
+          isError: true,
+        };
+      }
+
+      const mailboxBase = "https://graph.microsoft.com/v1.0/me";
+
       // 1️⃣ Create draft
-      const draftResp = await fetch("https://graph.microsoft.com/v1.0/me/messages", {
+      const draftResp = await fetch(`${mailboxBase}/messages`, {
         method: "POST",
         headers: { Authorization: `Bearer ${graphToken}`, "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -688,7 +825,7 @@ async function executeToolCall(
         const msgId = draft.id;
 
         // 2️⃣ Add inline CID attachment
-        await fetch(`https://graph.microsoft.com/v1.0/me/messages/${msgId}/attachments`, {
+        await fetch(`${mailboxBase}/messages/${msgId}/attachments`, {
           method: "POST",
           headers: { Authorization: `Bearer ${graphToken}`, "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -713,7 +850,7 @@ async function executeToolCall(
           if (!spec?.ref) continue;
           try {
             const file = await fetchDriveItem(graphToken, spec.ref, spec.siteId);
-            await attachFileToMessage(graphToken, msgId, file);
+            await attachFileToMessage(graphToken, msgId, file, mailboxBase);
             attachedNames.push(file.name);
           } catch (attErr) {
             // Abort rather than send a mail that silently lacks the very file
@@ -728,14 +865,17 @@ async function executeToolCall(
         }
 
         // 3️⃣ Send directly via Graph API (no Copilot license needed)
-        const sendRes = await fetch(`https://graph.microsoft.com/v1.0/me/messages/${msgId}/send`, {
+        const sendRes = await fetch(`${mailboxBase}/messages/${msgId}/send`, {
           method: "POST",
           headers: { Authorization: `Bearer ${graphToken}` },
         });
         if (sendRes.ok || sendRes.status === 202) {
-          log(`Email sent via Graph API direct send (msg: ${msgId})${attachedNames.length ? ` with ${attachedNames.length} attachment(s)` : ""}`);
+          // Only the user's own mailbox reaches here; the shared-mailbox path
+          // returns above.
+          log(`Email sent via Graph API direct send (msg: ${msgId})${attachedNames.length ? ` with ${attachedNames.length} attachment(s)` : ""}${linkedNames.length ? ` and ${linkedNames.length} link(s)` : ""}`);
           const suffix = attachedNames.length ? ` Attached: ${attachedNames.join(", ")}.` : "";
-          return { content: [{ type: "text", text: `Email sent successfully.${suffix}` }] };
+          const links = linkedNames.length ? ` Linked: ${linkedNames.join(", ")}.` : "";
+          return { content: [{ type: "text", text: `Email sent successfully.${suffix}${links}` }] };
         }
         const sendErr = await sendRes.text().catch(() => "");
         log(`Graph direct send failed (${sendRes.status}): ${sendErr} — trying upstream`);

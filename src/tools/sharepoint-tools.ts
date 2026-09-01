@@ -805,6 +805,59 @@ export interface FetchedDriveItem {
   buffer: Buffer;
 }
 
+export interface DriveItemLink {
+  name: string;
+  url: string;
+}
+
+/**
+ * Creates a sharing link for a drive item, for sending in place of an
+ * attachment.
+ *
+ * Defaults to an organisation-scoped view link: anyone at ABK with the link can
+ * open it, but it is not public. Anonymous links are possible in Graph but are
+ * not offered here — a mail tool should not be able to publish a company file
+ * to the open internet as a side effect of "send this to someone".
+ */
+export async function createDriveItemLink(
+  token: string,
+  ref: string,
+  siteId?: string,
+  type: "view" | "edit" = "view"
+): Promise<DriveItemLink> {
+  const base = siteId ? `/sites/${siteId}/drive` : "/me/drive";
+  const clean = ref.replace(/^\/+|\/+$/g, "");
+  const looksLikePath = ref.includes("/") || ref.includes(".");
+  const itemPath = looksLikePath
+    ? `${base}/root:/${encodeURI(clean)}`
+    : `${base}/items/${ref}`;
+
+  const headers = { Authorization: `Bearer ${token}`, "Content-Type": "application/json" };
+
+  const metaRes = await fetch(`https://graph.microsoft.com/v1.0${itemPath}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!metaRes.ok) {
+    throw new Error(`Could not find '${ref}' (${metaRes.status}): ${await metaRes.text()}`);
+  }
+  const meta = await metaRes.json() as { name: string; folder?: unknown };
+
+  const res = await fetch(`https://graph.microsoft.com/v1.0${itemPath}/createLink`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ type, scope: "organization" }),
+  });
+  if (!res.ok) {
+    throw new Error(`Could not create a link for '${meta.name}' (${res.status}): ${await res.text()}`);
+  }
+  const body = await res.json() as { link?: { webUrl?: string } };
+  const url = body.link?.webUrl;
+  if (!url) throw new Error(`Graph returned no link for '${meta.name}'.`);
+
+  log(`Created ${type} link for '${meta.name}'`);
+  return { name: meta.name, url };
+}
+
 /**
  * Downloads a OneDrive (or SharePoint) item's raw bytes so it can be attached
  * to an email. `ref` is either an item ID or a path relative to the drive root

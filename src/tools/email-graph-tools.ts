@@ -428,11 +428,21 @@ export const EMAIL_GRAPH_TOOLS: Tool[] = [
       "Create and immediately send an email, optionally attaching files straight from the user's " +
       "OneDrive or a SharePoint site. To attach a file, pass its path or item ID in `attachments` — " +
       "the file's bytes are fetched and attached for you, so there is no need to download or " +
-      "base64-encode anything first. The user's signature is appended automatically.",
+      "base64-encode anything first. The user's signature is appended automatically. " +
+      "To send from a shared mailbox such as info@ or support@, set `from` to that address; this " +
+      "is a normal arrangement where the user has been granted Send As rights, and Exchange " +
+      "rejects the attempt if they have not.",
     inputSchema: {
       type: "object",
       properties: {
         subject: { type: "string", description: "Email subject" },
+        from: {
+          type: "string",
+          description:
+            "Optional. Send from a shared mailbox the user has Send As rights on, e.g. " +
+            "'info@abk.gr'. Omit to send from the user's own mailbox. The message is created in, " +
+            "and sent from, that mailbox — so it also appears in its Sent Items.",
+        },
         body: { type: "string", description: "Email body content" },
         contentType: { type: "string", description: "Body type: 'HTML' or 'text' (default: text)" },
         to: {
@@ -453,12 +463,33 @@ export const EMAIL_GRAPH_TOOLS: Tool[] = [
             "Optional. Files to attach, each identified by its OneDrive path (e.g. " +
             "'/Reports/Q3.pptx' or just 'Q3.pptx' for a file in the root) or by the item ID " +
             "returned from list_onedrive_folder. Use siteId on an entry to pull the file from a " +
-            "SharePoint site instead of the personal OneDrive.",
+            "SharePoint site instead of the personal OneDrive. Size limits: about 150 MB from the " +
+            "user's own mailbox, but only about 3 MB in total when `from` names a shared mailbox " +
+            "— use `links` instead for anything larger.",
           items: {
             type: "object",
             properties: {
               ref: { type: "string", description: "File path relative to the drive root, or the file's item ID." },
               siteId: { type: "string", description: "Optional. SharePoint site ID, when the file lives in a site rather than the user's OneDrive." },
+            },
+            required: ["ref"],
+          },
+        },
+        links: {
+          type: "array",
+          description:
+            "Optional. Files to include as sharing links rather than attachments — the links are " +
+            "added to the end of the message body. Prefer this for large files, for anything over " +
+            "the shared-mailbox attachment limit, and whenever the recipient should always see the " +
+            "current version rather than a frozen copy. Links are scoped to the organisation: " +
+            "colleagues with the link can open the file, but it is not public. Mention the files " +
+            "in the body text yourself, since only the links themselves are appended.",
+          items: {
+            type: "object",
+            properties: {
+              ref: { type: "string", description: "File path relative to the drive root, or the file's item ID." },
+              siteId: { type: "string", description: "Optional. SharePoint site ID, when the file lives in a site rather than the user's OneDrive." },
+              type: { type: "string", enum: ["view", "edit"], description: "'view' (default) lets the recipient read the file; 'edit' lets them change it." },
             },
             required: ["ref"],
           },
