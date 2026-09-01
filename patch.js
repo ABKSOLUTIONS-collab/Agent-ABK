@@ -1225,11 +1225,17 @@ console.log(`ABK branding applied (idempotent)! Logo replaced in ${logoReplaced}
 // entries follow Anthropic's standard multipliers (write = 1.25x input,
 // read = 0.1x input), matching how the existing 4.x rows are derived.
 //
-// NOTE ON SONNET 5: Anthropic ran an introductory rate of $2/$10 through
-// 2026-08-31, after which it is $3/$15. We deliberately encode the standard
-// $3/$15 rather than date-switching logic that would be dead code within
-// days — this slightly OVER-states cost until 31 Aug and is exact from
-// 1 Sep onward. Over-stating is the safe direction for a budget figure.
+// NOTE ON SONNET 5: this was first encoded as $3/$15 on the assumption that
+// an introductory $2/$10 rate had expired on 2026-08-31. It had not. The
+// Console's own model card still showed $2/$10 on 1 Sep, and our reported
+// spend came out at exactly 1.50x Anthropic's — 3/2 and 15/10 — which is what
+// pinned the cause to the rate rather than to prompt caching.
+//
+// The lesson is the source, not the number: prices here must come from the
+// Console model card for this organisation, which is authoritative for what is
+// actually billed, rather than from a published list that may lag or carry
+// promotions. Cache rates follow from the base price (write 1.25x, read 0.1x)
+// and match the card: $2.50 and $0.20.
 {
   const path = require('path');
   const distDir = '/app/packages/data-schemas/dist';
@@ -1240,14 +1246,14 @@ console.log(`ABK branding applied (idempotent)! Logo replaced in ${logoReplaced}
   const cacheAnchor = "'claude-sonnet-4-6': { write: 3.75, read: 0.3 },";
 
   const baseRows = [
-    "'claude-sonnet-5': { prompt: 3, completion: 15 },",
+    "'claude-sonnet-5': { prompt: 2, completion: 10 },",
     "'claude-opus-4-8': { prompt: 5, completion: 25 },",
     "'claude-opus-5': { prompt: 5, completion: 25 },",
     "'claude-fable-5': { prompt: 10, completion: 50 },",
   ].join('\n    ');
 
   const cacheRows = [
-    "'claude-sonnet-5': { write: 3.75, read: 0.3 },",
+    "'claude-sonnet-5': { write: 2.5, read: 0.2 },",
     "'claude-opus-4-8': { write: 6.25, read: 0.5 },",
     "'claude-opus-5': { write: 6.25, read: 0.5 },",
     "'claude-fable-5': { write: 12.5, read: 1 },",
