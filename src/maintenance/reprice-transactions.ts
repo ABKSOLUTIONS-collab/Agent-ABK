@@ -6,9 +6,10 @@
  * result on the transaction. When a model is missing from that table it is
  * priced at a catch-all rate instead of failing, so the spend figures in
  * Organization Settings are quietly wrong — claude-sonnet-5 was billed at
- * $0.80/$2.40 instead of $3/$15 for two weeks before anyone noticed. Fixing the
- * table (see patch.js) only affects messages sent afterwards; everything
- * already recorded keeps the wrong value. This script restates that history.
+ * $0.80/$2.40 instead of its real $2/$10 for two weeks before anyone noticed.
+ * Fixing the table (see patch.js) only affects messages sent afterwards;
+ * everything already recorded keeps the wrong value. This script restates that
+ * history.
  *
  * It is also the procedure to run when Anthropic changes a price: update RATES,
  * dry-run, then apply over the affected date range.
@@ -29,14 +30,22 @@
  *   az containerapp exec -n agent365-bridge -g ABKAgent365 --command \
  *     "node /app/dist/maintenance/reprice-transactions.js --from 2026-09-01 --to 2026-09-02"
  *
- * Add --apply to commit, and --model <id> to limit it to one model.
+ * Add --apply to commit, --model <id> to limit it to one model, and --force to
+ * revisit rows a previous run already repriced (needed when the rates in this
+ * file were themselves wrong).
  */
 import { MongoClient, Document } from "mongodb";
 
 /**
- * Anthropic list prices, USD per 1M tokens. Keep in sync with the table
+ * Prices in USD per 1M tokens, keyed by model. Keep in sync with the table
  * injected by patch.js — this script and that patch must agree, or repriced
  * history will disagree with newly recorded messages.
+ *
+ * Take these from the Console's model card for this organisation (Dashboard ->
+ * Models -> click a model), not from a published price list. Sonnet 5 was first
+ * entered here as $3/$15 from such a list, while the Console showed $2/$10 —
+ * the promotional rate had not expired as the list implied — and every reported
+ * figure came out 1.5x too high until that was caught.
  */
 const RATES: Record<string, { prompt: number; completion: number }> = {
   "claude-fable-5":   { prompt: 10, completion: 50 },
@@ -45,7 +54,7 @@ const RATES: Record<string, { prompt: number; completion: number }> = {
   "claude-opus-4-7":  { prompt: 5,  completion: 25 },
   "claude-opus-4-6":  { prompt: 5,  completion: 25 },
   "claude-opus-4-5":  { prompt: 5,  completion: 25 },
-  "claude-sonnet-5":  { prompt: 3,  completion: 15 },
+  "claude-sonnet-5":  { prompt: 2,  completion: 10 },  // verified on the Console card
   "claude-sonnet-4-6": { prompt: 3, completion: 15 },
   "claude-sonnet-4-5": { prompt: 3, completion: 15 },
   "claude-haiku-4-5": { prompt: 1,  completion: 5 },
@@ -80,20 +89,24 @@ async function main() {
   const to = parseDate(arg("to"), "to");
   const onlyModel = arg("model");
   const apply = process.argv.includes("--apply");
+  // Rows are normally skipped once repriced, so a repeated run cannot compound
+  // values. --force is for the case where the RATES above were themselves
+  // wrong: the correction has to reach rows that a previous run already
+  // touched. It stays safe because every value is recomputed from rawAmount,
+  // which no run ever modifies.
+  const force = process.argv.includes("--force");
 
   const client = new MongoClient(uri);
   await client.connect();
   const col = client.db().collection("transactions");
 
-  const query: Document = {
-    createdAt: { $gte: from, $lt: to },
-    repricedAt: { $exists: false },
-  };
+  const query: Document = { createdAt: { $gte: from, $lt: to } };
+  if (!force) query.repricedAt = { $exists: false };
   if (onlyModel) query.model = onlyModel;
 
   const rows = await col.find(query).toArray();
   console.log(`Range ${from.toISOString().slice(0, 10)} -> ${to.toISOString().slice(0, 10)}`);
-  console.log(`${rows.length} transaction(s) not yet repriced${onlyModel ? ` for ${onlyModel}` : ""}\n`);
+  console.log(`${rows.length} transaction(s) in scope${force ? " (--force: including already repriced)" : " (not yet repriced)"}${onlyModel ? ` for ${onlyModel}` : ""}\n`);
 
   let oldTotal = 0;
   let newTotal = 0;
@@ -133,8 +146,11 @@ async function main() {
           $set: {
             tokenValue: -newValue,
             rate: perMillion,
-            tokenValueOriginal: r.tokenValue,
-            rateOriginal: r.rate,
+            // Keep the value LibreChat first recorded. On a --force re-run the
+            // "original" already stored is the real one; overwriting it with a
+            // previous correction would lose the only untouched reference.
+            tokenValueOriginal: r.tokenValueOriginal ?? r.tokenValue,
+            rateOriginal: r.rateOriginal ?? r.rate,
             repricedAt: new Date(),
           },
         }
