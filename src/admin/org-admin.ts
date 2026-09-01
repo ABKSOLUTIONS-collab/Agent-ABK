@@ -169,6 +169,48 @@ async function getUsageByUser(range: { start: Date; end: Date }): Promise<Map<st
   return map;
 }
 
+// LibreChat prices an unrecognised model at a catch-all rate rather than
+// failing, so a model missing from its table is billed silently and wrongly —
+// that is exactly how claude-sonnet-5 went ~4x under-reported for two weeks
+// before anyone noticed. No Claude model legitimately carries this rate, so a
+// transaction recorded with it is a reliable tell that the price table has
+// fallen behind the models people can actually select.
+const FALLBACK_RATE = Number(process.env.LIBRECHAT_DEFAULT_RATE ?? "6");
+
+interface MispricedModel {
+  model: string;
+  rows: number;
+  tokens: number;
+}
+
+async function getMispricedModels(range: { start: Date; end: Date }): Promise<MispricedModel[]> {
+  const db = await getDb();
+  if (!db) return [];
+  try {
+    const rows = await db.collection("transactions").aggregate([
+      {
+        $match: {
+          createdAt: { $gte: range.start, $lt: range.end },
+          rate: FALLBACK_RATE,
+          // Rows already corrected by the repricing script keep their history
+          // but must not keep raising the alarm.
+          repricedAt: { $exists: false },
+        },
+      },
+      { $group: { _id: "$model", rows: { $sum: 1 }, tokens: { $sum: "$rawAmount" } } },
+      { $sort: { tokens: 1 } },
+    ]).toArray();
+    return rows.map((r) => ({
+      model: String(r._id ?? "unknown"),
+      rows: r.rows as number,
+      tokens: Math.abs((r.tokens as number) ?? 0),
+    }));
+  } catch (e) {
+    log(`getMispricedModels error: ${e}`);
+    return [];
+  }
+}
+
 interface DaySpend {
   date: string;   // YYYY-MM-DD
   usd: number;
@@ -557,6 +599,10 @@ window.addEventListener('message', function(evt) {
     .btn-remove:hover{background:var(--danger-soft-bg);color:var(--danger)}
     /* Error */
     .err-bar{background:var(--danger-soft-bg);border:1px solid var(--danger-border);border-radius:9px;padding:10px 14px;color:var(--danger);font-size:13px;margin-bottom:16px;display:none;animation:abkFadeUp .2s ease}
+    /* Amber rather than red: the figures are wrong, but nothing is broken and
+       no one needs to act this second — it must be noticed, not alarming. */
+    .warn-bar{background:var(--accent-soft-bg);border:1px solid var(--accent);border-radius:9px;padding:10px 14px;color:var(--text-primary);font-size:13px;margin-bottom:16px;display:none;animation:abkFadeUp .2s ease;line-height:1.5}
+    .warn-bar b{color:var(--accent)}
     .empty-cell{text-align:center;padding:56px 20px;color:var(--text-tertiary);font-size:13px}
     .empty-cell svg{display:block;margin:0 auto 12px;color:var(--border-heavy)}
     .skeleton{background:linear-gradient(90deg,var(--skeleton-a),var(--skeleton-b),var(--skeleton-a));border-radius:6px;animation:abkPulse 1.3s ease infinite}
@@ -572,6 +618,7 @@ ${sidebarHtml}
   <div class="main">
     <h1>Organization settings</h1>
     <div id="errBox" class="err-bar"></div>
+    <div id="priceWarn" class="warn-bar"></div>
     <div class="overview">
       <div class="ov-item">
         <div class="ov-label">Allowed email domains</div>
@@ -718,9 +765,28 @@ async function load() {
     document.getElementById('mPrev').disabled = !!(earliestMonth && curMonth <= earliestMonth);
     document.getElementById('mNext').disabled = curMonth >= thisMonthKey();
     document.getElementById('countLbl').textContent = allUsers.length + ' member' + (allUsers.length!==1?'s':'');
+    renderPriceWarning(d.mispriced);
     // Tell parent LibreChat page the current user's role (for Account settings display)
     try { window.parent.postMessage({ type: 'abk_org_role', role: MY_TIER }, '*'); } catch(ex) {}
   } catch(e) { showErr('Failed to load: ' + e.message); }
+}
+
+// Surfaces spend that was billed at LibreChat's catch-all rate because the
+// model was missing from its price table. Says plainly that the figures are
+// understated rather than just naming the model, since the number on screen is
+// what someone will otherwise take at face value.
+function renderPriceWarning(list) {
+  const el = document.getElementById('priceWarn');
+  if (!el) return;
+  if (!list || !list.length) { el.style.display = 'none'; return; }
+  const names = list.map(function(m) {
+    return '<b>' + m.model + '</b> (' + m.tokens.toLocaleString('en-US') + ' tokens)';
+  }).join(', ');
+  el.innerHTML =
+    'Some usage this month was priced at a fallback rate because the model is not in ' +
+    'LibreChat\\'s price table: ' + names + '. <b>The amounts below are understated.</b> ' +
+    'Add the model\\'s real price in patch.js, redeploy, then reprice this period.';
+  el.style.display = 'block';
 }
 
 document.getElementById('mPrev').addEventListener('click', function() {
@@ -1407,10 +1473,11 @@ export function registerOrgAdminEndpoints(app: Express): void {
     }
     try {
       const range = monthRange(qstr(req.query.month));
-      const [lcUsers, usage, earliestMonth] = await Promise.all([
+      const [lcUsers, usage, earliestMonth, mispriced] = await Promise.all([
         getLcUsers(),
         getUsageByUser(range),
         getEarliestMonth(),
+        getMispricedModels(range),
       ]);
       const users = lcUsers.map((u) => ({
         email: u.email,
@@ -1419,7 +1486,7 @@ export function registerOrgAdminEndpoints(app: Express): void {
         consumed: usage.get(String(u._id)) ?? 0,
       }));
       const orgTotal = users.reduce((s, u) => s + u.consumed, 0);
-      res.json({ users, tier: info.tier, month: range.key, orgTotal, earliestMonth });
+      res.json({ users, tier: info.tier, month: range.key, orgTotal, earliestMonth, mispriced });
     } catch (e) {
       log(`/api/users error: ${e}`);
       res.status(500).json({ error: String(e) });
