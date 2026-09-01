@@ -256,6 +256,35 @@ export const SHAREPOINT_TOOLS: Tool[] = [
     },
   },
   {
+    name: "read_text_file",
+    description:
+      "Read the contents of a text-based file from the user's OneDrive or a SharePoint site — " +
+      ".txt, .csv, .json, .md, .log, .xml, .yaml, .srt, and .vtt (Teams transcripts and subtitles). " +
+      "Identify the file by path (e.g. '/Reports/data.csv') or by the item ID from a folder " +
+      "listing. For Word, Excel, PowerPoint or PDF files use their own tools instead — this one " +
+      "reads raw text and will refuse those formats.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        file: {
+          type: "string",
+          description: "The file: a path relative to the drive root, or its item ID.",
+        },
+        siteId: {
+          type: "string",
+          description: "Optional. SharePoint site ID, when the file lives in a site rather than the user's OneDrive.",
+        },
+        maxChars: {
+          type: "number",
+          description:
+            "Optional cap on how much text to return (default 100000). If the file is longer the " +
+            "result is truncated and says so, along with the full size.",
+        },
+      },
+      required: ["file"],
+    },
+  },
+  {
     name: "transfer_drive_item",
     description:
       "Copy or move a file or folder between ANY two locations the user can reach: OneDrive to " +
@@ -641,6 +670,55 @@ export class SharePointToolHandler {
     return `✅ Item moved successfully.`;
   }
 
+  // ── Read a text file ──────────────────────────────────────────────────────
+
+  async readTextFile(args: Record<string, unknown>): Promise<string> {
+    const ref = String(args.file ?? "").trim();
+    if (!ref) return "Error: 'file' is required.";
+    const maxChars = Math.max(1000, Number(args.maxChars) || 100_000);
+
+    const item = await fetchDriveItem(this.token, ref, args.siteId as string | undefined);
+    const ext = item.name.split(".").pop()?.toLowerCase() ?? "";
+
+    // Point at the right tool rather than returning the mangled text that
+    // falls out of decoding a zipped or compressed format as UTF-8.
+    const WRONG_TOOL: Record<string, string> = {
+      docx: "GetDocumentContent_mcp_WordServer",
+      doc:  "GetDocumentContent_mcp_WordServer",
+      xlsx: "GetDocumentContent_mcp_ExcelServer",
+      xls:  "GetDocumentContent_mcp_ExcelServer",
+      pptx: "GetPresentationContent",
+      ppt:  "GetPresentationContent",
+      pdf:  "ocr_search_and_read",
+    };
+    if (WRONG_TOOL[ext]) {
+      return `Error: '${item.name}' is not a text file. Use ${WRONG_TOOL[ext]} to read it.`;
+    }
+
+    // Extension lists never cover everything, so decide on the bytes: a NUL in
+    // the opening chunk means binary in every text encoding we would meet here.
+    const probe = item.buffer.subarray(0, 4096);
+    if (probe.includes(0)) {
+      return `Error: '${item.name}' appears to be a binary file, not text. If it is a document, use the tool for its format.`;
+    }
+
+    let text = item.buffer.toString("utf8");
+    if (text.charCodeAt(0) === 0xfeff) text = text.slice(1); // strip BOM
+
+    const totalChars = text.length;
+    const truncated = totalChars > maxChars;
+    if (truncated) text = text.slice(0, maxChars);
+
+    log(`Read text file '${item.name}' (${totalChars} chars${truncated ? `, truncated to ${maxChars}` : ""})`);
+
+    // State the truncation and the real size: silently returning a prefix would
+    // let the model summarise a fraction of a file as though it were the whole.
+    const header = truncated
+      ? `${item.name} — showing the first ${maxChars} of ${totalChars} characters (truncated; raise maxChars or ask for a specific part):\n\n`
+      : `${item.name} — ${totalChars} characters:\n\n`;
+    return header + text;
+  }
+
   // ── Cross-drive transfer ──────────────────────────────────────────────────
 
   // Both OneDrive and a SharePoint site are just "drives" to Graph, and the
@@ -813,6 +891,9 @@ export class SharePointToolHandler {
           break;
         case "transfer_drive_item":
           result = await this.transferDriveItem(args);
+          break;
+        case "read_text_file":
+          result = await this.readTextFile(args);
           break;
         default:
           result = `Unknown tool: ${toolName}`;
