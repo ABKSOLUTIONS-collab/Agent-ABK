@@ -1253,21 +1253,28 @@ console.log(`ABK branding applied (idempotent)! Logo replaced in ${logoReplaced}
     "'claude-fable-5': { write: 12.5, read: 1 },",
   ].join('\n    ');
 
+  // Must cover .cjs and .mjs, not just .js. data-schemas ships the same price
+  // table twice — methods/tx.es.js for ESM and methods/tx.cjs for CommonJS —
+  // and LibreChat loads it through require(), i.e. the .cjs build. An earlier
+  // version of this patch collected only .js files, so it rewrote the ESM copy,
+  // reported success, and left the table that actually runs untouched: rates
+  // stayed at the wrong fallback while the build log claimed the fix applied.
   function collectJs(dir, out) {
     let entries;
     try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { return out; }
     for (const e of entries) {
       const p = path.join(dir, e.name);
       if (e.isDirectory()) collectJs(p, out);
-      else if (e.name.endsWith('.js')) out.push(p);
+      else if (/\.(js|cjs|mjs)$/.test(e.name)) out.push(p);
     }
     return out;
   }
 
-  let patchedFiles = 0, alreadyPatched = 0;
+  let patchedFiles = 0, alreadyPatched = 0, cjsCovered = false;
   for (const file of collectJs(distDir, [])) {
     let src = fs.readFileSync(file, 'utf8');
     if (!src.includes(baseAnchor) && !src.includes(cacheAnchor)) continue;
+    if (file.endsWith('.cjs')) cjsCovered = true;
 
     // The price table is duplicated across several bundled entry points, so
     // every file carrying it has to be patched — but each is patched once.
@@ -1296,5 +1303,16 @@ console.log(`ABK branding applied (idempotent)! Logo replaced in ${logoReplaced}
       'its token price table — update the pricing patch in patch.js.'
     );
   }
-  console.log(`Claude 5 pricing applied (${patchedFiles} file(s) patched, ${alreadyPatched} already current).`);
+  // LibreChat require()s data-schemas, so the CommonJS build is the copy that
+  // actually decides what a message costs. Patching only the ESM build looks
+  // like success and changes nothing — fail the build rather than ship prices
+  // that are silently wrong.
+  if (!cjsCovered) {
+    throw new Error(
+      'Claude pricing patch: patched only non-CommonJS builds under ' + distDir +
+      '. The .cjs copy is the one loaded at runtime, so prices would stay at the ' +
+      'wrong fallback rate. Check how data-schemas is being bundled.'
+    );
+  }
+  console.log(`Claude 5 pricing applied (${patchedFiles} file(s) patched, ${alreadyPatched} already current, CommonJS build covered).`);
 }
