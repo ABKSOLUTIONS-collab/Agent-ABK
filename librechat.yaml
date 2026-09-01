@@ -3,6 +3,38 @@ registration:
   allowedDomains:
     - "abk.gr"
 
+# ── Selectable models ────────────────────────────────────────────────────────
+# NOT a setting in this file. Recorded here because this is where the rest of
+# this deployment's configuration decisions are written down, and because the
+# value lives only on the Azure Container App — nothing in either repository
+# reproduces it, so recreating `abkagent-backup` silently restores all ten
+# models unless it is set again:
+#
+#   az containerapp update -n abkagent-backup -g ABKAgent365 --set-env-vars \
+#     "ANTHROPIC_MODELS=claude-sonnet-5,claude-opus-5,claude-haiku-4-5-20251001"
+#
+# getAnthropicModels() (packages/api/src/endpoints/models.ts) returns this list
+# verbatim and skips its usual fetch from Anthropic, so the three named models
+# are the only ones offered anywhere: the model picker, the server-side
+# validateModel guard, and validateAgentModel, which all read the same list.
+#
+# Excluded on cost, per the September price review: Fable 5 ($10/$50) is 5x
+# Sonnet 5 and was the largest exposure — a single heavy user could reach ~$299
+# a month on it. The 4.x Opus models price identically to Opus 5 and differ only
+# in fast mode, and Sonnet 4.5/4.6 ($3/$15) are both dearer and weaker than
+# Sonnet 5 ($2/$10), so none of them has a case.
+#
+# The consequence to keep in mind: new Anthropic models no longer appear on
+# their own. That is deliberate. A model that appears without a matching entry
+# in patch.js's price table bills at LibreChat's catch-all rate — the exact
+# mechanism that under-reported Sonnet 5 by ~4x for two weeks. Both lists now
+# have to be edited together, which is the point.
+#
+# Anything set here must include the model the shared ABK Agent runs on
+# (currently claude-sonnet-5). validateAgentModel rejects an agent whose model
+# is absent from the list, so omitting it does not downgrade the agent — it
+# makes the agent unopenable.
+
 # Per-user token usage tracking. Every request against a real LLM API key
 # (Claude/OpenAI/etc., not the Agent365 Graph tools) is logged to the
 # Transactions collection regardless of the setting below — that's what
